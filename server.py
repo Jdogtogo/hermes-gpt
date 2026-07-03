@@ -15,6 +15,7 @@ import operator_skills as op_skills
 import operator_config as op_config
 import operator_workspace as op_workspace
 import operator_diagnostics as op_diagnostics
+import operator_agent as op_agent
 
 
 LOCAL_DEV_PROFILE = "local-dev"
@@ -26,6 +27,7 @@ ENABLE_MEMORY_WRITE_ENV = "HERMES_GPT_ENABLE_MEMORY_WRITE"
 ENABLE_SESSION_SEARCH_ENV = "HERMES_GPT_ENABLE_SESSION_SEARCH"
 ENABLE_TERMINAL_ENV = "HERMES_GPT_ENABLE_TERMINAL"
 NOAUTH_META = {"securitySchemes": [{"type": "noauth"}]}
+RUNTIME_TRANSPORT = "unknown"
 
 HERMES_ROOT: Path | None = None
 IMPORT_ERROR: str | None = None
@@ -567,6 +569,7 @@ def hermes_operator_status() -> str:
             "hermes_workspace_patch",
             "hermes_workspace_write_file",
             "hermes_workspace_run_test",
+            "hermes_agent_run",
             "hermes_owner_run_command",
             "hermes_owner_patch",
             "hermes_owner_write_file",
@@ -879,6 +882,30 @@ def hermes_owner_run_command(command: str, timeout: int = 120, workdir: str | No
     )
 
 
+def hermes_agent_run(
+    prompt: str,
+    mode: str = "read_only",
+    profile: str = "default",
+    workdir: str | None = None,
+    max_turns: int = 30,
+    timeout: int = 300,
+    allow_web: bool = False,
+    apply: bool = False,
+) -> str:
+    return op_agent.hermes_agent_run(
+        prompt=prompt,
+        mode=mode,
+        profile=profile,
+        workdir=workdir,
+        max_turns=max_turns,
+        timeout=timeout,
+        allow_web=allow_web,
+        apply=apply,
+        transport=RUNTIME_TRANSPORT,
+        hermes_root=_hermes_root_for_operator(),
+    )
+
+
 def hermes_owner_patch(
     path: str,
     old_string: str,
@@ -894,6 +921,67 @@ def hermes_owner_patch(
 
 def hermes_owner_write_file(path: str, content: str, dry_run: bool = True) -> str:
     return op_workspace.hermes_owner_write_file(path=path, content=content, dry_run=dry_run)
+
+
+def hermes_ops_brain_query(command: str, keyword: str = "", limit: int = 5) -> str:
+    """Run the read-only OpsBrain Markdown query prototype.
+
+    This is a narrow wrapper around ~/.hermes/ops-brain/tools/ops_brain_query.py.
+    It does not use a shell, does not create an index, and does not inspect
+    runtime/session databases. It only reads OpsBrain Markdown through the
+    committed query prototype.
+    """
+    try:
+        policy = op_policy.OperatorPolicy()
+        policy.require_level("read_only")
+        hermes_root = _hermes_root_for_operator()
+        if hermes_root is None:
+            return "OpsBrain query unavailable: Hermes root could not be resolved."
+        ops_brain = hermes_root / "ops-brain"
+        if op_policy.is_denied_path(ops_brain):
+            return "OpsBrain query unavailable: OpsBrain path is denied by policy."
+        if not op_policy.path_under_allowed(ops_brain, policy.allowed_paths):
+            return "OpsBrain query unavailable: OpsBrain path is not in HERMES_GPT_OPERATOR_ALLOWED_PATHS."
+        script = ops_brain / "tools" / "ops_brain_query.py"
+        if not script.is_file():
+            return f"OpsBrain query unavailable: missing {script}."
+
+        cmd = (command or "").strip()
+        allowed = {"status", "evidence", "linked", "blockers", "next-actions", "projects", "runbooks"}
+        if cmd not in allowed:
+            return "Unsupported OpsBrain query command. Allowed: " + ", ".join(sorted(allowed))
+
+        lim = max(1, min(int(limit or 5), 20))
+        argv: list[str] = [cmd]
+        if cmd in {"status", "evidence", "linked"}:
+            key = (keyword or "").strip()
+            if not key:
+                return f"OpsBrain query command {cmd!r} requires keyword."
+            argv.append(key)
+            argv.extend(["--limit", str(lim)])
+        elif cmd == "next-actions":
+            argv.extend(["--limit", str(lim)])
+
+        import contextlib
+        import io
+        module_dir = str(script.parent)
+        old_path = list(sys.path)
+        try:
+            if module_dir not in sys.path:
+                sys.path.insert(0, module_dir)
+            query_module = __import__("ops_brain_query")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = int(query_module.main(argv))
+            output = buf.getvalue().strip()
+            if rc != 0:
+                return f"OpsBrain query failed with exit {rc}.\n{output}"
+            return output or "OpsBrain query returned no output."
+        finally:
+            sys.path[:] = old_path
+    except Exception as exc:
+        return f"OpsBrain query unavailable: {exc}"
+
 
 
 def build_server(
@@ -939,6 +1027,7 @@ def register_tools(server: FastMCP) -> None:
     # see why unavailable") — the wrappers above return a JSON error string
     # when the operator policy is not enabled / level is insufficient /
     # apply_mode is dry_run / owner ack is missing.
+    server.add_tool(hermes_ops_brain_query, meta=tool_meta())
     server.add_tool(hermes_operator_policy, meta=tool_meta())
     server.add_tool(hermes_operator_status, meta=tool_meta())
     server.add_tool(hermes_operator_audit_tail, meta=tool_meta())
@@ -982,6 +1071,7 @@ def register_tools(server: FastMCP) -> None:
     server.add_tool(hermes_workspace_run_test, meta=tool_meta())
     server.add_tool(hermes_git_status, meta=tool_meta())
     server.add_tool(hermes_git_diff, meta=tool_meta())
+    server.add_tool(hermes_agent_run, meta=tool_meta())
     server.add_tool(hermes_owner_run_command, meta=tool_meta())
     server.add_tool(hermes_owner_patch, meta=tool_meta())
     server.add_tool(hermes_owner_write_file, meta=tool_meta())
@@ -991,6 +1081,7 @@ mcp = build_server()
 
 
 def main() -> None:
+    global RUNTIME_TRANSPORT
     parser = argparse.ArgumentParser(description="Hermes Agent MCP sidecar.")
     parser.add_argument("--http", action="store_true", help="Run streamable HTTP transport instead of stdio.")
     parser.add_argument("--sse", action="store_true", help="Run legacy SSE transport instead of stdio.")
@@ -1028,6 +1119,7 @@ def main() -> None:
         eprint("WARNING: remote no-auth mode is explicitly unsafe and intended only for temporary experiments.")
 
     transport = "streamable-http" if args.http else "sse" if args.sse else "stdio"
+    RUNTIME_TRANSPORT = transport
     server = build_server(host=args.host, port=args.port, http=args.http)
     if transport == "stdio":
         eprint("hermes-gpt MCP server starting in stdio mode.")
