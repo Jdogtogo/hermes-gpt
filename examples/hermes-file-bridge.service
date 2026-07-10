@@ -12,7 +12,7 @@ Environment="HERMES_GPT_OPERATOR_LEVEL=owner"
 Environment="HERMES_GPT_OPERATOR_APPLY_MODE=direct"
 Environment="HERMES_GPT_OWNER_ACK=I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE"
 Environment="HERMES_GPT_OPERATOR_ALLOWED_PROFILES=default"
-Environment="HERMES_GPT_OPERATOR_ALLOWED_PATHS=/home/jfroh/hermes-gpt,/home/jfroh/.hermes/hermes-agent,/home/jfroh/.hermes/ops-brain,/home/jfroh/.hermes/sessions,/home/jfroh/.hermes/turn_logs,/home/jfroh/.hermes/memory,/home/jfroh/.hermes/logs,/home/jfroh/.hermes/worktrees/hermes-file-bridge,/home/jfroh/.hermes/bridge"
+Environment="HERMES_GPT_OPERATOR_ALLOWED_PATHS=/home/jfroh/hermes-gpt,/home/jfroh/.hermes/hermes-agent,/home/jfroh/.hermes/ops-brain,/home/jfroh/.hermes/sessions,/home/jfroh/.hermes/turn_logs,/home/jfroh/.hermes/memories,/home/jfroh/.hermes/logs,/home/jfroh/.hermes/worktrees/hermes-file-bridge,/home/jfroh/.hermes/bridge"
 ExecStart=/home/jfroh/hermes-gpt/.venv/bin/python /home/jfroh/.hermes/worktrees/hermes-file-bridge/bridge_worker.py --root /home/jfroh/.hermes/bridge --profile default --max-turns 30 --timeout 600
 Restart=on-failure
 RestartSec=5
@@ -21,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/home/jfroh/hermes-gpt /home/jfroh/.hermes/hermes-agent /home/jfroh/.hermes/ops-brain /home/jfroh/.hermes/sessions /home/jfroh/.hermes/turn_logs /home/jfroh/.hermes/memory /home/jfroh/.hermes/logs /home/jfroh/.hermes/worktrees/hermes-file-bridge /home/jfroh/.hermes/bridge
+ReadWritePaths=/home/jfroh/hermes-gpt /home/jfroh/.hermes/hermes-agent /home/jfroh/.hermes/ops-brain /home/jfroh/.hermes/sessions /home/jfroh/.hermes/turn_logs /home/jfroh/.hermes/memories /home/jfroh/.hermes/logs /home/jfroh/.hermes/worktrees/hermes-file-bridge /home/jfroh/.hermes/bridge
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
