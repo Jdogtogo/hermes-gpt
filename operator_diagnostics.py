@@ -34,7 +34,7 @@ import operator_workspace as op_workspace
 # Release version
 # ---------------------------------------------------------------------------
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # ---------------------------------------------------------------------------
 # Check statuses
@@ -855,7 +855,7 @@ def hermes_release_doctor(
     timeout: int = 180,
     runner=None,
 ) -> str:
-    """Check whether the repo/operator is safe to ship as v0.3.0."""
+    """Check whether the repo/operator is safe to ship at the current version."""
     trace_id = op.new_trace_id()
     try:
         wd = Path(workdir).expanduser().resolve() if workdir else Path(__file__).resolve().parent
@@ -942,7 +942,7 @@ def hermes_release_doctor(
             recommended = "Review warnings, then run with full_tests=true before tagging."
         else:
             status = "PASS"
-            recommended = "Ready to tag v0.3.0."
+            recommended = f"Ready to tag v{VERSION}."
 
         return json.dumps(
             {

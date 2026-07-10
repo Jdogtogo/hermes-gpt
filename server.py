@@ -16,6 +16,7 @@ import operator_config as op_config
 import operator_workspace as op_workspace
 import operator_diagnostics as op_diagnostics
 import operator_bridge as op_bridge
+import operator_auth as op_auth
 
 try:
     import operator_agent as op_agent
@@ -35,6 +36,7 @@ ENABLE_WRITE_ENV = "HERMES_GPT_ENABLE_WRITE"
 ENABLE_MEMORY_WRITE_ENV = "HERMES_GPT_ENABLE_MEMORY_WRITE"
 ENABLE_SESSION_SEARCH_ENV = "HERMES_GPT_ENABLE_SESSION_SEARCH"
 ENABLE_TERMINAL_ENV = "HERMES_GPT_ENABLE_TERMINAL"
+ENABLE_BRIDGE_ENV = "HERMES_GPT_ENABLE_BRIDGE"
 NOAUTH_META = {"securitySchemes": [{"type": "noauth"}]}
 RUNTIME_TRANSPORT = "unknown"
 
@@ -279,7 +281,13 @@ import_hermes()
 
 
 def tool_meta(extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    meta = dict(NOAUTH_META)
+    if op_auth.auth_enabled():
+        scope = os.environ.get(op_auth.AUTH_SCOPE_ENV, op_auth.DEFAULT_SCOPE).strip() or op_auth.DEFAULT_SCOPE
+        meta: dict[str, Any] = {
+            "securitySchemes": [{"type": "oauth2", "scopes": [scope]}]
+        }
+    else:
+        meta = dict(NOAUTH_META)
     if extra:
         meta.update(extra)
     return meta
@@ -951,8 +959,18 @@ def bridge_read(root: str | None = None, max_chars: int = 200000) -> str:
     return op_bridge.bridge_read(root=root, max_chars=max_chars)
 
 
-def bridge_submit_command(command: str, command_id: str = "", root: str | None = None) -> str:
-    return op_bridge.bridge_submit_command(command=command, command_id=command_id, root=root)
+def bridge_submit_command(
+    command: str,
+    workdir: str,
+    command_id: str = "",
+    root: str | None = None,
+) -> str:
+    return op_bridge.bridge_submit_command(
+        command=command,
+        workdir=workdir,
+        command_id=command_id,
+        root=root,
+    )
 
 
 def bridge_read_result(command_id: str = "", root: str | None = None) -> str:
@@ -1030,7 +1048,26 @@ def build_server(
     port: int = 7677,
     http: bool = False,
     include_local_settings: bool = False,
+    transport: str | None = None,
 ) -> FastMCP:
+    effective_transport = transport or ("streamable-http" if http else "stdio")
+    remote_transport = effective_transport in {"streamable-http", "sse"}
+    bridge_requested = env_enabled(ENABLE_BRIDGE_ENV)
+    oauth_requested = remote_transport and op_auth.auth_enabled()
+
+    if remote_transport and bridge_requested and not oauth_requested:
+        raise RuntimeError(
+            f"{ENABLE_BRIDGE_ENV}=1 is refused over HTTP/SSE unless "
+            f"{op_auth.AUTH_ENABLED_ENV}=1 and OAuth is configured."
+        )
+
+    provider = None
+    auth_settings = None
+    if oauth_requested:
+        auth_config = op_auth.AuthRuntimeConfig.from_env()
+        provider = op_auth.PersistentOAuthProvider(auth_config)
+        auth_settings = provider.auth_settings()
+
     server = FastMCP(
         "hermes-gpt",
         host=host,
@@ -1040,12 +1077,16 @@ def build_server(
         message_path="/messages/",
         stateless_http=http,
         json_response=http,
+        auth_server_provider=provider,
+        auth=auth_settings,
     )
-    register_tools(server)
+    if provider is not None:
+        op_auth.register_login_routes(server, provider)
+    register_tools(server, include_bridge=bridge_requested)
     return server
 
 
-def register_tools(server: FastMCP) -> None:
+def register_tools(server: FastMCP, *, include_bridge: bool = False) -> None:
     server.add_tool(hermes_read_file, meta=tool_meta())
     server.add_tool(hermes_search_files, meta=tool_meta())
     server.add_tool(hermes_memory, meta=tool_meta())
@@ -1067,11 +1108,12 @@ def register_tools(server: FastMCP) -> None:
     # see why unavailable") — the wrappers above return a JSON error string
     # when the operator policy is not enabled / level is insufficient /
     # apply_mode is dry_run / owner ack is missing.
-    server.add_tool(bridge_status, meta=tool_meta())
-    server.add_tool(bridge_read, meta=tool_meta())
-    server.add_tool(bridge_submit_command, meta=tool_meta())
-    server.add_tool(bridge_read_result, meta=tool_meta())
-    server.add_tool(bridge_write_adjudication, meta=tool_meta())
+    if include_bridge:
+        server.add_tool(bridge_status, meta=tool_meta())
+        server.add_tool(bridge_read, meta=tool_meta())
+        server.add_tool(bridge_submit_command, meta=tool_meta())
+        server.add_tool(bridge_read_result, meta=tool_meta())
+        server.add_tool(bridge_write_adjudication, meta=tool_meta())
     server.add_tool(hermes_ops_brain_query, meta=tool_meta())
     server.add_tool(hermes_operator_policy, meta=tool_meta())
     server.add_tool(hermes_operator_status, meta=tool_meta())
@@ -1150,9 +1192,13 @@ def main() -> None:
 
     if args.http and args.sse:
         raise SystemExit("Choose only one of --http or --sse.")
-    if args.profile == REMOTE_PROFILE and not (args.unsafe_remote_ack and env_enabled(UNSAFE_REMOTE_ENV)):
+    if (
+        args.profile == REMOTE_PROFILE
+        and not op_auth.auth_enabled()
+        and not (args.unsafe_remote_ack and env_enabled(UNSAFE_REMOTE_ENV))
+    ):
         raise SystemExit(
-            "Remote profile requires real authentication, which is not implemented yet. "
+            f"Remote profile requires {op_auth.AUTH_ENABLED_ENV}=1 with OAuth configured. "
             f"For temporary experiments only, pass {UNSAFE_REMOTE_ACK} and set {UNSAFE_REMOTE_ENV}=1."
         )
     if args.profile == LOCAL_DEV_PROFILE and not is_loopback_host(args.host):
@@ -1160,12 +1206,17 @@ def main() -> None:
             "WARNING: local-dev profile is bound to a non-loopback host. "
             "Do not expose hermes-gpt without real authentication."
         )
-    if args.profile == REMOTE_PROFILE:
+    if args.profile == REMOTE_PROFILE and not op_auth.auth_enabled():
         eprint("WARNING: remote no-auth mode is explicitly unsafe and intended only for temporary experiments.")
 
     transport = "streamable-http" if args.http else "sse" if args.sse else "stdio"
     RUNTIME_TRANSPORT = transport
-    server = build_server(host=args.host, port=args.port, http=args.http)
+    server = build_server(
+        host=args.host,
+        port=args.port,
+        http=args.http,
+        transport=transport,
+    )
     if transport == "stdio":
         eprint("hermes-gpt MCP server starting in stdio mode.")
         server.run(transport="stdio")

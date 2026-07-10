@@ -22,6 +22,7 @@ VERDICT_HEADING = "### ADJUDICATION_FROM_CHATGPT"
 MAX_COMMAND_CHARS = 100_000
 MAX_READ_CHARS = 200_000
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+ACTIVE_STATUSES = frozenset({"queued", "claimed", "running", "adjudication_required", "adjudicated"})
 
 
 def _now() -> str:
@@ -95,6 +96,16 @@ def _section(heading: str, command_id: str, body: str) -> str:
     return f"{heading}\n\ncommand_id: {command_id}\ntimestamp: {_now()}\n\n{body.rstrip()}\n"
 
 
+def _command_section(command_id: str, workdir: Path, body: str) -> str:
+    return (
+        f"{COMMAND_HEADING}\n\n"
+        f"command_id: {command_id}\n"
+        f"timestamp: {_now()}\n"
+        f"workdir: {workdir}\n\n"
+        f"{body.rstrip()}\n"
+    )
+
+
 def _response(**values: Any) -> str:
     return json.dumps(values, indent=2, sort_keys=True)
 
@@ -122,25 +133,70 @@ def bridge_read(root: str | None = None, max_chars: int = MAX_READ_CHARS) -> str
         return _response(success=False, error=str(exc))
 
 
-def bridge_submit_command(command: str, command_id: str = "", root: str | None = None) -> str:
+def bridge_submit_command(
+    command: str,
+    workdir: str,
+    command_id: str = "",
+    root: str | None = None,
+) -> str:
     try:
         bridge_root = _root(root)
-        _guard(bridge_root, write=True)
+        policy = _guard(bridge_root, write=True)
         _layout(bridge_root)
         body = (command or "").strip()
         if not body:
             raise ValueError("command cannot be empty.")
         if len(body) > MAX_COMMAND_CHARS:
             raise ValueError("command is too large.")
+        if not isinstance(workdir, str) or not workdir.strip():
+            raise ValueError("workdir is required.")
+        candidate = Path(workdir).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("workdir must be an absolute path.")
+        resolved_workdir = candidate.resolve(strict=True)
+        if not resolved_workdir.is_dir():
+            raise NotADirectoryError("workdir must be an existing directory.")
+        policy.require_workspace_path(resolved_workdir)
+
         cid = _valid_id(command_id or uuid.uuid4().hex)
         state = _load_state(bridge_root)
-        if state.get("status") in {"queued", "claimed", "running", "adjudicated"}:
+        if state.get("status") in ACTIVE_STATUSES:
             raise RuntimeError("Bridge already has an active command.")
         if state.get("command_id") == cid or list((bridge_root / "archive").glob(f"{cid}.*")):
             raise RuntimeError("command_id has already been used.")
-        _atomic_write(bridge_root / "bridge.md", _section(COMMAND_HEADING, cid, body))
-        _save_state(bridge_root, {"status": "queued", "command_id": cid, "created_at": _now(), "attempt": 0})
-        return _response(success=True, command_id=cid, status="queued")
+
+        _atomic_write(
+            bridge_root / "bridge.md",
+            _command_section(cid, resolved_workdir, body),
+        )
+        _save_state(
+            bridge_root,
+            {
+                "status": "queued",
+                "command_id": cid,
+                "workdir": str(resolved_workdir),
+                "created_at": _now(),
+                "attempt": 0,
+            },
+        )
+        op_policy.audit_record(
+            tool="bridge_submit_command",
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=True,
+            changed=True,
+            summary="queued bridge command",
+            path=str(resolved_workdir),
+            prompt=body,
+            extra={"command_id": cid, "status": "queued"},
+        )
+        return _response(
+            success=True,
+            command_id=cid,
+            status="queued",
+            workdir=str(resolved_workdir),
+        )
     except Exception as exc:
         return _response(success=False, error=str(exc))
 
@@ -168,7 +224,7 @@ def bridge_read_result(command_id: str = "", root: str | None = None) -> str:
 def bridge_write_adjudication(command_id: str, verdict: str, root: str | None = None) -> str:
     try:
         bridge_root = _root(root)
-        _guard(bridge_root, write=True)
+        policy = _guard(bridge_root, write=True)
         cid = _valid_id(command_id)
         body = (verdict or "").strip()
         if not body:
@@ -182,6 +238,17 @@ def bridge_write_adjudication(command_id: str, verdict: str, root: str | None = 
         state["status"] = "adjudicated"
         state["adjudicated_at"] = _now()
         _save_state(bridge_root, state)
+        op_policy.audit_record(
+            tool="bridge_write_adjudication",
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=True,
+            changed=True,
+            summary="recorded bridge adjudication",
+            content=body,
+            extra={"command_id": cid, "status": "adjudicated"},
+        )
         return _response(success=True, command_id=cid, status="adjudicated")
     except Exception as exc:
         return _response(success=False, error=str(exc))

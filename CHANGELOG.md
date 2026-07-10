@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 - 2026-07-11
+
+- Added the authenticated asynchronous file bridge between ChatGPT and local Hermes.
+- Added five scoped MCP mailbox tools for command submission, status, result reading, and adjudication.
+- Added a local worker that executes through Hermes' existing bounded `operator_agent` stdio apply path.
+- Added per-command working-directory validation, atomic mailbox/state writes, duplicate prevention, worker locking, attempt archives, and stale-run recovery.
+- Added native MCP OAuth 2.1 authorization with dynamic public-client registration, PKCE S256, single-user login, protected-resource discovery, token rotation, revocation, and persistent SQLite state.
+- Stored authorization state and tokens only as HMAC digests; stored the local login password only as a scrypt hash.
+- Refused bridge activation over HTTP or SSE unless OAuth is enabled.
+- Added systemd deployment templates, service hardening, deployment/rollback documentation, and end-to-end OAuth/bridge tests.
+- Pinned the production MCP SDK dependency to `mcp[cli]>=1.28,<2`.
+
 ## 0.3.0 - 2026-06-25
 
 - Added operator diagnostics and recovery tools: `hermes_operator_doctor`, `hermes_operator_snapshot`, `hermes_release_doctor`, and `hermes_operator_recover`.

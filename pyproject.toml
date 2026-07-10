@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-gpt"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local-dev MCP sidecar for exposing selected Hermes Agent capabilities."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ authors = [
   { name = "hermes-gpt contributors" }
 ]
 dependencies = [
-  "mcp[cli]",
+  "mcp[cli]>=1.28,<2",
   "uvicorn",
 ]
 
@@ -37,7 +37,9 @@ py-modules = [
   "operator_diagnostics",
   "operator_bridge",
   "operator_agent",
+  "operator_auth",
   "bridge_worker",
+  "auth_bootstrap",
 ]
 
 [tool.setuptools.data-files]
@@ -50,12 +52,15 @@ py-modules = [
   "docs/operator-mode.md",
   "docs/release-notes-v0.2.0.md",
   "docs/release-notes-v0.3.0.md",
+  "docs/release-notes-v0.4.0.md",
+  "docs/file-bridge.md",
 ]
 "share/hermes-gpt/examples" = [
   "examples/start-hermes-gpt.example.ps1",
   "examples/status-hermes-gpt.example.ps1",
   "examples/install-task.example.ps1",
   "examples/hermes-file-bridge.service",
+  "examples/hermes-gpt-sidecar-file-bridge.conf",
 ]
 
 [tool.pytest.ini_options]

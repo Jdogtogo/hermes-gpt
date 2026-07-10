@@ -10,7 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from starlette.testclient import TestClient
 
+import operator_auth as op_auth
 import server
 
 
@@ -19,7 +21,14 @@ GATE_ENVS = [
     server.ENABLE_MEMORY_WRITE_ENV,
     server.ENABLE_SESSION_SEARCH_ENV,
     server.ENABLE_TERMINAL_ENV,
+    server.ENABLE_BRIDGE_ENV,
     server.UNSAFE_REMOTE_ENV,
+    op_auth.AUTH_ENABLED_ENV,
+    op_auth.AUTH_ISSUER_URL_ENV,
+    op_auth.AUTH_RESOURCE_URL_ENV,
+    op_auth.AUTH_ROOT_ENV,
+    op_auth.AUTH_SCOPE_ENV,
+    op_auth.AUTH_USERNAME_ENV,
 ]
 
 
@@ -60,6 +69,11 @@ def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
         "hermes_patch",
         "hermes_run_command",
         "hermes_session_search",
+        "bridge_status",
+        "bridge_read",
+        "bridge_submit_command",
+        "bridge_read_result",
+        "bridge_write_adjudication",
     ]:
         assert forbidden not in names
 
@@ -85,16 +99,82 @@ def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
         "hermes_cron_run",
         "hermes_skill_create",
         "hermes_owner_run_command",
+    ]:
+        assert operator_tool in names
+
+    for tool in tools_by_name(built).values():
+        assert tool.meta == {"securitySchemes": [{"type": "noauth"}]}
+
+
+def test_bridge_tools_require_explicit_gate_for_stdio(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(server.ENABLE_BRIDGE_ENV, "1")
+    names = tool_names(server.build_server(transport="stdio"))
+    for required in [
         "bridge_status",
         "bridge_read",
         "bridge_submit_command",
         "bridge_read_result",
         "bridge_write_adjudication",
     ]:
-        assert operator_tool in names
+        assert required in names
 
+
+def test_http_bridge_refuses_without_oauth(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(server.ENABLE_BRIDGE_ENV, "1")
+    with pytest.raises(RuntimeError, match="refused over HTTP/SSE"):
+        server.build_server(http=True, transport="streamable-http")
+
+
+def test_authenticated_http_bridge_requires_bearer_token(monkeypatch, tmp_path):
+    clear_gate_envs(monkeypatch)
+    auth_root = tmp_path / "auth"
+    config = op_auth.AuthRuntimeConfig(
+        issuer_url="https://mcp.example.test",
+        resource_server_url="https://mcp.example.test/mcp",
+        scope="hermes:operator",
+        root=auth_root,
+        username="justin",
+    )
+    op_auth.bootstrap_credentials(config)
+    monkeypatch.setenv(server.ENABLE_BRIDGE_ENV, "1")
+    monkeypatch.setenv(op_auth.AUTH_ENABLED_ENV, "1")
+    monkeypatch.setenv(op_auth.AUTH_ISSUER_URL_ENV, config.issuer_url)
+    monkeypatch.setenv(op_auth.AUTH_RESOURCE_URL_ENV, config.resource_server_url)
+    monkeypatch.setenv(op_auth.AUTH_ROOT_ENV, str(auth_root))
+    monkeypatch.setenv(op_auth.AUTH_SCOPE_ENV, config.scope)
+    monkeypatch.setenv(op_auth.AUTH_USERNAME_ENV, config.username)
+
+    built = server.build_server(http=True, transport="streamable-http")
+    names = tool_names(built)
+    assert "bridge_submit_command" in names
     for tool in tools_by_name(built).values():
-        assert tool.meta == {"securitySchemes": [{"type": "noauth"}]}
+        assert tool.meta == {
+            "securitySchemes": [{"type": "oauth2", "scopes": [config.scope]}]
+        }
+
+    app = built.streamable_http_app()
+    with TestClient(app) as client:
+        protected = client.get("/mcp")
+        assert protected.status_code == 401
+        assert "Bearer" in protected.headers.get("www-authenticate", "")
+
+        metadata = client.get("/.well-known/oauth-protected-resource/mcp")
+        assert metadata.status_code == 200
+        payload = metadata.json()
+        assert payload["resource"] == config.resource_server_url
+        assert [value.rstrip("/") for value in payload["authorization_servers"]] == [
+            config.issuer_url.rstrip("/")
+        ]
+
+        authorization_metadata = client.get("/.well-known/oauth-authorization-server")
+        assert authorization_metadata.status_code == 200
+        assert authorization_metadata.json()["registration_endpoint"].endswith("/register")
+
+        health = client.get("/health/auth")
+        assert health.status_code == 200
+        assert health.text == "oauth-enabled"
 
 
 def test_env_gates_expose_high_risk_tools(monkeypatch):
@@ -172,7 +252,7 @@ def test_remote_profile_requires_explicit_unsafe_ack(monkeypatch):
     clear_gate_envs(monkeypatch)
     monkeypatch.setattr(sys, "argv", ["server.py", "--http", "--profile", "remote"])
 
-    with pytest.raises(SystemExit, match="Remote profile requires real authentication"):
+    with pytest.raises(SystemExit, match="Remote profile requires HERMES_GPT_AUTH_ENABLED=1"):
         server.main()
 
 
