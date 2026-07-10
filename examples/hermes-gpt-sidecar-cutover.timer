@@ -1,0 +1,10 @@
+[Unit]
+Description=Delay Hermes GPT sidecar production cutover
+
+[Timer]
+OnActiveSec=3s
+AccuracySec=1s
+Unit=hermes-gpt-sidecar-cutover.service
+
+[Install]
+WantedBy=timers.target

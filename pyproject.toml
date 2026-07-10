@@ -62,6 +62,9 @@ py-modules = [
   "examples/hermes-file-bridge.service",
   "examples/hermes-gpt-sidecar-file-bridge.conf",
   "examples/hermes-gpt-sidecar-bridge.service",
+  "examples/hermes-gpt-sidecar-cutover.service",
+  "examples/hermes-gpt-sidecar-rollback.service",
+  "examples/hermes-gpt-sidecar-cutover.timer",
 ]
 
 [tool.pytest.ini_options]

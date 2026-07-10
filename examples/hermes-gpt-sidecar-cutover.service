@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes GPT sidecar production cutover
+OnFailure=hermes-gpt-sidecar-rollback.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user stop hermes-gpt-sidecar.service
+ExecStart=/usr/bin/systemctl --user start hermes-gpt-sidecar-bridge.service
+ExecStart=/usr/bin/sleep 3
+ExecStart=/usr/bin/curl --fail --silent --show-error http://127.0.0.1:7677/health/auth
+ExecStart=/usr/bin/systemctl --user is-active --quiet hermes-gpt-sidecar-bridge.service

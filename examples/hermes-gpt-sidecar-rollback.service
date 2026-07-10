@@ -1,0 +1,7 @@
+[Unit]
+Description=Rollback Hermes GPT sidecar production cutover
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/systemctl --user stop hermes-gpt-sidecar-bridge.service
+ExecStart=/usr/bin/systemctl --user start hermes-gpt-sidecar.service
