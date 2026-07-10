@@ -15,7 +15,16 @@ import operator_skills as op_skills
 import operator_config as op_config
 import operator_workspace as op_workspace
 import operator_diagnostics as op_diagnostics
-import operator_agent as op_agent
+import operator_bridge as op_bridge
+
+try:
+    import operator_agent as op_agent
+    OPERATOR_AGENT_IMPORT_ERROR: str | None = None
+except ModuleNotFoundError as exc:
+    if exc.name != "operator_agent":
+        raise
+    op_agent = None
+    OPERATOR_AGENT_IMPORT_ERROR = str(exc)
 
 
 LOCAL_DEV_PROFILE = "local-dev"
@@ -892,6 +901,17 @@ def hermes_agent_run(
     allow_web: bool = False,
     apply: bool = False,
 ) -> str:
+    if op_agent is None:
+        return json.dumps(
+            op_policy.make_error_envelope(
+                layer="operator",
+                code="AGENT_RUN_UNAVAILABLE",
+                safe_message="hermes_agent_run is unavailable because operator_agent.py is not installed in this package.",
+                suggested_action="Use the narrower operator tools, or install a package that includes operator_agent.py.",
+                extra={"module": "operator_agent"},
+            ),
+            indent=2,
+        )
     return op_agent.hermes_agent_run(
         prompt=prompt,
         mode=mode,
@@ -921,6 +941,26 @@ def hermes_owner_patch(
 
 def hermes_owner_write_file(path: str, content: str, dry_run: bool = True) -> str:
     return op_workspace.hermes_owner_write_file(path=path, content=content, dry_run=dry_run)
+
+
+def bridge_status(root: str | None = None) -> str:
+    return op_bridge.bridge_status(root=root)
+
+
+def bridge_read(root: str | None = None, max_chars: int = 200000) -> str:
+    return op_bridge.bridge_read(root=root, max_chars=max_chars)
+
+
+def bridge_submit_command(command: str, command_id: str = "", root: str | None = None) -> str:
+    return op_bridge.bridge_submit_command(command=command, command_id=command_id, root=root)
+
+
+def bridge_read_result(command_id: str = "", root: str | None = None) -> str:
+    return op_bridge.bridge_read_result(command_id=command_id, root=root)
+
+
+def bridge_write_adjudication(command_id: str, verdict: str, root: str | None = None) -> str:
+    return op_bridge.bridge_write_adjudication(command_id=command_id, verdict=verdict, root=root)
 
 
 def hermes_ops_brain_query(command: str, keyword: str = "", limit: int = 5) -> str:
@@ -1027,6 +1067,11 @@ def register_tools(server: FastMCP) -> None:
     # see why unavailable") — the wrappers above return a JSON error string
     # when the operator policy is not enabled / level is insufficient /
     # apply_mode is dry_run / owner ack is missing.
+    server.add_tool(bridge_status, meta=tool_meta())
+    server.add_tool(bridge_read, meta=tool_meta())
+    server.add_tool(bridge_submit_command, meta=tool_meta())
+    server.add_tool(bridge_read_result, meta=tool_meta())
+    server.add_tool(bridge_write_adjudication, meta=tool_meta())
     server.add_tool(hermes_ops_brain_query, meta=tool_meta())
     server.add_tool(hermes_operator_policy, meta=tool_meta())
     server.add_tool(hermes_operator_status, meta=tool_meta())

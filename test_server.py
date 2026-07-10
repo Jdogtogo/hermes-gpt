@@ -85,6 +85,11 @@ def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
         "hermes_cron_run",
         "hermes_skill_create",
         "hermes_owner_run_command",
+        "bridge_status",
+        "bridge_read",
+        "bridge_submit_command",
+        "bridge_read_result",
+        "bridge_write_adjudication",
     ]:
         assert operator_tool in names
 
