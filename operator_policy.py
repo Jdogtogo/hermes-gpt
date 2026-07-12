@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Optional
 
+import operator_sessions
+
 # ---------------------------------------------------------------------------
 # Env var names
 # ---------------------------------------------------------------------------
@@ -580,13 +582,52 @@ class OperatorPolicy:
         "apply_mode",
         "allowed_profiles",
         "allowed_paths",
+        "readable_roots",
+        "writable_roots",
+        "egress_hosts",
+        "git_remotes",
+        "service_units",
+        "verbs",
         "denied_paths",
         "owner_ack",
         "owner_mode_ready",
         "mutation_allowed",
+        "session_id",
+        "snapshot_hash",
+        "expires_at",
     )
 
     def __init__(self) -> None:
+        session = operator_sessions.active_session()
+        if session is not None:
+            snapshot = session.policy
+            self.enabled = True
+            raw_level = str(snapshot.get("level") or "workspace").strip().lower()
+            self.level = raw_level if raw_level in LEVELS else "workspace"
+            raw_mode = str(snapshot.get("apply_mode") or "direct").strip().lower()
+            self.apply_mode = raw_mode if raw_mode in {"dry_run", "direct"} else "direct"
+            self.allowed_profiles = parse_allowed_profiles(
+                os.environ.get(OPERATOR_ALLOWED_PROFILES_ENV)
+            )
+            self.readable_roots = [Path(p) for p in snapshot.get("readable_roots", [])]
+            self.writable_roots = [Path(p) for p in snapshot.get("writable_roots", [])]
+            self.allowed_paths = sorted(
+                {*self.readable_roots, *self.writable_roots},
+                key=lambda p: str(p),
+            )
+            self.egress_hosts = list(snapshot.get("egress_hosts", []))
+            self.git_remotes = list(snapshot.get("git_remotes", []))
+            self.service_units = list(snapshot.get("service_units", []))
+            self.verbs = dict(snapshot.get("verbs", {}))
+            self.denied_paths = [Path(p) for p in snapshot.get("hard_denied_paths", [])]
+            self.owner_ack = ""
+            self.owner_mode_ready = False
+            self.mutation_allowed = self.apply_mode == "direct" and level_rank(self.level) >= level_rank("workspace")
+            self.session_id = session.session_id
+            self.snapshot_hash = session.snapshot_hash
+            self.expires_at = session.expires_at
+            return
+
         self.enabled = env_truthy(OPERATOR_ENABLED_ENV)
         raw_level = os.environ.get(OPERATOR_LEVEL_ENV, "read_only").strip().lower()
         if raw_level not in LEVELS:
@@ -604,6 +645,12 @@ class OperatorPolicy:
         self.allowed_paths = parse_path_list(
             os.environ.get(OPERATOR_ALLOWED_PATHS_ENV)
         )
+        self.readable_roots = list(self.allowed_paths)
+        self.writable_roots = list(self.allowed_paths)
+        self.egress_hosts = []
+        self.git_remotes = []
+        self.service_units = []
+        self.verbs = {}
         # Denied paths env adds to the built-in defaults; it cannot remove
         # the defaults. We don't store the env list as paths here because
         # ``is_denied_path`` already covers the built-in conservative set.
@@ -624,6 +671,9 @@ class OperatorPolicy:
             and self.apply_mode == "direct"
             and level_rank(self.level) >= level_rank("cron")
         )
+        self.session_id = None
+        self.snapshot_hash = None
+        self.expires_at = None
 
     # --- convenience -------------------------------------------------------
 
@@ -702,17 +752,51 @@ class OperatorPolicy:
                 f"Path {str(path)!r} is denied by the operator path safety policy "
                 "(secret / credential / vault / token / .env)."
             )
-        if not self.allowed_paths:
+        writable_roots = self.writable_roots or self.allowed_paths
+        if not writable_roots:
             raise PermissionError(
                 "Workspace writes are disabled because "
                 f"{OPERATOR_ALLOWED_PATHS_ENV} is empty. Set it to one or more "
                 "workspace root directories."
             )
-        if not path_under_allowed(path, self.allowed_paths):
+        if not path_under_allowed(path, writable_roots):
             raise PermissionError(
                 f"Path {str(path)!r} is not under any allowed path in "
                 f"{OPERATOR_ALLOWED_PATHS_ENV}."
             )
+
+    def denies_path(self, path: str | os.PathLike[str]) -> bool:
+        if is_denied_path(path):
+            return True
+        return path_under_allowed(path, self.denied_paths)
+
+    def require_read_path(self, path: str | os.PathLike[str]) -> None:
+        if self.denies_path(path):
+            raise PermissionError("Path is hard-denied by the operator policy snapshot.")
+        readable_roots = self.readable_roots or self.allowed_paths
+        if readable_roots and not path_under_allowed(path, readable_roots):
+            raise PermissionError("Path is not under any readable root in the operator policy.")
+
+    def require_egress_host(self, hostname: str) -> None:
+        host = (hostname or "").strip().lower()
+        if not host or host not in {item.lower() for item in self.egress_hosts}:
+            raise PermissionError(f"Egress host {hostname!r} is not granted by this Operator Session.")
+
+    def require_git_remote(self, remote: str, *, verb: str = "fetch") -> None:
+        if not operator_sessions.remote_matches(remote, self.git_remotes):
+            raise PermissionError("Git remote is not granted by this Operator Session.")
+        self.require_verb("git", verb)
+
+    def require_verb(self, resource: str, verb: str) -> None:
+        granted = set(self.verbs.get(resource, []))
+        if verb not in granted:
+            raise PermissionError(f"Verb {resource}:{verb} is not granted by this Operator Session.")
+
+    def require_recursive_delete(self) -> None:
+        self.require_verb("filesystem", "recursive_delete")
+
+    def require_force_push(self) -> None:
+        self.require_verb("git", "force_push")
 
     def to_summary(self) -> dict[str, Any]:
         """Return a JSON-safe summary. Never includes raw env values."""
@@ -732,6 +816,9 @@ class OperatorPolicy:
             "owner_mode_ready": self.owner_mode_ready,
             "mutation_allowed": self.mutation_allowed,
             "available_capability_groups": _capability_groups(self.level),
+            "session_id": self.session_id,
+            "snapshot_hash": self.snapshot_hash,
+            "expires_at": self.expires_at,
         }
 
 
@@ -855,6 +942,13 @@ def audit_record(
                 record[k] = v[:500]
             else:
                 record[k] = v
+    try:
+        active = operator_sessions.active_session()
+        if active is not None:
+            record["session_id"] = active.session_id
+            record["snapshot_hash"] = active.snapshot_hash
+    except Exception:
+        pass
 
     try:
         log_path = audit_log_path()

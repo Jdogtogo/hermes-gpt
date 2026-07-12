@@ -14,6 +14,7 @@ from starlette.testclient import TestClient
 
 import operator_auth as op_auth
 import operator_policy as op_policy
+import operator_sessions as op_sessions
 import server
 
 
@@ -37,6 +38,8 @@ GATE_ENVS = [
     op_policy.OPERATOR_ALLOWED_PATHS_ENV,
     op_policy.OPERATOR_DENIED_PATHS_ENV,
     op_policy.OWNER_ACK_ENV,
+    op_sessions.SESSION_ROOT_ENV,
+    op_sessions.ACTIVE_SESSION_ID_ENV,
 ]
 
 
@@ -255,6 +258,107 @@ def test_local_owner_loopback_can_expose_bridge_without_oauth(monkeypatch):
     )
 
     assert "bridge_submit_command" in tool_names(built)
+
+
+def enable_operator_session(monkeypatch, tmp_path: Path) -> None:
+    auth_root = tmp_path / "auth"
+    session_root = tmp_path / "sessions"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = op_auth.AuthRuntimeConfig(
+        issuer_url="https://operator.example.test",
+        resource_server_url="https://operator.example.test/mcp",
+        scope="hermes:operator",
+        root=auth_root,
+        username="justin",
+    )
+    op_auth.bootstrap_credentials(config)
+    record = op_sessions.create_session(
+        {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "readable_roots": [str(workspace)],
+            "writable_roots": [str(workspace)],
+            "egress_hosts": ["localhost"],
+            "git_remotes": ["github.com/Jdogtogo/*"],
+            "verbs": {"filesystem": ["read", "edit"], "git": ["fetch", "push"]},
+        },
+        duration_seconds=600,
+        root=session_root,
+        session_id="ops-endpoint",
+    )
+    monkeypatch.setenv(op_sessions.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.setenv(op_sessions.ACTIVE_SESSION_ID_ENV, record.session_id)
+    monkeypatch.setenv(op_auth.AUTH_ENABLED_ENV, "1")
+    monkeypatch.setenv(op_auth.AUTH_ISSUER_URL_ENV, config.issuer_url)
+    monkeypatch.setenv(op_auth.AUTH_RESOURCE_URL_ENV, config.resource_server_url)
+    monkeypatch.setenv(op_auth.AUTH_ROOT_ENV, str(auth_root))
+    monkeypatch.setenv(op_auth.AUTH_SCOPE_ENV, config.scope)
+    monkeypatch.setenv(op_auth.AUTH_USERNAME_ENV, config.username)
+
+
+def test_chatgpt_operator_requires_oauth(monkeypatch, tmp_path):
+    clear_gate_envs(monkeypatch)
+    session_root = tmp_path / "sessions"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    record = op_sessions.create_session(
+        {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "readable_roots": [str(workspace)],
+            "writable_roots": [str(workspace)],
+        },
+        duration_seconds=600,
+        root=session_root,
+        session_id="ops-noauth",
+    )
+    monkeypatch.setenv(op_sessions.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.setenv(op_sessions.ACTIVE_SESSION_ID_ENV, record.session_id)
+
+    with pytest.raises(RuntimeError, match="OAuth"):
+        server.build_server(
+            http=True,
+            transport="streamable-http",
+            profile=server.CHATGPT_OPERATOR_PROFILE,
+        )
+
+
+def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatch, tmp_path):
+    clear_gate_envs(monkeypatch)
+    enable_operator_session(monkeypatch, tmp_path)
+
+    built = server.build_server(
+        http=True,
+        transport="streamable-http",
+        profile=server.CHATGPT_OPERATOR_PROFILE,
+    )
+    names = tool_names(built)
+
+    for required in [
+        "hermes_operator_session_status",
+        "hermes_operator_session_revoke",
+        "hermes_workspace_read",
+        "hermes_workspace_patch",
+        "hermes_workspace_write_file",
+        "hermes_workspace_run_test",
+        "hermes_git_status",
+        "hermes_git_diff",
+        "hermes_agent_run",
+    ]:
+        assert required in names
+    for forbidden in [
+        "hermes_owner_run_command",
+        "hermes_owner_patch",
+        "hermes_owner_write_file",
+        "bridge_submit_command",
+        "hermes_restricted_agent_run",
+    ]:
+        assert forbidden not in names
+    for tool in tools_by_name(built).values():
+        assert tool.meta == {
+            "securitySchemes": [{"type": "oauth2", "scopes": ["hermes:operator"]}]
+        }
 
 
 def test_authenticated_http_bridge_requires_bearer_token(monkeypatch, tmp_path):

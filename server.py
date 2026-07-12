@@ -19,6 +19,7 @@ import operator_workspace as op_workspace
 import operator_diagnostics as op_diagnostics
 import operator_bridge as op_bridge
 import operator_auth as op_auth
+import operator_sessions as op_sessions
 import dcr_compat
 
 try:
@@ -34,6 +35,7 @@ except ModuleNotFoundError as exc:
 LOCAL_DEV_PROFILE = "local-dev"
 REMOTE_PROFILE = "remote"
 CHATGPT_RESTRICTED_PROFILE = "chatgpt-restricted"
+CHATGPT_OPERATOR_PROFILE = "chatgpt-operator"
 LOCAL_OWNER_PROFILE = "local-owner"
 UNSAFE_REMOTE_ACK = "--i-understand-this-is-unsafe"
 UNSAFE_REMOTE_ENV = "HERMES_GPT_UNSAFE_REMOTE_NOAUTH"
@@ -122,6 +124,21 @@ def validate_local_owner_runtime(*, host: str) -> None:
     """Local owner HTTP is allowed only on loopback and never through Cloudflare."""
     if not is_loopback_host(host):
         raise RuntimeError("local-owner profile must bind to loopback only.")
+
+
+def validate_chatgpt_operator_runtime(*, host: str, transport: str) -> None:
+    """Fail closed before serving the authenticated Operator connector."""
+    if transport not in {"streamable-http", "sse"}:
+        raise RuntimeError("chatgpt-operator profile requires HTTP or SSE transport.")
+    if not is_loopback_host(host):
+        raise RuntimeError("chatgpt-operator profile must bind to loopback behind the tunnel.")
+    if not op_auth.auth_enabled():
+        raise RuntimeError("chatgpt-operator profile requires OAuth authentication.")
+    policy = op_policy.OperatorPolicy()
+    if not policy.enabled or not policy.session_id or not policy.snapshot_hash:
+        raise RuntimeError("chatgpt-operator profile requires an active Operator Session snapshot.")
+    if policy.level == "owner" or policy.owner_mode_ready or os.environ.get(op_policy.OWNER_ACK_ENV):
+        raise RuntimeError("chatgpt-operator profile refuses owner mode.")
 
 
 def restricted_path_denied(path: Path) -> bool:
@@ -703,6 +720,67 @@ def hermes_operator_audit_tail(limit: int = 20) -> str:
         )
 
 
+def hermes_operator_session_status() -> str:
+    """Return active Operator Session identity and expiry. Never returns secrets."""
+    try:
+        policy = op_policy.OperatorPolicy()
+        if not policy.session_id:
+            raise PermissionError("No active Operator Session is configured.")
+        return json.dumps(
+            {
+                "success": True,
+                "session_id": policy.session_id,
+                "snapshot_hash": policy.snapshot_hash,
+                "level": policy.level,
+                "apply_mode": policy.apply_mode,
+                "expires_at": policy.expires_at,
+                "owner_mode_ready": False,
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="OPERATOR_SESSION_STATUS_ERROR",
+                suggested_action="Create or activate a non-owner Operator Session.",
+            ),
+            indent=2,
+        )
+
+
+def hermes_operator_session_revoke(session_id: str = "") -> str:
+    """Revoke the active Operator Session or an explicitly supplied session id."""
+    try:
+        policy = op_policy.OperatorPolicy()
+        target = (session_id or policy.session_id or "").strip()
+        if not target:
+            raise ValueError("session_id is required.")
+        changed = op_sessions.revoke_session(target)
+        op_policy.audit_record(
+            tool="hermes_operator_session_revoke",
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=True,
+            changed=changed,
+            summary="revoked operator session" if changed else "operator session was already revoked or missing",
+            extra={"target_session_id": target},
+        )
+        return json.dumps({"success": True, "revoked": changed, "session_id": target}, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="OPERATOR_SESSION_REVOKE_ERROR",
+                suggested_action="Check the active Operator Session id.",
+            ),
+            indent=2,
+        )
+
+
 def hermes_operator_doctor(profile: str = "default") -> str:
     """Run a read-only health check across operator surfaces."""
     return op_diagnostics.hermes_operator_doctor(
@@ -1233,6 +1311,10 @@ def build_server(
         validate_chatgpt_restricted_runtime(host=host, transport=effective_transport)
         bridge_requested = False
         oauth_requested = False
+    elif profile == CHATGPT_OPERATOR_PROFILE:
+        validate_chatgpt_operator_runtime(host=host, transport=effective_transport)
+        bridge_requested = False
+        oauth_requested = True
     elif profile == LOCAL_OWNER_PROFILE:
         validate_local_owner_runtime(host=host)
 
@@ -1288,6 +1370,30 @@ def register_tools(
         if registered != RESTRICTED_TOOL_NAMES:
             raise RuntimeError("Restricted tool registration drifted.")
         for tool in restricted_tools.values():
+            server.add_tool(tool, meta=tool_meta())
+        return
+
+    if profile == CHATGPT_OPERATOR_PROFILE:
+        for tool in [
+            hermes_ops_brain_query,
+            hermes_operator_policy,
+            hermes_operator_status,
+            hermes_operator_session_status,
+            hermes_operator_session_revoke,
+            hermes_operator_audit_tail,
+            hermes_operator_doctor,
+            hermes_operator_snapshot,
+            hermes_config_get,
+            hermes_env_status,
+            hermes_gateway_status,
+            hermes_workspace_read,
+            hermes_workspace_patch,
+            hermes_workspace_write_file,
+            hermes_workspace_run_test,
+            hermes_git_status,
+            hermes_git_diff,
+            hermes_agent_run,
+        ]:
             server.add_tool(tool, meta=tool_meta())
         return
 
@@ -1386,6 +1492,7 @@ def main() -> None:
             LOCAL_DEV_PROFILE,
             REMOTE_PROFILE,
             CHATGPT_RESTRICTED_PROFILE,
+            CHATGPT_OPERATOR_PROFILE,
             LOCAL_OWNER_PROFILE,
         ],
         default=LOCAL_DEV_PROFILE,
@@ -1427,6 +1534,11 @@ def main() -> None:
     if args.profile == LOCAL_OWNER_PROFILE:
         try:
             validate_local_owner_runtime(host=args.host)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+    if args.profile == CHATGPT_OPERATOR_PROFILE:
+        try:
+            validate_chatgpt_operator_runtime(host=args.host, transport=transport)
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
 

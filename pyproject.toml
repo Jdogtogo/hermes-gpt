@@ -38,6 +38,7 @@ py-modules = [
   "operator_bridge",
   "operator_agent",
   "operator_auth",
+  "operator_sessions",
   "bridge_worker",
   "auth_bootstrap",
 ]

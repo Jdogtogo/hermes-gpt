@@ -363,19 +363,7 @@ def hermes_workspace_read(
     """Read a file. Read-only but applies operator path policy (deny secrets)."""
     try:
         policy = op.OperatorPolicy()
-        if op.is_denied_path(path):
-            raise PermissionError(
-                f"Path {path!r} is denied by the operator path safety policy."
-            )
-        # If allowed_paths is set, require the path to be under one of them.
-        # If allowed_paths is empty, allow reads anywhere that's not denied
-        # (read-only mode is the default and the existing hermes_read_file
-        # tool already exists).
-        if policy.allowed_paths and not op.path_under_allowed(path, policy.allowed_paths):
-            raise PermissionError(
-                f"Path {path!r} is not under any allowed path in "
-                f"{op.OPERATOR_ALLOWED_PATHS_ENV}."
-            )
+        policy.require_read_path(path)
         p = op._normalize_path(path)
         if not p.exists() or not p.is_file():
             raise FileNotFoundError(f"File not found: {path}")
@@ -741,13 +729,7 @@ def hermes_git_status(workdir: str, runner=None) -> str:
         policy = op.OperatorPolicy()
         if not workdir:
             raise ValueError("workdir is required.")
-        # If allowed_paths is set, workdir must be under one. Otherwise allow
-        # any workdir (read-only git status is safe and the existing terminal
-        # tool is also unguarded when enabled).
-        if policy.allowed_paths and not op.path_under_allowed(workdir, policy.allowed_paths):
-            raise PermissionError(
-                f"workdir {workdir!r} is not under any allowed path."
-            )
+        policy.require_read_path(workdir)
         rc, out, err = _git(["status", "--porcelain=v1"], workdir, runner=runner)
         result = {
             "success": rc == 0,
@@ -778,10 +760,7 @@ def hermes_git_diff(
         policy = op.OperatorPolicy()
         if not workdir:
             raise ValueError("workdir is required.")
-        if policy.allowed_paths and not op.path_under_allowed(workdir, policy.allowed_paths):
-            raise PermissionError(
-                f"workdir {workdir!r} is not under any allowed path."
-            )
+        policy.require_read_path(workdir)
         argv: list[str] = ["diff"]
         if stat:
             argv.append("--stat")
