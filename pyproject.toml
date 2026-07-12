@@ -54,12 +54,14 @@ py-modules = [
   "docs/release-notes-v0.3.0.md",
   "docs/release-notes-v0.4.0.md",
   "docs/file-bridge.md",
+  "docs/split-endpoint-architecture.md",
 ]
 "share/hermes-gpt/examples" = [
   "examples/start-hermes-gpt.example.ps1",
   "examples/status-hermes-gpt.example.ps1",
   "examples/install-task.example.ps1",
   "examples/hermes-file-bridge.service",
+  "examples/hermes-gpt-owner-local.service",
   "examples/hermes-gpt-sidecar-file-bridge.conf",
   "examples/hermes-gpt-sidecar-bridge.service",
   "examples/hermes-gpt-sidecar-cutover.service",

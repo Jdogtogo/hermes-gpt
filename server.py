@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from mcp.server.fastmcp import FastMCP
+
 import operator_policy as op_policy
 import operator_cron as op_cron
 import operator_skills as op_skills
@@ -31,6 +33,8 @@ except ModuleNotFoundError as exc:
 
 LOCAL_DEV_PROFILE = "local-dev"
 REMOTE_PROFILE = "remote"
+CHATGPT_RESTRICTED_PROFILE = "chatgpt-restricted"
+LOCAL_OWNER_PROFILE = "local-owner"
 UNSAFE_REMOTE_ACK = "--i-understand-this-is-unsafe"
 UNSAFE_REMOTE_ENV = "HERMES_GPT_UNSAFE_REMOTE_NOAUTH"
 ENABLE_WRITE_ENV = "HERMES_GPT_ENABLE_WRITE"
@@ -38,6 +42,15 @@ ENABLE_MEMORY_WRITE_ENV = "HERMES_GPT_ENABLE_MEMORY_WRITE"
 ENABLE_SESSION_SEARCH_ENV = "HERMES_GPT_ENABLE_SESSION_SEARCH"
 ENABLE_TERMINAL_ENV = "HERMES_GPT_ENABLE_TERMINAL"
 ENABLE_BRIDGE_ENV = "HERMES_GPT_ENABLE_BRIDGE"
+RESTRICTED_AGENT_MAX_TIMEOUT_SECONDS = 300
+RESTRICTED_AGENT_MAX_TURNS = 30
+RESTRICTED_TOOL_NAMES = frozenset(
+    {
+        "hermes_restricted_status",
+        "hermes_restricted_agent_run",
+        "hermes_ops_brain_query",
+    }
+)
 NOAUTH_META = {"securitySchemes": [{"type": "noauth"}]}
 RUNTIME_TRANSPORT = "unknown"
 
@@ -61,6 +74,61 @@ def env_enabled(name: str) -> bool:
 
 def is_loopback_host(host: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _enabled_high_risk_envs_for_restricted() -> list[str]:
+    return [
+        name
+        for name in [
+            ENABLE_WRITE_ENV,
+            ENABLE_MEMORY_WRITE_ENV,
+            ENABLE_SESSION_SEARCH_ENV,
+            ENABLE_TERMINAL_ENV,
+            ENABLE_BRIDGE_ENV,
+        ]
+        if env_enabled(name)
+    ]
+
+
+def validate_chatgpt_restricted_runtime(*, host: str, transport: str) -> None:
+    """Fail closed before serving a no-auth public connector endpoint."""
+    if transport not in {"streamable-http", "sse"}:
+        raise RuntimeError("chatgpt-restricted profile requires HTTP or SSE transport.")
+    if not is_loopback_host(host):
+        raise RuntimeError("chatgpt-restricted profile must bind to loopback only.")
+    if op_auth.auth_enabled():
+        raise RuntimeError("chatgpt-restricted profile must not enable OAuth.")
+    high_risk = _enabled_high_risk_envs_for_restricted()
+    if high_risk:
+        raise RuntimeError(
+            "chatgpt-restricted profile refuses high-risk env flags: "
+            + ", ".join(sorted(high_risk))
+        )
+
+    policy = op_policy.OperatorPolicy()
+    if not policy.enabled:
+        raise RuntimeError("chatgpt-restricted profile requires read-only operator policy.")
+    if policy.level != "read_only":
+        raise RuntimeError("chatgpt-restricted profile requires HERMES_GPT_OPERATOR_LEVEL=read_only.")
+    if policy.apply_mode != "dry_run":
+        raise RuntimeError("chatgpt-restricted profile requires HERMES_GPT_OPERATOR_APPLY_MODE=dry_run.")
+    if policy.owner_mode_ready or os.environ.get(op_policy.OWNER_ACK_ENV):
+        raise RuntimeError("chatgpt-restricted profile refuses owner acknowledgement.")
+    if not policy.allowed_paths:
+        raise RuntimeError("chatgpt-restricted profile requires at least one allowed read path.")
+
+
+def validate_local_owner_runtime(*, host: str) -> None:
+    """Local owner HTTP is allowed only on loopback and never through Cloudflare."""
+    if not is_loopback_host(host):
+        raise RuntimeError("local-owner profile must bind to loopback only.")
+
+
+def restricted_path_denied(path: Path) -> bool:
+    name = path.name.lower()
+    if name in op_policy.DEFAULT_DENIED_DIR_NAMES:
+        return True
+    return op_policy.is_denied_path(path)
 
 
 def is_hermes_root(path: Path) -> bool:
@@ -275,8 +343,6 @@ def clean_error(tool_name: str, exc: Exception) -> RuntimeError:
     eprint(f"hermes-gpt: {tool_name} failed: {exc}")
     return RuntimeError(f"{tool_name} failed: {exc}")
 
-
-from mcp.server.fastmcp import FastMCP
 
 import_hermes()
 
@@ -1049,6 +1115,105 @@ def hermes_ops_brain_query(command: str, keyword: str = "", limit: int = 5) -> s
         return f"OpsBrain query unavailable: {exc}"
 
 
+def hermes_restricted_status() -> str:
+    """Return the public no-auth endpoint posture without secrets."""
+    try:
+        policy = op_policy.OperatorPolicy()
+        payload = {
+            "success": True,
+            "profile": CHATGPT_RESTRICTED_PROFILE,
+            "authentication": "none",
+            "tool_surface": sorted(RESTRICTED_TOOL_NAMES),
+            "operator_level": policy.level,
+            "apply_mode": policy.apply_mode,
+            "owner_mode_ready": False,
+            "max_agent_timeout_seconds": RESTRICTED_AGENT_MAX_TIMEOUT_SECONDS,
+            "max_agent_turns": RESTRICTED_AGENT_MAX_TURNS,
+            "mutation": "disabled",
+            "bridge_submission": "disabled",
+            "secret_access": "denied",
+        }
+        return json.dumps(payload, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="RESTRICTED_STATUS_ERROR",
+                suggested_action="Check restricted endpoint operator environment.",
+            ),
+            indent=2,
+        )
+
+
+def hermes_restricted_agent_run(
+    prompt: str,
+    workdir: str,
+    mode: str = "read_only",
+    profile: str = "default",
+    max_turns: int = 12,
+    timeout: int = 120,
+) -> str:
+    """Run a bounded, read-only Hermes inspection for the no-auth endpoint."""
+    try:
+        if op_agent is None:
+            raise RuntimeError("operator_agent.py is unavailable.")
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode not in {"plan", "read_only"}:
+            raise PermissionError("Restricted endpoint allows only plan or read_only mode.")
+        turns = int(max_turns)
+        if not 1 <= turns <= RESTRICTED_AGENT_MAX_TURNS:
+            raise ValueError(
+                f"max_turns must be between 1 and {RESTRICTED_AGENT_MAX_TURNS}."
+            )
+        capped_timeout = int(timeout)
+        if not 1 <= capped_timeout <= RESTRICTED_AGENT_MAX_TIMEOUT_SECONDS:
+            raise ValueError(
+                "timeout must be between 1 and "
+                f"{RESTRICTED_AGENT_MAX_TIMEOUT_SECONDS} seconds; use the local file bridge for longer jobs."
+            )
+
+        policy = op_policy.OperatorPolicy()
+        policy.require_level("read_only")
+        if policy.level != "read_only" or policy.apply_mode != "dry_run" or policy.owner_mode_ready:
+            raise PermissionError("Restricted endpoint is not running under read_only/dry_run policy.")
+        canonical_profile = op_policy.validate_profile_name(profile)
+        policy.require_profile(canonical_profile, _hermes_root_for_operator())
+
+        candidate = Path(workdir).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("workdir must be an absolute path.")
+        resolved_workdir = candidate.resolve(strict=True)
+        if not resolved_workdir.is_dir():
+            raise NotADirectoryError("workdir must be an existing directory.")
+        if restricted_path_denied(resolved_workdir):
+            raise PermissionError("workdir is denied by restricted endpoint policy.")
+        policy.require_workspace_path(str(resolved_workdir))
+
+        return op_agent.hermes_agent_run(
+            prompt=prompt,
+            mode=normalized_mode,
+            profile=canonical_profile,
+            workdir=str(resolved_workdir),
+            max_turns=turns,
+            timeout=capped_timeout,
+            allow_web=False,
+            apply=False,
+            transport=RUNTIME_TRANSPORT,
+            hermes_root=_hermes_root_for_operator(),
+        )
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="RESTRICTED_AGENT_RUN_DENIED",
+                suggested_action="Use an allowed read-only workdir, or use the local owner endpoint/file bridge for mutation.",
+            ),
+            indent=2,
+        )
+
+
 
 def build_server(
     *,
@@ -1057,13 +1222,26 @@ def build_server(
     http: bool = False,
     include_local_settings: bool = False,
     transport: str | None = None,
+    profile: str = LOCAL_DEV_PROFILE,
 ) -> FastMCP:
     effective_transport = transport or ("streamable-http" if http else "stdio")
     remote_transport = effective_transport in {"streamable-http", "sse"}
     bridge_requested = env_enabled(ENABLE_BRIDGE_ENV)
     oauth_requested = remote_transport and op_auth.auth_enabled()
 
-    if remote_transport and bridge_requested and not oauth_requested:
+    if profile == CHATGPT_RESTRICTED_PROFILE:
+        validate_chatgpt_restricted_runtime(host=host, transport=effective_transport)
+        bridge_requested = False
+        oauth_requested = False
+    elif profile == LOCAL_OWNER_PROFILE:
+        validate_local_owner_runtime(host=host)
+
+    if (
+        remote_transport
+        and bridge_requested
+        and not oauth_requested
+        and profile != LOCAL_OWNER_PROFILE
+    ):
         raise RuntimeError(
             f"{ENABLE_BRIDGE_ENV}=1 is refused over HTTP/SSE unless "
             f"{op_auth.AUTH_ENABLED_ENV}=1 and OAuth is configured."
@@ -1090,11 +1268,29 @@ def build_server(
     )
     if provider is not None:
         op_auth.register_login_routes(server, provider)
-    register_tools(server, include_bridge=bridge_requested)
+    register_tools(server, include_bridge=bridge_requested, profile=profile)
     return server
 
 
-def register_tools(server: FastMCP, *, include_bridge: bool = False) -> None:
+def register_tools(
+    server: FastMCP,
+    *,
+    include_bridge: bool = False,
+    profile: str = LOCAL_DEV_PROFILE,
+) -> None:
+    if profile == CHATGPT_RESTRICTED_PROFILE:
+        restricted_tools = {
+            "hermes_restricted_status": hermes_restricted_status,
+            "hermes_restricted_agent_run": hermes_restricted_agent_run,
+            "hermes_ops_brain_query": hermes_ops_brain_query,
+        }
+        registered = set(restricted_tools)
+        if registered != RESTRICTED_TOOL_NAMES:
+            raise RuntimeError("Restricted tool registration drifted.")
+        for tool in restricted_tools.values():
+            server.add_tool(tool, meta=tool_meta())
+        return
+
     server.add_tool(hermes_read_file, meta=tool_meta())
     server.add_tool(hermes_search_files, meta=tool_meta())
     server.add_tool(hermes_memory, meta=tool_meta())
@@ -1186,9 +1382,14 @@ def main() -> None:
     parser.add_argument("--key", help="Path to SSL key file (enables HTTPS)")
     parser.add_argument(
         "--profile",
-        choices=[LOCAL_DEV_PROFILE, REMOTE_PROFILE],
+        choices=[
+            LOCAL_DEV_PROFILE,
+            REMOTE_PROFILE,
+            CHATGPT_RESTRICTED_PROFILE,
+            LOCAL_OWNER_PROFILE,
+        ],
         default=LOCAL_DEV_PROFILE,
-        help="Release safety profile. Remote no-auth is refused unless explicitly acknowledged.",
+        help="Release safety profile.",
     )
     parser.add_argument(
         UNSAFE_REMOTE_ACK,
@@ -1218,12 +1419,24 @@ def main() -> None:
         eprint("WARNING: remote no-auth mode is explicitly unsafe and intended only for temporary experiments.")
 
     transport = "streamable-http" if args.http else "sse" if args.sse else "stdio"
+    if args.profile == CHATGPT_RESTRICTED_PROFILE:
+        try:
+            validate_chatgpt_restricted_runtime(host=args.host, transport=transport)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+    if args.profile == LOCAL_OWNER_PROFILE:
+        try:
+            validate_local_owner_runtime(host=args.host)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+
     RUNTIME_TRANSPORT = transport
     server = build_server(
         host=args.host,
         port=args.port,
         http=args.http,
         transport=transport,
+        profile=args.profile,
     )
     if transport == "stdio":
         eprint("hermes-gpt MCP server starting in stdio mode.")

@@ -13,6 +13,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import operator_auth as op_auth
+import operator_policy as op_policy
 import server
 
 
@@ -29,6 +30,13 @@ GATE_ENVS = [
     op_auth.AUTH_ROOT_ENV,
     op_auth.AUTH_SCOPE_ENV,
     op_auth.AUTH_USERNAME_ENV,
+    op_policy.OPERATOR_ENABLED_ENV,
+    op_policy.OPERATOR_LEVEL_ENV,
+    op_policy.OPERATOR_APPLY_MODE_ENV,
+    op_policy.OPERATOR_ALLOWED_PROFILES_ENV,
+    op_policy.OPERATOR_ALLOWED_PATHS_ENV,
+    op_policy.OPERATOR_DENIED_PATHS_ENV,
+    op_policy.OWNER_ACK_ENV,
 ]
 
 
@@ -45,6 +53,15 @@ def tool_names(mcp_server) -> list[str]:
 def tools_by_name(mcp_server):
     tools = asyncio.run(mcp_server.list_tools())
     return {tool.name: tool for tool in tools}
+
+
+def enable_restricted_env(monkeypatch: pytest.MonkeyPatch, allowed_path: Path) -> None:
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(op_policy.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op_policy.OPERATOR_LEVEL_ENV, "read_only")
+    monkeypatch.setenv(op_policy.OPERATOR_APPLY_MODE_ENV, "dry_run")
+    monkeypatch.setenv(op_policy.OPERATOR_ALLOWED_PROFILES_ENV, "default")
+    monkeypatch.setenv(op_policy.OPERATOR_ALLOWED_PATHS_ENV, str(allowed_path))
 
 
 def test_default_tool_surface_is_read_or_local_metadata_only(monkeypatch):
@@ -125,6 +142,119 @@ def test_http_bridge_refuses_without_oauth(monkeypatch):
     monkeypatch.setenv(server.ENABLE_BRIDGE_ENV, "1")
     with pytest.raises(RuntimeError, match="refused over HTTP/SSE"):
         server.build_server(http=True, transport="streamable-http")
+
+
+def test_chatgpt_restricted_tool_surface_is_allowlisted(monkeypatch, tmp_path):
+    enable_restricted_env(monkeypatch, tmp_path)
+
+    built = server.build_server(
+        http=True,
+        transport="streamable-http",
+        profile=server.CHATGPT_RESTRICTED_PROFILE,
+    )
+    names = tool_names(built)
+
+    assert names == sorted(server.RESTRICTED_TOOL_NAMES)
+    for forbidden in [
+        "hermes_owner_run_command",
+        "hermes_owner_patch",
+        "hermes_workspace_write_file",
+        "hermes_gateway_restart",
+        "hermes_config_set",
+        "hermes_env_set_nonsecret",
+        "hermes_run_command",
+        "bridge_submit_command",
+        "hermes_read_file",
+    ]:
+        assert forbidden not in names
+    for tool in tools_by_name(built).values():
+        assert tool.meta == {"securitySchemes": [{"type": "noauth"}]}
+
+
+def test_chatgpt_restricted_refuses_high_risk_env(monkeypatch, tmp_path):
+    enable_restricted_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(server.ENABLE_TERMINAL_ENV, "1")
+
+    with pytest.raises(RuntimeError, match="high-risk env"):
+        server.build_server(
+            http=True,
+            transport="streamable-http",
+            profile=server.CHATGPT_RESTRICTED_PROFILE,
+        )
+
+
+def test_chatgpt_restricted_agent_denies_secret_path_before_execution(monkeypatch, tmp_path):
+    allowed = tmp_path
+    denied = tmp_path / ".ssh"
+    denied.mkdir()
+    enable_restricted_env(monkeypatch, allowed)
+    called = False
+
+    def should_not_call(**kwargs):
+        nonlocal called
+        called = True
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr(
+        server,
+        "op_agent",
+        SimpleNamespace(hermes_agent_run=should_not_call),
+    )
+
+    result = json.loads(
+        server.hermes_restricted_agent_run(
+            "Inspect this directory.",
+            workdir=str(denied),
+        )
+    )
+
+    assert result["success"] is False
+    assert result["code"] == "RESTRICTED_AGENT_RUN_DENIED"
+    assert called is False
+
+
+def test_chatgpt_restricted_agent_forces_read_only_execution(monkeypatch, tmp_path):
+    enable_restricted_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "RUNTIME_TRANSPORT", "streamable-http")
+    captured = {}
+
+    def fake_agent_run(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True, "returncode": 0})
+
+    monkeypatch.setattr(
+        server,
+        "op_agent",
+        SimpleNamespace(hermes_agent_run=fake_agent_run),
+    )
+
+    result = json.loads(
+        server.hermes_restricted_agent_run(
+            "Inspect this workspace.",
+            workdir=str(tmp_path),
+            timeout=server.RESTRICTED_AGENT_MAX_TIMEOUT_SECONDS,
+        )
+    )
+
+    assert result["success"] is True
+    assert captured["mode"] == "read_only"
+    assert captured["allow_web"] is False
+    assert captured["apply"] is False
+    assert captured["transport"] == "streamable-http"
+
+
+def test_local_owner_loopback_can_expose_bridge_without_oauth(monkeypatch):
+    clear_gate_envs(monkeypatch)
+    monkeypatch.setenv(server.ENABLE_BRIDGE_ENV, "1")
+
+    built = server.build_server(
+        http=True,
+        host="127.0.0.1",
+        transport="streamable-http",
+        profile=server.LOCAL_OWNER_PROFILE,
+    )
+
+    assert "bridge_submit_command" in tool_names(built)
 
 
 def test_authenticated_http_bridge_requires_bearer_token(monkeypatch, tmp_path):

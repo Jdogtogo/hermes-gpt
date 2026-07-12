@@ -18,6 +18,7 @@ APPLY_TOOLSETS = ("terminal", "file", "skills", "todo")
 FILE_READ_SAFE_ROOT_ENV = "HERMES_FILE_READ_SAFE_ROOT"
 MAX_PROMPT_BYTES = 65536
 MAX_OUTPUT_CHARS = 4096
+MAX_TIMEOUT_SECONDS = 3600
 
 _MODE_PREFIXES = {
     "plan": (
@@ -162,8 +163,10 @@ def hermes_agent_run(
         if not 1 <= turns <= 100:
             raise ValueError("max_turns must be between 1 and 100.")
         capped_timeout = int(timeout)
-        if not 1 <= capped_timeout <= 600:
-            raise ValueError("timeout must be between 1 and 600 seconds.")
+        if not 1 <= capped_timeout <= MAX_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds."
+            )
 
         policy = op.OperatorPolicy()
         policy.require_enabled()

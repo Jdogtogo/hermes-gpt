@@ -327,6 +327,29 @@ python server.py --http --profile remote --i-understand-this-is-unsafe
 
 Do not use this bypass for release.
 
+## Restricted ChatGPT profile
+
+For a personal ChatGPT connector configured with **No authentication**, use the
+split endpoint profile instead of disabling OAuth on an owner/direct service:
+
+```bash
+python server.py --http --profile chatgpt-restricted --host 127.0.0.1 --port 7677
+```
+
+This profile registers only `hermes_restricted_status`,
+`hermes_restricted_agent_run`, and `hermes_ops_brain_query`. It refuses to start
+unless the process is loopback-only, no-OAuth, read-only, dry-run, and free of
+write, terminal, session-search, memory-write, bridge, and owner acknowledgement
+flags.
+
+Run owner/direct capability separately on loopback only:
+
+```bash
+python server.py --http --profile local-owner --host 127.0.0.1 --port 7679
+```
+
+Do not route Cloudflare to the local owner endpoint.
+
 ## Release checklist
 
 Before publishing:

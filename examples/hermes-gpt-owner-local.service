@@ -1,19 +1,23 @@
 [Unit]
-Description=Hermes asynchronous file-bridge worker
-After=hermes-gateway.service hermes-gpt-owner-local.service
-Wants=hermes-gateway.service hermes-gpt-owner-local.service
+Description=Hermes GPT local owner MCP sidecar
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/home/jfroh/.hermes/worktrees/hermes-file-bridge
-Environment="HERMES_GPT_BRIDGE_ROOT=/home/jfroh/.hermes/bridge"
+Environment="PYTHONPATH=/home/jfroh/.hermes/hermes-agent"
+Environment="HERMES_GPT_READ_ONLY=1"
+Environment="HERMES_GPT_ENABLE_MEMORY_WRITE=1"
+Environment="HERMES_GPT_ENABLE_SESSION_SEARCH=1"
 Environment="HERMES_GPT_OPERATOR_ENABLED=1"
 Environment="HERMES_GPT_OPERATOR_LEVEL=owner"
 Environment="HERMES_GPT_OPERATOR_APPLY_MODE=direct"
 Environment="HERMES_GPT_OWNER_ACK=I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE"
 Environment="HERMES_GPT_OPERATOR_ALLOWED_PROFILES=default"
 Environment="HERMES_GPT_OPERATOR_ALLOWED_PATHS=/home/jfroh/hermes-gpt,/home/jfroh/.hermes/hermes-agent,/home/jfroh/.hermes/ops-brain,/home/jfroh/.hermes/sessions,/home/jfroh/.hermes/turn_logs,/home/jfroh/.hermes/memories,/home/jfroh/.hermes/logs,/home/jfroh/.hermes/worktrees/hermes-file-bridge,/home/jfroh/.hermes/bridge"
-ExecStart=/home/jfroh/hermes-gpt/.venv/bin/python /home/jfroh/.hermes/worktrees/hermes-file-bridge/bridge_worker.py --root /home/jfroh/.hermes/bridge --profile default --max-turns 30 --timeout 3600
+Environment="HERMES_GPT_ENABLE_BRIDGE=1"
+ExecStart=/home/jfroh/hermes-gpt/.venv/bin/python /home/jfroh/.hermes/worktrees/hermes-file-bridge/server.py --http --profile local-owner --host 127.0.0.1 --port 7679
 Restart=on-failure
 RestartSec=5
 UMask=0077

@@ -1,30 +1,19 @@
 [Unit]
-Description=Hermes GPT MCP sidecar with file bridge
+Description=Hermes GPT restricted ChatGPT MCP sidecar
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=/home/jfroh/.hermes/auth/hermes-gpt/credentials.json
 
 [Service]
 Type=simple
 WorkingDirectory=/home/jfroh/.hermes/worktrees/hermes-file-bridge
 Environment="PYTHONPATH=/home/jfroh/.hermes/hermes-agent"
 Environment="HERMES_GPT_READ_ONLY=1"
-Environment="HERMES_GPT_ENABLE_MEMORY_WRITE=1"
-Environment="HERMES_GPT_ENABLE_SESSION_SEARCH=1"
 Environment="HERMES_GPT_OPERATOR_ENABLED=1"
-Environment="HERMES_GPT_OPERATOR_LEVEL=owner"
-Environment="HERMES_GPT_OPERATOR_APPLY_MODE=direct"
-Environment="HERMES_GPT_OWNER_ACK=I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE"
+Environment="HERMES_GPT_OPERATOR_LEVEL=read_only"
+Environment="HERMES_GPT_OPERATOR_APPLY_MODE=dry_run"
 Environment="HERMES_GPT_OPERATOR_ALLOWED_PROFILES=default"
-Environment="HERMES_GPT_OPERATOR_ALLOWED_PATHS=/home/jfroh/hermes-gpt,/home/jfroh/.hermes/hermes-agent,/home/jfroh/.hermes/ops-brain,/home/jfroh/.hermes/sessions,/home/jfroh/.hermes/turn_logs,/home/jfroh/.hermes/memories,/home/jfroh/.hermes/logs,/home/jfroh/.hermes/worktrees/hermes-file-bridge,/home/jfroh/.hermes/bridge"
-Environment="HERMES_GPT_ENABLE_BRIDGE=1"
-Environment="HERMES_GPT_AUTH_ENABLED=1"
-Environment="HERMES_GPT_AUTH_ISSUER_URL=https://mcp.frohnert-hermes.org"
-Environment="HERMES_GPT_AUTH_RESOURCE_URL=https://mcp.frohnert-hermes.org/mcp"
-Environment="HERMES_GPT_AUTH_ROOT=/home/jfroh/.hermes/auth/hermes-gpt"
-Environment="HERMES_GPT_AUTH_SCOPE=hermes:operator"
-Environment="HERMES_GPT_AUTH_USERNAME=justin"
-ExecStart=/home/jfroh/hermes-gpt/.venv/bin/python /home/jfroh/.hermes/worktrees/hermes-file-bridge/server.py --http --host 127.0.0.1 --port 7677
+Environment="HERMES_GPT_OPERATOR_ALLOWED_PATHS=/home/jfroh/.hermes/ops-brain,/home/jfroh/.hermes/worktrees/hermes-file-bridge"
+ExecStart=/home/jfroh/hermes-gpt/.venv/bin/python /home/jfroh/.hermes/worktrees/hermes-file-bridge/server.py --http --profile chatgpt-restricted --host 127.0.0.1 --port 7677
 Restart=on-failure
 RestartSec=5
 UMask=0077
@@ -32,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/home/jfroh/hermes-gpt /home/jfroh/.hermes/hermes-agent /home/jfroh/.hermes/ops-brain /home/jfroh/.hermes/sessions /home/jfroh/.hermes/turn_logs /home/jfroh/.hermes/memories /home/jfroh/.hermes/logs /home/jfroh/.hermes/worktrees/hermes-file-bridge /home/jfroh/.hermes/bridge /home/jfroh/.hermes/auth/hermes-gpt
+ReadWritePaths=/home/jfroh/.hermes/logs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
