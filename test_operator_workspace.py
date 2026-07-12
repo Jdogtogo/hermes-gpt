@@ -281,6 +281,57 @@ def test_gateway_status_no_pid_file(tmp_path, clean_env, audit_override):
     assert parsed["gateway_pid"] is None
 
 
+def test_systemd_default_gateway_status_reports_active_service():
+    calls = []
+
+    def runner(argv, timeout, workdir):
+        calls.append((argv, timeout, workdir))
+        return 0, "MainPID=4242\nActiveState=active\nSubState=running\n", ""
+
+    status = ows._systemd_default_gateway_status(runner=runner)
+    assert status == {
+        "running": True,
+        "pid": 4242,
+        "active_state": "active",
+        "sub_state": "running",
+        "unit": "hermes-gateway.service",
+    }
+    assert calls[0][0][:4] == ["systemctl", "--user", "show", "hermes-gateway.service"]
+
+
+def test_systemd_default_gateway_status_falls_back_when_probe_fails():
+    status = ows._systemd_default_gateway_status(
+        runner=lambda argv, timeout, workdir: (1, "", "systemd unavailable")
+    )
+    assert status is None
+
+
+def test_gateway_status_uses_systemd_with_explicit_default_root(
+    tmp_path, clean_env, audit_override, monkeypatch
+):
+    monkeypatch.setattr(ows.op, "resolve_profile_home", lambda profile, root: tmp_path)
+    monkeypatch.setattr(
+        ows,
+        "_systemd_default_gateway_status",
+        lambda: {
+            "running": True,
+            "pid": 4242,
+            "active_state": "active",
+            "sub_state": "running",
+            "unit": "hermes-gateway.service",
+        },
+    )
+
+    parsed = json.loads(
+        ows.hermes_gateway_status(
+            profile="default", hermes_root=tmp_path, prefer_systemd=True
+        )
+    )
+    assert parsed["gateway_running"] is True
+    assert parsed["gateway_pid"] == 4242
+    assert parsed["gateway_status_source"] == "systemd"
+
+
 def test_gateway_status_with_state_file(tmp_path, clean_env, audit_override):
     (tmp_path / "gateway_state.json").write_text(
         json.dumps({"telegram": {"connected": True}, "discord": {"connected": False}}),

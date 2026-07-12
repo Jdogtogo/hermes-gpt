@@ -99,9 +99,60 @@ def _gateway_state_path(profile_home: Path) -> Path:
     return profile_home / "gateway_state.json"
 
 
+def _systemd_default_gateway_status(runner=None) -> dict[str, Any] | None:
+    """Return authoritative default-gateway service state when systemd is available.
+
+    None means the probe is unsupported or failed, so callers must retain
+    the portable PID-file fallback.
+    """
+    if os.name == "nt":
+        return None
+    run_fn = runner or op.run_argv
+    try:
+        rc, stdout, _stderr = run_fn(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "hermes-gateway.service",
+                "--property=ActiveState,SubState,MainPID",
+            ],
+            timeout=10,
+            workdir=None,
+        )
+    except Exception:
+        return None
+    if rc != 0:
+        return None
+
+    values: dict[str, str] = {}
+    for line in stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+
+    active_state = values.get("ActiveState")
+    sub_state = values.get("SubState")
+    if active_state is None:
+        return None
+    try:
+        main_pid = int(values.get("MainPID", "0"))
+    except ValueError:
+        main_pid = 0
+
+    return {
+        "running": active_state == "active" and sub_state == "running",
+        "pid": main_pid if main_pid > 0 else None,
+        "active_state": active_state,
+        "sub_state": sub_state,
+        "unit": "hermes-gateway.service",
+    }
+
+
 def hermes_gateway_status(
     profile: str = "default",
     hermes_root: Path | None = None,
+    prefer_systemd: bool = False,
 ) -> str:
     try:
         policy = op.OperatorPolicy()
@@ -117,6 +168,7 @@ def hermes_gateway_status(
             except (OSError, ValueError):
                 pid = None
         running = False
+        status_source = "pid_file" if pid is not None else "unavailable"
         if pid is not None:
             try:
                 import psutil  # type: ignore
@@ -131,6 +183,16 @@ def hermes_gateway_status(
                     running = False
                 except Exception:
                     running = False
+
+        # The default Linux installation is supervised by a user systemd unit.
+        # Prefer that authoritative service state over a stale/missing PID file.
+        systemd_status = None
+        if profile == "default" and prefer_systemd:
+            systemd_status = _systemd_default_gateway_status()
+            if systemd_status is not None:
+                running = bool(systemd_status["running"])
+                pid = systemd_status["pid"]
+                status_source = "systemd"
 
         state: dict[str, Any] = {}
         if state_path.exists():
@@ -167,9 +229,14 @@ def hermes_gateway_status(
             "profile": profile,
             "gateway_pid": pid,
             "gateway_running": running,
+            "gateway_status_source": status_source,
             "ticker_heartbeat_mtime": ticker_heartbeat,
             "adapters": adapters_summary,
         }
+        if systemd_status is not None:
+            result["systemd_unit"] = systemd_status["unit"]
+            result["systemd_active_state"] = systemd_status["active_state"]
+            result["systemd_sub_state"] = systemd_status["sub_state"]
         return json.dumps(result, indent=2)
     except Exception as exc:
         return json.dumps(
@@ -581,7 +648,9 @@ def hermes_workspace_run_test(
         try:
             argv = _split_command_argv(command)
         except ValueError as exc:
-            raise ValueError(f"Could not parse command: {exc}") from exc
+            raise PermissionError(
+                "Command not in the test/lint allowlist: could not parse safely."
+            ) from exc
 
         allowed, reason = _is_allowed_test_command(argv)
         if not allowed:

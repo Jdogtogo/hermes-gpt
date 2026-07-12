@@ -143,6 +143,53 @@ def test_doctor_fails_for_dead_pid(hermes_root, clean_env, audit_override):
     assert parsed["checks"]["gateway_status"]["layer"] == "gateway"
 
 
+def test_gateway_check_prefers_active_systemd_when_pid_file_is_missing(
+    hermes_root, clean_env, audit_override, monkeypatch
+):
+    (hermes_root / "cron" / "ticker_heartbeat").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(od.op, "resolve_profile_home", lambda profile, root: hermes_root)
+    monkeypatch.setattr(
+        od.op_workspace,
+        "_systemd_default_gateway_status",
+        lambda: {
+            "running": True,
+            "pid": 4242,
+            "active_state": "active",
+            "sub_state": "running",
+            "unit": "hermes-gateway.service",
+        },
+    )
+
+    check = od._check_gateway_status(hermes_root, prefer_systemd=True)
+    assert check["status"] == "PASS"
+    assert check["pid"] == 4242
+    assert check["running"] is True
+    assert check["status_source"] == "systemd"
+
+
+def test_gateway_check_fails_when_systemd_is_inactive_even_with_fresh_heartbeat(
+    hermes_root, clean_env, audit_override, monkeypatch
+):
+    (hermes_root / "cron" / "ticker_heartbeat").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(od.op, "resolve_profile_home", lambda profile, root: hermes_root)
+    monkeypatch.setattr(
+        od.op_workspace,
+        "_systemd_default_gateway_status",
+        lambda: {
+            "running": False,
+            "pid": None,
+            "active_state": "inactive",
+            "sub_state": "dead",
+            "unit": "hermes-gateway.service",
+        },
+    )
+
+    check = od._check_gateway_status(hermes_root, prefer_systemd=True)
+    assert check["status"] == "FAIL"
+    assert check["code"] == "GATEWAY_SYSTEMD_INACTIVE"
+    assert check["status_source"] == "systemd"
+
+
 def test_doctor_fails_for_corrupt_cron_jobs(hermes_root, clean_env, audit_override):
     (hermes_root / "cron" / "jobs.json").write_text("not json", encoding="utf-8")
     out = od.hermes_operator_doctor(profile="default", hermes_root=hermes_root)
@@ -166,7 +213,7 @@ def test_doctor_structures_upstream_502_like_failure(hermes_root, clean_env, aud
     def _boom(*args, **kwargs):
         raise RuntimeError("upstream returned 502 Bad Gateway for /connector/health")
 
-    monkeypatch.setattr(od, "_check_gateway_status", lambda profile_home: od._check_result(
+    monkeypatch.setattr(od, "_check_gateway_status", lambda profile_home, prefer_systemd=False: od._check_result(
         status=od.STATUS_FAIL,
         layer="connector",
         code="UPSTREAM_502",
@@ -253,6 +300,7 @@ def test_snapshot_never_includes_env_values(hermes_root, clean_env, audit_overri
 
 
 def test_release_doctor_clean_repo_passes(tmp_path, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "dry_run")
     # Build a minimal clean repo.
     repo = tmp_path / "repo"
     repo.mkdir()

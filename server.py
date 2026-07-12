@@ -17,6 +17,7 @@ import operator_workspace as op_workspace
 import operator_diagnostics as op_diagnostics
 import operator_bridge as op_bridge
 import operator_auth as op_auth
+import dcr_compat
 
 try:
     import operator_agent as op_agent
@@ -639,7 +640,9 @@ def hermes_operator_audit_tail(limit: int = 20) -> str:
 def hermes_operator_doctor(profile: str = "default") -> str:
     """Run a read-only health check across operator surfaces."""
     return op_diagnostics.hermes_operator_doctor(
-        profile=profile, hermes_root=_default_hermes_root()
+        profile=profile,
+        hermes_root=_default_hermes_root(),
+        prefer_systemd=(profile == "default"),
     )
 
 
@@ -660,7 +663,10 @@ def hermes_release_doctor(workdir: str | None = None, full_tests: bool = False, 
 def hermes_operator_recover(profile: str = "default", apply: bool = False) -> str:
     """Conservative recovery sequence. Dry-run by default."""
     return op_diagnostics.hermes_operator_recover(
-        profile=profile, apply=apply, hermes_root=_default_hermes_root()
+        profile=profile,
+        apply=apply,
+        hermes_root=_default_hermes_root(),
+        prefer_systemd=(profile == "default"),
     )
 
 
@@ -846,7 +852,9 @@ def hermes_env_copy_nonsecret(source_profile: str, target_profile: str, key: str
 
 def hermes_gateway_status(profile: str = "default") -> str:
     return op_workspace.hermes_gateway_status(
-        profile=profile, hermes_root=_default_hermes_root(),
+        profile=profile,
+        hermes_root=_default_hermes_root(),
+        prefer_systemd=(profile == "default"),
     )
 
 
@@ -1228,6 +1236,9 @@ def main() -> None:
         # local-only testing when cert/key are provided.
         import uvicorn
         app = server.streamable_http_app() if args.http else server.sse_app()
+        # Register public PKCE clients (e.g. ChatGPT) that request a confidential
+        # token_endpoint_auth_method but present no secret. See dcr_compat.
+        app = dcr_compat.normalize_public_client_registration(app)
 
         uvicorn.run(
             app,

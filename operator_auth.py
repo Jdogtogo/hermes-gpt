@@ -136,6 +136,17 @@ def _validate_https_origin(value: str, variable: str) -> str:
     return raw
 
 
+def _origin_of_url(value: str) -> str:
+    """Return ``scheme://host[:port]`` for a URL, or "" if it cannot be parsed."""
+    parsed = urlparse((value or "").strip())
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    origin = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port:
+        origin = f"{origin}:{parsed.port}"
+    return origin
+
+
 def _secure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, 0o700)
@@ -479,10 +490,22 @@ class PersistentOAuthProvider(
             connection.execute("DELETE FROM login_attempts WHERE rate_key = ?", (rate_key,))
 
     def login_page(self, state: str) -> HTMLResponse:
-        if not state or self._load_pending(state) is None:
+        pending = self._load_pending(state) if state else None
+        if pending is None:
             return HTMLResponse("Invalid or expired authorization request.", status_code=400)
         escaped_state = html.escape(state, quote=True)
         action = html.escape(f"{self.config.issuer_url}/login/callback", quote=True)
+        # A successful login redirects (302) to the OAuth client's registered
+        # redirect_uri, which is cross-origin (e.g. ChatGPT). Browsers enforce
+        # form-action across that redirect, so the client's callback origin must
+        # be allowlisted or the redirect is blocked and the code never reaches
+        # the client. The redirect_uri was validated at registration/authorize.
+        redirect_origin = _origin_of_url(str(pending.get("redirect_uri", "")))
+        form_action = f"'self' {redirect_origin}" if redirect_origin else "'self'"
+        csp = (
+            f"default-src 'none'; form-action {form_action}; "
+            "base-uri 'none'; frame-ancestors 'none'"
+        )
         content = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Authorize Hermes-GPT</title></head>
 <body><main><h1>Authorize Hermes-GPT</h1>
@@ -497,7 +520,7 @@ class PersistentOAuthProvider(
             headers={
                 "Cache-Control": "no-store",
                 "Pragma": "no-cache",
-                "Content-Security-Policy": "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+                "Content-Security-Policy": csp,
                 "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer",
             },

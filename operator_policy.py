@@ -24,7 +24,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Optional
 
 # ---------------------------------------------------------------------------
@@ -305,7 +305,22 @@ def normalize_hermes_data_root(path: str | os.PathLike[str] | None) -> Path | No
     """
     if path is None:
         return None
-    raw = Path(os.path.expanduser(str(path)))
+    raw_text = os.path.expanduser(str(path))
+
+    # Path uses the host platform's syntax, so a Windows HERMES_HOME received
+    # through WSL/Linux is otherwise treated as one opaque filename. Parse
+    # backslash-separated paths explicitly and convert the normalized result
+    # back to Path without requiring the path to exist.
+    if "\\" in raw_text:
+        windows_path = PureWindowsPath(raw_text)
+        parts = [part.lower() for part in windows_path.parts]
+        if parts and parts[-1] == "hermes-agent":
+            windows_path = windows_path.parent
+        elif len(parts) >= 2 and parts[-2] == "profiles":
+            windows_path = windows_path.parent.parent
+        return Path(str(windows_path))
+
+    raw = Path(raw_text)
     try:
         parts = [part.lower() for part in raw.parts]
     except Exception:

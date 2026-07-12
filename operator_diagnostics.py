@@ -259,7 +259,9 @@ def _check_operator_runtime() -> dict[str, Any]:
     )
 
 
-def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
+def _check_gateway_status(
+    profile_home: Path, prefer_systemd: bool = False
+) -> dict[str, Any]:
     pid_path = _gateway_pid_path(profile_home)
     heartbeat_path = _ticker_heartbeat_path(profile_home)
 
@@ -272,6 +274,15 @@ def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
 
     running = _is_process_alive(pid) if pid is not None else False
 
+    # For the real default profile, systemd is the authoritative supervisor.
+    # Tests and portable/profile-specific installs retain the PID-file fallback.
+    systemd_status = None
+    if prefer_systemd:
+        systemd_status = op_workspace._systemd_default_gateway_status()
+        if systemd_status is not None:
+            pid = systemd_status["pid"]
+            running = bool(systemd_status["running"])
+
     heartbeat_mtime: float | None = None
     heartbeat_stale = False
     if heartbeat_path.exists():
@@ -280,6 +291,22 @@ def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
             heartbeat_stale = (time.time() - heartbeat_mtime) > _STALE_HEARTBEAT_SECONDS
         except OSError:
             heartbeat_mtime = None
+
+    if systemd_status is not None and not running:
+        return _check_result(
+            status=STATUS_FAIL,
+            layer="gateway",
+            code="GATEWAY_SYSTEMD_INACTIVE",
+            message="The hermes-gateway.service user unit is not active and running.",
+            suggested_action="Inspect the user service and run hermes_operator_recover with apply=false.",
+            extra={
+                "pid": pid,
+                "running": False,
+                "status_source": "systemd",
+                "active_state": systemd_status["active_state"],
+                "sub_state": systemd_status["sub_state"],
+            },
+        )
 
     if pid is None and not heartbeat_path.exists():
         return _check_result(
@@ -311,15 +338,30 @@ def _check_gateway_status(profile_home: Path) -> dict[str, Any]:
         )
 
     extra = {"pid": pid, "running": running}
+    if systemd_status is not None:
+        extra.update(
+            {
+                "status_source": "systemd",
+                "active_state": systemd_status["active_state"],
+                "sub_state": systemd_status["sub_state"],
+            }
+        )
+    else:
+        extra["status_source"] = "pid_file_heartbeat"
     if heartbeat_mtime is not None:
         extra["heartbeat_mtime"] = heartbeat_mtime
     extra.update(_gateway_state_summary(profile_home))
 
+    message = (
+        "Gateway is active according to systemd; heartbeat is current."
+        if systemd_status is not None
+        else "Gateway appears reachable based on PID and heartbeat."
+    )
     return _check_result(
         status=STATUS_PASS,
         layer="gateway",
         code="GATEWAY_OK",
-        message="Gateway appears reachable based on PID and heartbeat.",
+        message=message,
         suggested_action="No action needed.",
         extra=extra,
     )
@@ -534,6 +576,7 @@ def _check_connector_api_bridge(profile_home: Path) -> dict[str, Any]:
 def hermes_operator_doctor(
     profile: str = "default",
     hermes_root: Path | None = None,
+    prefer_systemd: bool = False,
 ) -> str:
     """Run a read-only health check across operator surfaces."""
     trace_id = op.new_trace_id()
@@ -564,7 +607,7 @@ def hermes_operator_doctor(
 
         checks: dict[str, Any] = {
             "operator_runtime": _check_operator_runtime(),
-            "gateway_status": _check_gateway_status(profile_home),
+            "gateway_status": _check_gateway_status(profile_home, prefer_systemd=(prefer_systemd and profile == "default")),
             "config_readable": _check_config_readable(profile_home),
             "env_readable": _check_env_readable(profile_home),
             "cron_registry": _check_cron_registry(profile_home),
@@ -1000,6 +1043,7 @@ def hermes_operator_recover(
     apply: bool = False,
     hermes_root: Path | None = None,
     runner=None,
+    prefer_systemd: bool = False,
 ) -> str:
     """Conservative recovery sequence. Dry-run by default."""
     trace_id = op.new_trace_id()
@@ -1116,7 +1160,7 @@ def hermes_operator_recover(
             )
 
         # 3. restart_gateway_if_needed
-        gateway_check = _check_gateway_status(profile_home)
+        gateway_check = _check_gateway_status(profile_home, prefer_systemd=(prefer_systemd and profile == "default"))
         if gateway_check["status"] in (STATUS_FAIL, STATUS_WARN):
             mutations_attempted += 1
             if apply and can_mutate:
