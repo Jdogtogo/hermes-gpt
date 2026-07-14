@@ -26,6 +26,10 @@ DEFAULT_SESSION_ROOT = Path.home() / ".hermes" / "operator-sessions"
 DEFAULT_SESSION_DURATION_SECONDS = 2 * 60 * 60
 MAX_SESSION_DURATION_SECONDS = 4 * 60 * 60
 EXTENSION_SECONDS = 30 * 60
+
+# How long a human has to act on a pending session-creation request (via
+# Telegram or the localhost approval page) before it expires unactioned.
+SESSION_REQUEST_TTL_SECONDS = 15 * 60
 DEFAULT_HARD_DENIES = (
     "~/.ssh",
     "~/.aws",
@@ -141,6 +145,19 @@ def _connect(root: Path | None = None) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_extension_requests_session
             ON session_extension_requests(session_id);
+        CREATE TABLE IF NOT EXISTS session_creation_requests (
+            request_id TEXT PRIMARY KEY,
+            policy_template TEXT NOT NULL,
+            resolved_policy_json TEXT NOT NULL,
+            requested_duration_seconds INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            decided_by TEXT,
+            decided_at INTEGER,
+            resulting_session_id TEXT
+        );
         """
     )
     try:
@@ -209,6 +226,27 @@ def load_session(session_id: str, *, root: Path | None = None, now: int | None =
     )
 
 
+def _audit_decision(*, request_id: str, request_type: str, decision: str, decided_by: str, extra: dict[str, Any]) -> None:
+    """Best-effort audit of an approval/denial decision. Lazily imports
+    operator_policy to avoid a circular import (operator_policy imports this
+    module at the top level). Never records secrets, tokens, or codes."""
+    try:
+        import operator_policy as op_policy
+        payload = {"request_id": request_id, "request_type": request_type, "decision": decision, "approval_source": decided_by}
+        payload.update(extra)
+        op_policy.audit_record(
+            tool="session_approval",
+            level="session",
+            apply_mode="approval",
+            dry_run=False,
+            success=True,
+            summary=f"{request_type} request {decision}",
+            extra=payload,
+        )
+    except Exception:
+        pass
+
+
 def revoke_session(session_id: str, *, root: Path | None = None, now: int | None = None) -> bool:
     current = int(time.time() if now is None else now)
     with _connect(root) as connection:
@@ -253,10 +291,13 @@ def list_pending_extensions(*, root: Path | None = None) -> list[dict[str, Any]]
     return [dict(row) for row in rows]
 
 
-def approve_extension(request_id: str, *, root: Path | None = None, now: int | None = None) -> SessionRecord:
+def approve_extension(
+    request_id: str, *, decided_by: str = "local-cli", root: Path | None = None, now: int | None = None
+) -> SessionRecord:
     """Local-only: grant a pending extension request. Never callable by the
-    session itself — intended to be invoked by the human operator via the
-    CLI in this module, not exposed as a remote MCP tool."""
+    session itself — intended to be invoked by a human via Telegram, the
+    localhost approval page, or (break-glass) the CLI in this module —
+    never exposed as a remote MCP tool."""
     current = int(time.time() if now is None else now)
     with _connect(root) as connection:
         row = connection.execute(
@@ -292,17 +333,166 @@ def approve_extension(request_id: str, *, root: Path | None = None, now: int | N
             "UPDATE session_extension_requests SET status = 'approved', decided_at = ? WHERE request_id = ?",
             (current, request_id),
         )
-    return load_session(session_id, root=root, now=current)
+    record = load_session(session_id, root=root, now=current)
+    _audit_decision(
+        request_id=request_id, request_type="extension", decision="approved", decided_by=decided_by,
+        extra={"session_id": session_id, "resulting_expires_at": record.expires_at},
+    )
+    return record
 
 
-def deny_extension(request_id: str, *, root: Path | None = None, now: int | None = None) -> bool:
+def deny_extension(
+    request_id: str, *, decided_by: str = "local-cli", root: Path | None = None, now: int | None = None
+) -> bool:
     current = int(time.time() if now is None else now)
     with _connect(root) as connection:
+        row = connection.execute(
+            "SELECT session_id FROM session_extension_requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
         changed = connection.execute(
             "UPDATE session_extension_requests SET status = 'denied', decided_at = ? "
             "WHERE request_id = ? AND status = 'pending'",
             (current, request_id),
         ).rowcount
+    if changed:
+        _audit_decision(
+            request_id=request_id, request_type="extension", decision="denied", decided_by=decided_by,
+            extra={"session_id": row["session_id"] if row else None},
+        )
+    return changed > 0
+
+
+# ---------------------------------------------------------------------------
+# Session-creation requests (request-only; approval creates the session)
+# ---------------------------------------------------------------------------
+#
+# hermes_operator_session_request (the MCP tool) never creates authority
+# itself — it only ever calls request_session() below, which records a
+# pending request carrying the fully *resolved* policy (not just the
+# template name) so a human approver sees exactly what they're granting.
+# Only approve_session_request(), called from Telegram, the localhost
+# approval page, or the break-glass CLI, actually creates the session.
+
+
+def request_session(
+    *,
+    policy_template: str,
+    resolved_policy: dict[str, Any],
+    requested_duration_seconds: int,
+    reason: str,
+    root: Path | None = None,
+    now: int | None = None,
+    request_id: str | None = None,
+) -> str:
+    current = int(time.time() if now is None else now)
+    rid = request_id or f"sr_{secrets.token_hex(4)}"
+    expires_at = current + SESSION_REQUEST_TTL_SECONDS
+    with _connect(root) as connection:
+        connection.execute(
+            "INSERT INTO session_creation_requests"
+            "(request_id, policy_template, resolved_policy_json, requested_duration_seconds, "
+            "reason, status, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (
+                rid,
+                policy_template,
+                json.dumps(resolved_policy, sort_keys=True),
+                int(requested_duration_seconds),
+                reason,
+                current,
+                expires_at,
+            ),
+        )
+    return rid
+
+
+def list_pending_session_requests(*, root: Path | None = None) -> list[dict[str, Any]]:
+    now = int(time.time())
+    with _connect(root) as connection:
+        connection.execute(
+            "DELETE FROM session_creation_requests WHERE status = 'pending' AND expires_at < ?",
+            (now,),
+        )
+        rows = connection.execute(
+            "SELECT request_id, policy_template, resolved_policy_json, requested_duration_seconds, "
+            "reason, created_at, expires_at FROM session_creation_requests "
+            "WHERE status = 'pending' ORDER BY created_at"
+        ).fetchall()
+    return [
+        {
+            "request_id": row["request_id"],
+            "policy_template": row["policy_template"],
+            "resolved_policy": json.loads(row["resolved_policy_json"]),
+            "requested_duration_seconds": row["requested_duration_seconds"],
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+        }
+        for row in rows
+    ]
+
+
+def approve_session_request(
+    request_id: str, *, decided_by: str = "local-cli", root: Path | None = None, now: int | None = None
+) -> SessionRecord:
+    current = int(time.time() if now is None else now)
+    with _connect(root) as connection:
+        row = connection.execute(
+            "SELECT resolved_policy_json, requested_duration_seconds, status, expires_at "
+            "FROM session_creation_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Session request does not exist or has expired.")
+        if row["status"] != "pending":
+            raise ValueError(f"Session request already {row['status']}.")
+        if int(row["expires_at"]) < current:
+            connection.execute(
+                "UPDATE session_creation_requests SET status = 'expired' WHERE request_id = ?",
+                (request_id,),
+            )
+            raise ValueError("Session request has expired.")
+        policy = json.loads(row["resolved_policy_json"])
+        duration = int(row["requested_duration_seconds"])
+    # create_session opens its own connection; keep it outside the block
+    # above so a same-thread nested SQLite write never deadlocks.
+    record = create_session(policy, duration_seconds=duration, root=root, now=current)
+    with _connect(root) as connection:
+        connection.execute(
+            "UPDATE session_creation_requests SET status = 'approved', decided_by = ?, "
+            "decided_at = ?, resulting_session_id = ? WHERE request_id = ?",
+            (decided_by, current, record.session_id, request_id),
+        )
+    _audit_decision(
+        request_id=request_id, request_type="session_creation", decision="approved", decided_by=decided_by,
+        extra={
+            "resulting_session_id": record.session_id,
+            "snapshot_hash": record.snapshot_hash,
+            "requested_duration_seconds": duration,
+            "approved_duration_seconds": record.expires_at - record.created_at,
+        },
+    )
+    return record
+
+
+def deny_session_request(
+    request_id: str, *, decided_by: str = "local-cli", root: Path | None = None, now: int | None = None
+) -> bool:
+    current = int(time.time() if now is None else now)
+    with _connect(root) as connection:
+        row = connection.execute(
+            "SELECT policy_template FROM session_creation_requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        changed = connection.execute(
+            "UPDATE session_creation_requests SET status = 'denied', decided_by = ?, decided_at = ? "
+            "WHERE request_id = ? AND status = 'pending'",
+            (decided_by, current, request_id),
+        ).rowcount
+    if changed:
+        _audit_decision(
+            request_id=request_id, request_type="session_creation", decision="denied", decided_by=decided_by,
+            extra={"policy_template": row["policy_template"] if row else None},
+        )
     return changed > 0
 
 
@@ -369,6 +559,21 @@ def _cli() -> None:
     revoke = sub.add_parser("revoke-session", help="Revoke an operator session immediately.")
     revoke.add_argument("session_id")
 
+    sub.add_parser(
+        "list-pending-sessions",
+        help="[break-glass] List pending session-creation requests. Normal workflow is Telegram/localhost.",
+    )
+    approve_session = sub.add_parser(
+        "approve-session",
+        help="[break-glass] Approve a pending session-creation request. Normal workflow is Telegram/localhost.",
+    )
+    approve_session.add_argument("request_id")
+    deny_session = sub.add_parser(
+        "deny-session",
+        help="[break-glass] Deny a pending session-creation request. Normal workflow is Telegram/localhost.",
+    )
+    deny_session.add_argument("request_id")
+
     args = parser.parse_args()
 
     if args.cmd == "create-session":
@@ -385,12 +590,19 @@ def _cli() -> None:
     elif args.cmd == "list-pending-extensions":
         print(json.dumps(list_pending_extensions(), indent=2))
     elif args.cmd == "approve-extension":
-        record = approve_extension(args.request_id)
+        record = approve_extension(args.request_id, decided_by="cli-break-glass")
         print(json.dumps({"session_id": record.session_id, "expires_at": record.expires_at}, indent=2))
     elif args.cmd == "deny-extension":
-        print(json.dumps({"denied": deny_extension(args.request_id)}, indent=2))
+        print(json.dumps({"denied": deny_extension(args.request_id, decided_by="cli-break-glass")}, indent=2))
     elif args.cmd == "revoke-session":
         print(json.dumps({"revoked": revoke_session(args.session_id)}, indent=2))
+    elif args.cmd == "list-pending-sessions":
+        print(json.dumps(list_pending_session_requests(), indent=2))
+    elif args.cmd == "approve-session":
+        record = approve_session_request(args.request_id, decided_by="cli-break-glass")
+        print(json.dumps({"session_id": record.session_id, "expires_at": record.expires_at}, indent=2))
+    elif args.cmd == "deny-session":
+        print(json.dumps({"denied": deny_session_request(args.request_id, decided_by="cli-break-glass")}, indent=2))
 
 
 if __name__ == "__main__":
