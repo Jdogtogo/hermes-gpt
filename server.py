@@ -20,6 +20,7 @@ import operator_diagnostics as op_diagnostics
 import operator_bridge as op_bridge
 import operator_auth as op_auth
 import operator_sessions as op_sessions
+import operator_policy_templates as op_templates
 import dcr_compat
 
 try:
@@ -783,6 +784,15 @@ def hermes_operator_session_request_extension(minutes: int = 30) -> str:
             summary=f"requested {seconds}s extension",
             extra={"target_session_id": policy.session_id, "request_id": request_id},
         )
+        _notify_pending_request(
+            "extension",
+            request_id,
+            {
+                "session_id": policy.session_id,
+                "current_expiry": policy.expires_at,
+                "requested_seconds": seconds,
+            },
+        )
         return json.dumps(
             {
                 "success": True,
@@ -801,6 +811,99 @@ def hermes_operator_session_request_extension(minutes: int = 30) -> str:
                 layer="operator",
                 code="OPERATOR_SESSION_EXTENSION_ERROR",
                 suggested_action="Check the active Operator Session id.",
+            ),
+            indent=2,
+        )
+
+
+def _notify_pending_request(request_type: str, request_id: str, details: dict) -> None:
+    """Best-effort: tell a human a new approval request is waiting, via
+    Telegram if configured. Never raises — a notification failure must never
+    block or fail the tool call that created the request. The localhost
+    approval page needs no push notification since it polls the same
+    pending-request tables directly."""
+    try:
+        import operator_approval_notify as notify
+        notify.notify_pending_request(request_type, request_id, details)
+    except Exception:
+        pass
+
+
+def hermes_operator_session_request(
+    policy_template: str,
+    requested_duration_minutes: int = 60,
+    reason: str = "",
+) -> str:
+    """Request a new Operator Session. This never creates authority by
+    itself — it only ever records a pending request carrying the fully
+    resolved policy for the named template, for a human to approve via
+    Telegram, the localhost approval page, or (break-glass) the CLI. The
+    remote caller can only name one of the approved policy templates; it
+    can never submit raw roots, verbs, or policy JSON."""
+    try:
+        if not reason or not reason.strip():
+            raise ValueError("reason is required.")
+        resolved = op_templates.resolve_template(policy_template)
+        requested_seconds = max(60, int(requested_duration_minutes) * 60)
+        capped_seconds = min(requested_seconds, resolved["max_duration_seconds"])
+        request_id = op_sessions.request_session(
+            policy_template=policy_template,
+            resolved_policy=resolved["policy"],
+            requested_duration_seconds=capped_seconds,
+            reason=reason.strip(),
+        )
+        op_policy.audit_record(
+            tool="hermes_operator_session_request",
+            level="none",
+            apply_mode="request-only",
+            dry_run=False,
+            success=True,
+            summary=f"requested session from template {policy_template!r}",
+            extra={
+                "request_id": request_id,
+                "policy_template": policy_template,
+                "requested_duration_seconds": capped_seconds,
+            },
+        )
+        _notify_pending_request(
+            "session_creation",
+            request_id,
+            {
+                "policy_template": policy_template,
+                "resolved_policy": resolved["policy"],
+                "requested_duration_seconds": capped_seconds,
+                "reason": reason.strip(),
+            },
+        )
+        return json.dumps(
+            {
+                "success": True,
+                "request_id": request_id,
+                "policy_template": policy_template,
+                "resolved_policy": resolved["policy"],
+                "requested_duration_seconds": capped_seconds,
+                "status": "pending",
+                "note": "Requires local (Telegram or localhost) approval before any session is created.",
+            },
+            indent=2,
+        )
+    except (op_templates.UnknownPolicyTemplateError, op_templates.InactivePolicyTemplateError) as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="OPERATOR_SESSION_REQUEST_TEMPLATE_ERROR",
+                suggested_action=f"Use one of: {', '.join(op_templates.active_template_names())}.",
+            ),
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="OPERATOR_SESSION_REQUEST_ERROR",
+                suggested_action="Check policy_template, requested_duration_minutes, and reason.",
             ),
             indent=2,
         )
@@ -1459,6 +1562,7 @@ def register_tools(
             hermes_operator_policy,
             hermes_operator_status,
             hermes_operator_session_status,
+            hermes_operator_session_request,
             hermes_operator_session_request_extension,
             hermes_operator_session_revoke,
             hermes_operator_audit_tail,
