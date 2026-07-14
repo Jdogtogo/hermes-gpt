@@ -721,19 +721,28 @@ def hermes_operator_audit_tail(limit: int = 20) -> str:
 
 
 def hermes_operator_session_status() -> str:
-    """Return active Operator Session identity and expiry. Never returns secrets."""
+    """Return active Operator Session identity, scope, and expiry. Never returns secrets."""
     try:
         policy = op_policy.OperatorPolicy()
         if not policy.session_id:
             raise PermissionError("No active Operator Session is configured.")
+        record = op_sessions.load_session(policy.session_id)
+        oauth_subject, oauth_client_id = op_policy.current_oauth_identity()
         return json.dumps(
             {
                 "success": True,
                 "session_id": policy.session_id,
                 "snapshot_hash": policy.snapshot_hash,
+                "issued_at": record.created_at,
+                "expires_at": policy.expires_at,
+                "approval_state": record.approval_state,
                 "level": policy.level,
                 "apply_mode": policy.apply_mode,
-                "expires_at": policy.expires_at,
+                "readable_roots": [str(p) for p in policy.readable_roots],
+                "writable_roots": [str(p) for p in policy.writable_roots],
+                "verbs": policy.verbs,
+                "oauth_subject": oauth_subject,
+                "oauth_client_id": oauth_client_id,
                 "owner_mode_ready": False,
             },
             indent=2,
@@ -745,6 +754,49 @@ def hermes_operator_session_status() -> str:
                 layer="operator",
                 code="OPERATOR_SESSION_STATUS_ERROR",
                 suggested_action="Create or activate a non-owner Operator Session.",
+            ),
+            indent=2,
+        )
+
+
+def hermes_operator_session_request_extension(minutes: int = 30) -> str:
+    """Request a session extension. This never grants the extension itself —
+    a human operator must separately approve it via the local session CLI
+    (operator_sessions.py approve-extension). A session can never approve
+    its own extension."""
+    try:
+        policy = op_policy.OperatorPolicy()
+        if not policy.session_id:
+            raise PermissionError("No active Operator Session is configured.")
+        seconds = max(60, min(int(minutes) * 60, op_sessions.EXTENSION_SECONDS))
+        request_id = op_sessions.request_extension(policy.session_id, seconds=seconds)
+        op_policy.audit_record(
+            tool="hermes_operator_session_request_extension",
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=True,
+            summary=f"requested {seconds}s extension",
+            extra={"target_session_id": policy.session_id, "request_id": request_id},
+        )
+        return json.dumps(
+            {
+                "success": True,
+                "request_id": request_id,
+                "session_id": policy.session_id,
+                "requested_seconds": seconds,
+                "status": "pending",
+                "note": "Requires separate local operator approval before it takes effect.",
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="OPERATOR_SESSION_EXTENSION_ERROR",
+                suggested_action="Check the active Operator Session id.",
             ),
             indent=2,
         )
@@ -1043,6 +1095,24 @@ def hermes_git_status(workdir: str) -> str:
 
 def hermes_git_diff(workdir: str, pathspec: str | None = None, stat: bool = False) -> str:
     return op_workspace.hermes_git_diff(workdir=workdir, pathspec=pathspec, stat=stat)
+
+
+def hermes_workspace_git_commit(
+    workdir: str,
+    expected_branch: str,
+    expected_baseline: str,
+    allowed_files: list[str],
+    message: str,
+    dry_run: bool = True,
+) -> str:
+    return op_workspace.hermes_workspace_git_commit(
+        workdir=workdir,
+        expected_branch=expected_branch,
+        expected_baseline=expected_baseline,
+        allowed_files=allowed_files,
+        message=message,
+        dry_run=dry_run,
+    )
 
 
 def hermes_owner_run_command(command: str, timeout: int = 120, workdir: str | None = None, dry_run: bool = True) -> str:
@@ -1374,11 +1444,18 @@ def register_tools(
         return
 
     if profile == CHATGPT_OPERATOR_PROFILE:
+        # Deliberately excludes: hermes_owner_run_command, hermes_owner_patch,
+        # hermes_owner_write_file, bridge_submit_command, hermes_config_set,
+        # hermes_config_patch, hermes_env_set_nonsecret, hermes_gateway_restart,
+        # hermes_cron_*, hermes_skill_create/edit/patch/write_file/copy/
+        # sync_to_default/delete, hermes_agent_run (unrestricted delegation),
+        # and any arbitrary command tool. See docs/operator-mode.md.
         for tool in [
             hermes_ops_brain_query,
             hermes_operator_policy,
             hermes_operator_status,
             hermes_operator_session_status,
+            hermes_operator_session_request_extension,
             hermes_operator_session_revoke,
             hermes_operator_audit_tail,
             hermes_operator_doctor,
@@ -1386,13 +1463,14 @@ def register_tools(
             hermes_config_get,
             hermes_env_status,
             hermes_gateway_status,
+            hermes_search_files,
             hermes_workspace_read,
             hermes_workspace_patch,
             hermes_workspace_write_file,
             hermes_workspace_run_test,
+            hermes_workspace_git_commit,
             hermes_git_status,
             hermes_git_diff,
-            hermes_agent_run,
         ]:
             server.add_tool(tool, meta=tool_meta())
         return

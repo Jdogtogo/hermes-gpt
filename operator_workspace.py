@@ -9,6 +9,7 @@ Tools:
 - ``hermes_workspace_run_test``    : workspace  — conservative allowlist of test/lint commands
 - ``hermes_git_status``            : read_only  — git status in a workdir
 - ``hermes_git_diff``              : read_only  — git diff in a workdir
+- ``hermes_workspace_git_commit``  : workspace  — narrow, session-gated commit of an explicit file list
 - ``hermes_owner_run_command``     : owner      — arbitrary command (with catastrophic blocks)
 - ``hermes_owner_patch``           : owner      — arbitrary file patch (still denies secret paths)
 - ``hermes_owner_write_file``      : owner      — arbitrary file write (still denies secret paths)
@@ -782,6 +783,156 @@ def hermes_git_diff(
                 layer="workspace",
                 code="GIT_DIFF_ERROR",
                 suggested_action="Check workdir, allowed_paths, pathspec, and git availability.",
+            ),
+            indent=2,
+        )
+
+
+def hermes_workspace_git_commit(
+    workdir: str,
+    expected_branch: str,
+    expected_baseline: str,
+    allowed_files: list[str],
+    message: str,
+    dry_run: bool = True,
+    runner=None,
+) -> str:
+    """Create exactly one normal commit of an explicitly approved file list.
+
+    Requires an active Operator Session granting the ``git:commit`` verb.
+    Never pushes, amends, resets, cleans, stashes, or changes branches.
+    Refuses if the worktree has any dirty file outside ``allowed_files``,
+    if the branch or baseline commit does not match what was expected, or
+    if ``workdir`` is not the repository's own toplevel.
+    """
+    try:
+        policy = op.OperatorPolicy()
+        if not workdir:
+            raise ValueError("workdir is required.")
+        if not policy.session_id:
+            raise PermissionError("hermes_workspace_git_commit requires an active Operator Session.")
+        policy.require_write_path(workdir)
+        policy.require_verb("git", "commit")
+        if not allowed_files:
+            raise ValueError("allowed_files must list at least one path.")
+        if not message or not message.strip():
+            raise ValueError("message is required.")
+
+        root_rc, root_out, _ = _git(["rev-parse", "--show-toplevel"], workdir, runner=runner)
+        if root_rc != 0:
+            raise PermissionError("workdir is not inside a Git repository.")
+        actual_root = str(Path(root_out.strip()).resolve())
+        if actual_root != str(Path(workdir).expanduser().resolve()):
+            raise PermissionError(
+                f"workdir must be the repository toplevel; got {workdir!r}, repository root is {actual_root!r}."
+            )
+
+        branch_rc, branch_out, _ = _git(["branch", "--show-current"], workdir, runner=runner)
+        actual_branch = branch_out.strip()
+        if branch_rc != 0 or actual_branch != expected_branch:
+            raise PermissionError(
+                f"Branch mismatch: expected {expected_branch!r}, found {actual_branch!r}."
+            )
+
+        head_rc, head_out, _ = _git(["rev-parse", "HEAD"], workdir, runner=runner)
+        actual_head = head_out.strip()
+        if head_rc != 0 or actual_head != expected_baseline:
+            raise PermissionError(
+                f"Baseline mismatch: expected {expected_baseline!r}, found {actual_head!r}."
+            )
+
+        status_rc, status_out, _ = _git(["status", "--porcelain=v1"], workdir, runner=runner)
+        if status_rc != 0:
+            raise PermissionError("Could not read git status.")
+        dirty_files: list[str] = []
+        for line in status_out.splitlines():
+            if not line.strip():
+                continue
+            # Porcelain v1: "XY path" (or "XY orig -> path" for renames).
+            entry = line[3:].strip()
+            if " -> " in entry:
+                entry = entry.split(" -> ", 1)[1]
+            dirty_files.append(entry)
+
+        allowed_set = set(allowed_files)
+        out_of_scope = [f for f in dirty_files if f not in allowed_set]
+        if out_of_scope:
+            raise PermissionError(
+                f"Refusing to commit: unapproved dirty files present: {out_of_scope!r}."
+            )
+        to_stage = [f for f in allowed_files if f in dirty_files]
+        if not to_stage:
+            raise PermissionError("None of allowed_files are actually modified or untracked.")
+
+        for f in to_stage:
+            if op.is_denied_path(Path(workdir) / f):
+                raise PermissionError(f"Path {f!r} is denied by the operator path safety policy.")
+
+        if policy.effective_dry_run(dry_run):
+            plan = {"would_commit": True, "branch": actual_branch, "baseline": actual_head, "files": to_stage}
+            op.audit_record(
+                tool="hermes_workspace_git_commit",
+                level=policy.level,
+                apply_mode=policy.apply_mode,
+                dry_run=True,
+                success=True,
+                summary="dry-run commit plan",
+                path=workdir,
+                extra={"files": ",".join(to_stage)},
+            )
+            return json.dumps({"success": True, "dry_run": True, "plan": plan}, indent=2)
+
+        policy.require_mutation(dry_run)
+        for f in to_stage:
+            add_rc, _, add_err = _git(["add", "--", f], workdir, runner=runner)
+            if add_rc != 0:
+                raise PermissionError(f"Failed to stage {f!r}: {op.redact_output(add_err)}")
+
+        commit_rc, commit_out, commit_err = _git(
+            ["commit", "-m", message, "--"] + to_stage, workdir, runner=runner
+        )
+        if commit_rc != 0:
+            raise PermissionError(f"Commit failed: {op.redact_output(commit_err)}")
+
+        hash_rc, hash_out, _ = _git(["rev-parse", "HEAD"], workdir, runner=runner)
+        commit_hash = hash_out.strip() if hash_rc == 0 else ""
+        final_status_rc, final_status_out, _ = _git(["status", "--porcelain=v1"], workdir, runner=runner)
+
+        result = {
+            "success": True,
+            "commit_hash": commit_hash,
+            "branch": actual_branch,
+            "files": to_stage,
+            "status": op.redact_output(final_status_out) if final_status_rc == 0 else "",
+        }
+        op.audit_record(
+            tool="hermes_workspace_git_commit",
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=True,
+            changed=True,
+            summary=f"committed {commit_hash} with {len(to_stage)} file(s)",
+            path=workdir,
+            extra={"files": ",".join(to_stage), "commit_hash": commit_hash},
+        )
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        op.audit_record(
+            tool="hermes_workspace_git_commit",
+            level="unknown",
+            apply_mode="unknown",
+            dry_run=dry_run,
+            success=False,
+            error=str(exc),
+            path=workdir,
+        )
+        return json.dumps(
+            op.error_from_exception(
+                exc,
+                layer="workspace",
+                code="WORKSPACE_GIT_COMMIT_ERROR",
+                suggested_action="Check branch, baseline commit, allowed_files, and the git:commit session verb.",
             ),
             indent=2,
         )
