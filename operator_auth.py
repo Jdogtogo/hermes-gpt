@@ -480,7 +480,29 @@ class PersistentOAuthProvider(
                 "VALUES (?, ?, ?, ?, 'pending')",
                 (self._digest(login_state), json.dumps(payload, sort_keys=True), expires_at, request_id),
             )
+        if self.config.approval_mode:
+            self._notify_pending_oauth_request(request_id, payload, expires_at)
         return f"{self.config.issuer_url}/login?state={quote(login_state, safe='')}"
+
+    def _notify_pending_oauth_request(self, request_id: str, payload: dict[str, Any], expires_at: int) -> None:
+        """Best-effort: tell a human a new connection request is waiting.
+        Never raises, never blocks authorize()."""
+        try:
+            import operator_approval_notify as notify
+
+            redirect_domain = urlparse(str(payload.get("redirect_uri", ""))).hostname or ""
+            notify.notify_pending_request(
+                "oauth",
+                request_id,
+                {
+                    "client_id": payload.get("client_id"),
+                    "redirect_domain": redirect_domain,
+                    "scope": " ".join(payload.get("scopes") or []),
+                    "expires_at": expires_at,
+                },
+            )
+        except Exception:
+            pass
 
     def _load_pending(self, state: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as connection:
