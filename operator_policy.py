@@ -22,12 +22,33 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import threading
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Optional
 
 import operator_sessions
+
+try:
+    from mcp.server.auth.middleware.auth_context import get_access_token as _get_access_token
+except Exception:  # pragma: no cover - auth middleware optional in some contexts
+    _get_access_token = None
+
+
+def current_oauth_identity() -> tuple[str | None, str | None]:
+    """Return (subject, client_id) for the current request's bearer token, if
+    any. Never returns the token itself. Safe to call outside a request
+    context (e.g. in tests or stdio mode), where it returns (None, None)."""
+    if _get_access_token is None:
+        return None, None
+    try:
+        token = _get_access_token()
+    except Exception:
+        return None, None
+    if token is None:
+        return None, None
+    return getattr(token, "subject", None), getattr(token, "client_id", None)
 
 # ---------------------------------------------------------------------------
 # Env var names
@@ -777,6 +798,13 @@ class OperatorPolicy:
         if readable_roots and not path_under_allowed(path, readable_roots):
             raise PermissionError("Path is not under any readable root in the operator policy.")
 
+    def require_write_path(self, path: str | os.PathLike[str]) -> None:
+        if self.denies_path(path):
+            raise PermissionError("Path is hard-denied by the operator policy snapshot.")
+        writable_roots = self.writable_roots or self.allowed_paths
+        if writable_roots and not path_under_allowed(path, writable_roots):
+            raise PermissionError("Path is not under any writable root in the operator policy.")
+
     def require_egress_host(self, hostname: str) -> None:
         host = (hostname or "").strip().lower()
         if not host or host not in {item.lower() for item in self.egress_hosts}:
@@ -892,17 +920,23 @@ def audit_record(
     content: str | None = None,
     key: str | None = None,
     extra: dict[str, Any] | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """Append a single audit record to the JSONL log. Returns the record.
 
     Sensitive inputs (prompt, content) are recorded as length + sha256 only.
     Path is summarized to its basename + length, not the full path, to avoid
     leaking directory structure that might itself contain secret hints.
+    The authenticated OAuth subject/client_id for the current request (if
+    any) is attached automatically. Access tokens, refresh tokens,
+    authorization codes and passwords are never recorded here or anywhere
+    else in this module.
 
     The record is also returned so callers can include it in tool output.
     """
     prompt_len, prompt_sha = _hash_secret_text(prompt)
     content_len, content_sha = _hash_secret_text(content)
+    oauth_subject, oauth_client_id = current_oauth_identity()
 
     path_summary = ""
     if path:
@@ -933,6 +967,9 @@ def audit_record(
         "prompt_sha256": prompt_sha,
         "content_len": content_len,
         "content_sha256": content_sha,
+        "trace_id": trace_id or secrets.token_hex(8),
+        "oauth_subject": oauth_subject,
+        "oauth_client_id": oauth_client_id,
     }
     if extra:
         # Extra must already be sanitized by the caller; we only truncate
