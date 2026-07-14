@@ -104,6 +104,40 @@ def test_workspace_patch_refuses_path_outside_allowed_roots(workspace_tree, tmp_
     assert "not under" in parsed["error"].lower()
 
 
+def test_workspace_write_refuses_traversal_escape(workspace_tree, tmp_path, clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    outside = tmp_path / "outside.txt"
+    traversal_path = str(workspace_tree / ".." / "outside.txt")
+    out = ows.hermes_workspace_write_file(
+        path=traversal_path, content="escaped", dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "not under" in parsed["error"].lower()
+    assert not outside.exists()
+
+
+def test_workspace_write_refuses_symlink_escape(workspace_tree, tmp_path, clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    outside_dir = tmp_path / "outside-real"
+    outside_dir.mkdir()
+    link = workspace_tree / "escape-link"
+    link.symlink_to(outside_dir, target_is_directory=True)
+    out = ows.hermes_workspace_write_file(
+        path=str(link / "pwned.txt"), content="escaped", dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "not under" in parsed["error"].lower()
+    assert not (outside_dir / "pwned.txt").exists()
+
+
 def test_workspace_patch_refuses_denied_paths(workspace_tree, clean_env, audit_override, monkeypatch):
     monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
     monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
@@ -203,12 +237,30 @@ def test_run_test_accepts_pytest(workspace_tree, clean_env, audit_override, monk
         "cmd /c evil",
         "git add -A",
         "git commit -m x",
+        "git commit --amend",
+        "git commit --amend -m x",
         "git push",
         "git push --force",
+        "git push --force-with-lease",
+        "git reset --hard",
+        "git reset --hard HEAD~1",
+        "git clean -fd",
+        "git checkout main",
+        "git checkout -b other",
+        "git switch main",
+        "git switch -c other",
+        "git stash",
+        "git stash drop",
+        "git rebase main",
+        "git rebase -i HEAD~3",
+        "git filter-branch --force",
         "pytest | tee log",
         "pytest > log",
         "pytest; rm x",
         "pytest & rm x",
+        "pytest && rm x",
+        "pytest `rm x`",
+        "pytest $(rm x)",
         "evil-binary --flag",
     ],
 )

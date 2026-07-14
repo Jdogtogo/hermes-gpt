@@ -337,14 +337,16 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
 
     for required in [
         "hermes_operator_session_status",
+        "hermes_operator_session_request_extension",
         "hermes_operator_session_revoke",
+        "hermes_search_files",
         "hermes_workspace_read",
         "hermes_workspace_patch",
         "hermes_workspace_write_file",
         "hermes_workspace_run_test",
+        "hermes_workspace_git_commit",
         "hermes_git_status",
         "hermes_git_diff",
-        "hermes_agent_run",
     ]:
         assert required in names
     for forbidden in [
@@ -353,6 +355,17 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_owner_write_file",
         "bridge_submit_command",
         "hermes_restricted_agent_run",
+        # hermes_agent_run is deliberately excluded: unrestricted agent
+        # delegation could act as a proxy for capabilities outside this
+        # profile's narrow, session-gated tool surface.
+        "hermes_agent_run",
+        "hermes_config_set",
+        "hermes_config_patch",
+        "hermes_env_set_nonsecret",
+        "hermes_gateway_restart",
+        "hermes_cron_run",
+        "hermes_skill_delete",
+        "hermes_skill_write_file",
     ]:
         assert forbidden not in names
     for tool in tools_by_name(built).values():
