@@ -556,9 +556,15 @@ class PersistentOAuthProvider(
             # authorize()); this page just polls until a local operator (or
             # a private approval channel wired to approve_request/
             # deny_request) decides it.
+            # default-src 'none' blocks the inline polling <script> outright
+            # unless script-src explicitly allows it. There is no untrusted
+            # or user-reflected content on this page (state is rendered via
+            # json.dumps, and is itself just an opaque token), so allowing
+            # inline script here does not reopen an XSS hole — it's what
+            # actually lets the "waiting" page complete the flow.
             csp = (
-                f"default-src 'none'; connect-src 'self'; form-action {form_action}; "
-                "base-uri 'none'; frame-ancestors 'none'"
+                f"default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; "
+                f"form-action {form_action}; base-uri 'none'; frame-ancestors 'none'"
             )
             content = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Authorize Hermes-GPT</title></head>
