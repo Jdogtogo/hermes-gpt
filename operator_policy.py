@@ -729,6 +729,12 @@ class OperatorPolicy:
             return
         # Direct path: require enabled + direct mode.
         if not (self.enabled and self.apply_mode == "direct"):
+            if self.session_id is None:
+                raise PermissionError(
+                    "No active approved operator session. Request one via "
+                    "hermes_operator_session_request and have it approved, "
+                    "then retry."
+                )
             raise PermissionError(
                 "Direct mutation requires operator mode enabled with "
                 f"{OPERATOR_APPLY_MODE_ENV}=direct."

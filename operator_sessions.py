@@ -457,6 +457,9 @@ def approve_session_request(
     # create_session opens its own connection; keep it outside the block
     # above so a same-thread nested SQLite write never deadlocks.
     record = create_session(policy, duration_seconds=duration, root=root, now=current)
+    # Update the live pointer so the already-running server picks this up on
+    # its very next tool call — no restart needed.
+    _write_active_pointer(record.session_id, root=root)
     with _connect(root) as connection:
         connection.execute(
             "UPDATE session_creation_requests SET status = 'approved', decided_by = ?, "
@@ -496,11 +499,61 @@ def deny_session_request(
     return changed > 0
 
 
+ACTIVE_SESSION_POINTER_NAME = "active_session_id"
+
+
+def _active_pointer_path(root: Path | None = None) -> Path:
+    return (root or session_root()) / ACTIVE_SESSION_POINTER_NAME
+
+
+def _write_active_pointer(session_id: str, *, root: Path | None = None) -> None:
+    """Record which session is "the" active one for this deployment. A
+    freshly-approved session (via Telegram, the localhost approval page, or
+    the CLI) becomes active immediately for the already-running server
+    process — no restart required — because active_session() re-reads this
+    file on every call rather than relying on a startup-time env var."""
+    path = _active_pointer_path(root)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    tmp.write_text(session_id, encoding="utf-8")
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def active_session(*, now: int | None = None) -> SessionRecord | None:
-    sid = os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip()
+    """Return the currently active session, or None if there isn't one.
+
+    An expired, revoked, or otherwise invalid pointed-to session is treated
+    identically to "no active session" rather than raised — the server must
+    keep running and serving OAuth/status/request tools regardless of
+    whether the last operator session lapsed. Checks the live pointer file
+    first (updated in place by approve_session_request), then falls back to
+    the ACTIVE_SESSION_ID_ENV env var for test/back-compat purposes.
+
+    This is called on every OperatorPolicy() construction — i.e. on every
+    tool call — so the pointer-file lookup is deliberately maximally
+    defensive: any unexpected error there (missing dir, permissions, a
+    caller-mutated os.name mid-call, whatever) must never take down policy
+    evaluation. It only ever downgrades to "no pointer file found".
+    """
+    sid = ""
+    try:
+        pointer_path = _active_pointer_path()
+        if pointer_path.is_file():
+            sid = pointer_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        sid = ""
+    if not sid:
+        sid = os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip()
     if not sid:
         return None
-    return load_session(sid, now=now)
+    try:
+        return load_session(sid, now=now)
+    except PermissionError:
+        return None
 
 
 def path_under(path: str | os.PathLike[str], roots: list[str]) -> bool:

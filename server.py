@@ -127,17 +127,21 @@ def validate_local_owner_runtime(*, host: str) -> None:
 
 
 def validate_chatgpt_operator_runtime(*, host: str, transport: str) -> None:
-    """Fail closed before serving the authenticated Operator connector."""
+    """Fail closed before serving the authenticated Operator connector.
+
+    Deliberately does not require an active Operator Session: the service
+    must start and keep serving OAuth/status/session-request tools even
+    with no session, or after the last one expired. Per-call mutation
+    gating is enforced by OperatorPolicy at tool-call time (see
+    require_mutation), not here.
+    """
     if transport not in {"streamable-http", "sse"}:
         raise RuntimeError("chatgpt-operator profile requires HTTP or SSE transport.")
     if not is_loopback_host(host):
         raise RuntimeError("chatgpt-operator profile must bind to loopback behind the tunnel.")
     if not op_auth.auth_enabled():
         raise RuntimeError("chatgpt-operator profile requires OAuth authentication.")
-    policy = op_policy.OperatorPolicy()
-    if not policy.enabled or not policy.session_id or not policy.snapshot_hash:
-        raise RuntimeError("chatgpt-operator profile requires an active Operator Session snapshot.")
-    if policy.level == "owner" or policy.owner_mode_ready or os.environ.get(op_policy.OWNER_ACK_ENV):
+    if os.environ.get(op_policy.OWNER_ACK_ENV):
         raise RuntimeError("chatgpt-operator profile refuses owner mode.")
 
 

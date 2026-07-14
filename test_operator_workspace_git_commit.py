@@ -248,7 +248,11 @@ def test_expired_session_cannot_commit(git_repo, clean_env, audit_override, monk
         dry_run=False,
     ))
     assert out["success"] is False
-    assert "expired" in out["error"].lower()
+    # An expired session is now treated identically to no active session at
+    # all (the service must keep running rather than raise) — see
+    # active_session() in operator_sessions.py. The tool-level message is
+    # correspondingly generic; what matters is that mutation is refused.
+    assert "active operator session" in out["error"].lower()
     assert _run_git(["rev-parse", "HEAD"], git_repo) == baseline
 
 
@@ -270,4 +274,7 @@ def test_revoked_session_cannot_commit(git_repo, clean_env, audit_override, monk
         dry_run=False,
     ))
     assert out["success"] is False
-    assert "revoked" in out["error"].lower()
+    # A revoked session is now treated identically to no active session at
+    # all (see active_session() in operator_sessions.py) — the important
+    # property is that mutation is refused, not the specific wording.
+    assert "active operator session" in out["error"].lower()
