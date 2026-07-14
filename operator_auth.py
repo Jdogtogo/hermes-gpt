@@ -31,7 +31,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from pydantic import AnyHttpUrl, AnyUrl
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -55,6 +55,14 @@ AUTH_ROOT_ENV = "HERMES_GPT_AUTH_ROOT"
 AUTH_SCOPE_ENV = "HERMES_GPT_AUTH_SCOPE"
 AUTH_USERNAME_ENV = "HERMES_GPT_AUTH_USERNAME"
 
+# When set, the login page shows no password form at all. Instead, ChatGPT's
+# authorization request is recorded as a pending approval that only a local
+# CLI (or, if wired up separately, a private Telegram approval channel) can
+# approve or deny. The browser polls for the decision. This is additive and
+# gated: local-owner never sets this env var, so its password-based login is
+# completely unaffected.
+AUTH_APPROVAL_MODE_ENV = "HERMES_GPT_AUTH_APPROVAL_MODE"
+
 DEFAULT_AUTH_ROOT = Path.home() / ".hermes" / "auth" / "hermes-gpt"
 DEFAULT_SCOPE = "hermes:operator"
 DEFAULT_USERNAME = "justin"
@@ -66,6 +74,7 @@ _SCRYPT_DKLEN = 32
 _MAX_FORM_BYTES = 16_384
 _LOGIN_WINDOW_SECONDS = 15 * 60
 _MAX_LOGIN_FAILURES = 10
+_MAX_PENDING_PER_CLIENT = 5
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,7 @@ class AuthRuntimeConfig:
     code_ttl: int = 5 * 60
     access_ttl: int = 60 * 60
     refresh_ttl: int = 30 * 24 * 60 * 60
+    approval_mode: bool = False
 
     @property
     def db_path(self) -> Path:
@@ -105,12 +115,16 @@ class AuthRuntimeConfig:
         if not username or len(username) > 128:
             raise ValueError(f"{AUTH_USERNAME_ENV} must be a non-empty username.")
         root = Path(os.environ.get(AUTH_ROOT_ENV, str(DEFAULT_AUTH_ROOT))).expanduser().resolve()
+        approval_mode = os.environ.get(AUTH_APPROVAL_MODE_ENV, "").strip().lower() in {
+            "1", "true", "yes", "on", "enabled",
+        }
         return cls(
             issuer_url=issuer,
             resource_server_url=resource,
             scope=scope,
             root=root,
             username=username,
+            approval_mode=approval_mode,
         )
 
 
@@ -321,6 +335,11 @@ class PersistentOAuthProvider(
                     rate_key TEXT NOT NULL,
                     attempted_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS approved_authorizations (
+                    state_hash TEXT PRIMARY KEY,
+                    redirect_url TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_login_attempts_key_time
                     ON login_attempts(rate_key, attempted_at);
                 CREATE INDEX IF NOT EXISTS idx_access_family
@@ -328,6 +347,24 @@ class PersistentOAuthProvider(
                 CREATE INDEX IF NOT EXISTS idx_refresh_family
                     ON refresh_tokens(family_id);
                 """
+            )
+            # Additive migration for approval-mode support. request_id is a
+            # short, human-typeable identifier separate from the (long,
+            # security-sensitive) login state, so a local operator can
+            # reference a pending request without ever seeing the state
+            # value. status distinguishes pending/approved/denied.
+            existing_cols = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(pending_auth)").fetchall()
+            }
+            if "request_id" not in existing_cols:
+                connection.execute("ALTER TABLE pending_auth ADD COLUMN request_id TEXT")
+            if "status" not in existing_cols:
+                connection.execute(
+                    "ALTER TABLE pending_auth ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_auth_request_id ON pending_auth(request_id)"
             )
         os.chmod(self.config.db_path, 0o600)
 
@@ -340,6 +377,7 @@ class PersistentOAuthProvider(
         connection.execute("DELETE FROM auth_codes WHERE expires_at < ? OR used = 1", (now,))
         connection.execute("DELETE FROM access_tokens WHERE expires_at < ?", (now,))
         connection.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (now,))
+        connection.execute("DELETE FROM approved_authorizations WHERE expires_at < ?", (now,))
         connection.execute(
             "DELETE FROM login_attempts WHERE attempted_at < ?",
             (now - _LOGIN_WINDOW_SECONDS, ),
@@ -415,6 +453,7 @@ class PersistentOAuthProvider(
             raise AuthorizeError(error="invalid_scope", error_description="Unsupported OAuth scope.")
         resource = self._normalize_resource(params.resource)
         login_state = secrets.token_urlsafe(32)
+        request_id = secrets.token_hex(4)
         payload = {
             "client_id": client.client_id,
             "client_state": params.state,
@@ -427,9 +466,19 @@ class PersistentOAuthProvider(
         expires_at = int(time.time()) + self.config.authorization_ttl
         with self._lock, self._connect() as connection:
             self._cleanup(connection)
+            if self.config.approval_mode:
+                pending_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM pending_auth WHERE status = 'pending'"
+                ).fetchone()["count"]
+                if pending_count >= _MAX_PENDING_PER_CLIENT:
+                    raise AuthorizeError(
+                        error="temporarily_unavailable",
+                        error_description="Too many pending authorization requests. Try again shortly.",
+                    )
             connection.execute(
-                "INSERT INTO pending_auth(state_hash, data, expires_at) VALUES (?, ?, ?)",
-                (self._digest(login_state), json.dumps(payload, sort_keys=True), expires_at),
+                "INSERT INTO pending_auth(state_hash, data, expires_at, request_id, status) "
+                "VALUES (?, ?, ?, ?, 'pending')",
+                (self._digest(login_state), json.dumps(payload, sort_keys=True), expires_at, request_id),
             )
         return f"{self.config.issuer_url}/login?state={quote(login_state, safe='')}"
 
@@ -494,7 +543,6 @@ class PersistentOAuthProvider(
         if pending is None:
             return HTMLResponse("Invalid or expired authorization request.", status_code=400)
         escaped_state = html.escape(state, quote=True)
-        action = html.escape(f"{self.config.issuer_url}/login/callback", quote=True)
         # A successful login redirects (302) to the OAuth client's registered
         # redirect_uri, which is cross-origin (e.g. ChatGPT). Browsers enforce
         # form-action across that redirect, so the client's callback origin must
@@ -502,6 +550,57 @@ class PersistentOAuthProvider(
         # the client. The redirect_uri was validated at registration/authorize.
         redirect_origin = _origin_of_url(str(pending.get("redirect_uri", "")))
         form_action = f"'self' {redirect_origin}" if redirect_origin else "'self'"
+
+        if self.config.approval_mode:
+            # No password form. The request is already pending (created in
+            # authorize()); this page just polls until a local operator (or
+            # a private approval channel wired to approve_request/
+            # deny_request) decides it.
+            csp = (
+                f"default-src 'none'; connect-src 'self'; form-action {form_action}; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            )
+            content = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Authorize Hermes-GPT</title></head>
+<body><main>
+<h1>Waiting for approval on your Hermes device</h1>
+<p id="status">No password is required here. Approve or deny this request locally, then this page will continue automatically.</p>
+<form id="redirect-form" method="get" action="" style="display:none"></form>
+<script>
+(function() {{
+  var state = {json.dumps(state)};
+  function poll() {{
+    fetch('/login/poll?state=' + encodeURIComponent(state), {{cache: 'no-store'}})
+      .then(function(r) {{ return r.json(); }})
+      .then(function(data) {{
+        if (data.status === 'approved' && data.redirect) {{
+          window.location.replace(data.redirect);
+        }} else if (data.status === 'denied') {{
+          document.getElementById('status').textContent = 'This authorization request was denied.';
+        }} else if (data.status === 'expired') {{
+          document.getElementById('status').textContent = 'This authorization request has expired. Please reconnect from ChatGPT.';
+        }} else {{
+          setTimeout(poll, 2000);
+        }}
+      }})
+      .catch(function() {{ setTimeout(poll, 3000); }});
+  }}
+  poll();
+}})();
+</script>
+</main></body></html>"""
+            return HTMLResponse(
+                content,
+                headers={
+                    "Cache-Control": "no-store",
+                    "Pragma": "no-cache",
+                    "Content-Security-Policy": csp,
+                    "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "no-referrer",
+                },
+            )
+
+        action = html.escape(f"{self.config.issuer_url}/login/callback", quote=True)
         csp = (
             f"default-src 'none'; form-action {form_action}; "
             "base-uri 'none'; frame-ancestors 'none'"
@@ -526,21 +625,11 @@ class PersistentOAuthProvider(
             },
         )
 
-    def complete_login(self, *, username: str, password: str, state: str, request: Request) -> str:
-        pending = self._load_pending(state)
-        if pending is None:
-            raise ValueError("Invalid or expired authorization request.")
-        rate_key = self._rate_key(request, username)
-        if self._login_is_rate_limited(rate_key):
-            raise PermissionError("Too many failed login attempts. Try again later.")
-        if not self.credentials.verify(username, password):
-            self._record_login_failure(rate_key)
-            raise PermissionError("Invalid username or password.")
-        self._clear_login_failures(rate_key)
-        pending = self._consume_pending(state)
-        if pending is None:
-            raise ValueError("Authorization request was already used or has expired.")
-
+    def _issue_code(self, pending: dict[str, Any]) -> str:
+        """Generate and persist an authorization code for an already-consumed
+        pending request, returning the client redirect URL. Shared by both
+        the password flow and the approval-mode flow — the only difference
+        between them is what gates reaching this point."""
         code = secrets.token_urlsafe(32)
         auth_code = AuthorizationCode(
             code=code,
@@ -570,6 +659,153 @@ class PersistentOAuthProvider(
             code=code,
             state=pending.get("client_state"),
         )
+
+    def complete_login(self, *, username: str, password: str, state: str, request: Request) -> str:
+        pending = self._load_pending(state)
+        if pending is None:
+            raise ValueError("Invalid or expired authorization request.")
+        rate_key = self._rate_key(request, username)
+        if self._login_is_rate_limited(rate_key):
+            raise PermissionError("Too many failed login attempts. Try again later.")
+        if not self.credentials.verify(username, password):
+            self._record_login_failure(rate_key)
+            raise PermissionError("Invalid username or password.")
+        self._clear_login_failures(rate_key)
+        pending = self._consume_pending(state)
+        if pending is None:
+            raise ValueError("Authorization request was already used or has expired.")
+        return self._issue_code(pending)
+
+    # --- Approval-mode (passwordless) flow ----------------------------------
+
+    def list_pending_requests(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            self._cleanup(connection)
+            rows = connection.execute(
+                "SELECT request_id, data, expires_at FROM pending_auth "
+                "WHERE status = 'pending' ORDER BY expires_at"
+            ).fetchall()
+        out = []
+        for row in rows:
+            data = json.loads(row["data"])
+            out.append({
+                "request_id": row["request_id"],
+                "client_id": data.get("client_id"),
+                "redirect_uri": data.get("redirect_uri"),
+                "scopes": data.get("scopes"),
+                "expires_at": row["expires_at"],
+            })
+        return out
+
+    def _find_pending_by_request_id(self, connection: sqlite3.Connection, request_id: str) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT state_hash, data, expires_at, status FROM pending_auth WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+
+    def approve_request(self, request_id: str, *, decided_by: str = "local-cli") -> None:
+        """Local-only: approve a pending authorization request. Never callable
+        by the MCP client itself — there is no HTTP route that reaches this."""
+        now = int(time.time())
+        state_hash: str
+        pending: dict[str, Any]
+        with self._lock, self._connect() as connection:
+            self._cleanup(connection)
+            row = self._find_pending_by_request_id(connection, request_id)
+            if row is None:
+                raise ValueError("Authorization request does not exist or has expired.")
+            if row["status"] != "pending":
+                raise ValueError(f"Authorization request already {row['status']}.")
+            if int(row["expires_at"]) < now:
+                raise ValueError("Authorization request has expired.")
+            state_hash = row["state_hash"]
+            pending = json.loads(row["data"])
+            connection.execute(
+                "UPDATE pending_auth SET status = 'approved' WHERE state_hash = ?", (state_hash,)
+            )
+        # _issue_code opens its own connection; it must run after the block
+        # above has released its connection/transaction, or SQLite reports
+        # "database is locked" for a same-thread nested write.
+        redirect = self._issue_code(pending)
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO approved_authorizations(state_hash, redirect_url, expires_at) VALUES (?, ?, ?)",
+                (state_hash, redirect, now + 120),
+            )
+        self._audit_approval_decision(
+            request_id=request_id, decision="approved", decided_by=decided_by, pending=pending,
+        )
+
+    def deny_request(self, request_id: str, *, decided_by: str = "local-cli") -> None:
+        with self._lock, self._connect() as connection:
+            row = self._find_pending_by_request_id(connection, request_id)
+            if row is None:
+                raise ValueError("Authorization request does not exist or has expired.")
+            if row["status"] != "pending":
+                raise ValueError(f"Authorization request already {row['status']}.")
+            pending = json.loads(row["data"])
+            connection.execute(
+                "UPDATE pending_auth SET status = 'denied' WHERE state_hash = ?", (row["state_hash"],)
+            )
+        self._audit_approval_decision(
+            request_id=request_id, decision="denied", decided_by=decided_by, pending=pending,
+        )
+
+    def _audit_approval_decision(
+        self, *, request_id: str, decision: str, decided_by: str, pending: dict[str, Any]
+    ) -> None:
+        try:
+            import operator_policy as op_policy
+            op_policy.audit_record(
+                tool="oauth_approval",
+                level="oauth",
+                apply_mode="approval",
+                dry_run=False,
+                success=True,
+                summary=f"authorization request {decision}",
+                extra={
+                    "request_id": request_id,
+                    "decision": decision,
+                    "approval_source": decided_by,
+                    "oauth_client_id": pending.get("client_id"),
+                },
+            )
+        except Exception:
+            # Auditing must never block an approval/denial decision.
+            pass
+
+    def poll_status(self, state: str) -> dict[str, Any]:
+        """Called by the waiting browser page. Never exposes secrets — only
+        a status string and, once approved, the one-time redirect URL."""
+        digest = self._digest(state)
+        now = int(time.time())
+        with self._lock, self._connect() as connection:
+            approved = connection.execute(
+                "SELECT redirect_url, expires_at FROM approved_authorizations WHERE state_hash = ?",
+                (digest,),
+            ).fetchone()
+            if approved is not None:
+                connection.execute(
+                    "DELETE FROM approved_authorizations WHERE state_hash = ?", (digest,)
+                )
+                if int(approved["expires_at"]) < now:
+                    return {"status": "expired"}
+                return {"status": "approved", "redirect": approved["redirect_url"]}
+            pending = connection.execute(
+                "SELECT expires_at, status FROM pending_auth WHERE state_hash = ?",
+                (digest,),
+            ).fetchone()
+        if pending is None:
+            return {"status": "expired"}
+        if int(pending["expires_at"]) < now:
+            return {"status": "expired"}
+        if pending["status"] == "denied":
+            return {"status": "denied"}
+        if pending["status"] == "approved":
+            # The one-time redirect was already delivered and consumed above
+            # (or by a previous poll) — never redeliver it.
+            return {"status": "expired"}
+        return {"status": "pending"}
 
     async def handle_login_callback(self, request: Request) -> Response:
         body = await request.body()
@@ -853,6 +1089,49 @@ def register_login_routes(server: Any, provider: PersistentOAuthProvider) -> Non
     async def login_callback(request: Request) -> Response:
         return await provider.handle_login_callback(request)
 
+    @server.custom_route("/login/poll", methods=["GET"], include_in_schema=False)
+    async def login_poll(request: Request) -> Response:
+        state = request.query_params.get("state", "")
+        if not state:
+            return JSONResponse({"status": "expired"}, status_code=400)
+        result = provider.poll_status(state)
+        return JSONResponse(result, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
     @server.custom_route("/health/auth", methods=["GET"], include_in_schema=False)
     async def auth_health(_: Request) -> Response:
         return PlainTextResponse("oauth-enabled", headers={"Cache-Control": "no-store"})
+
+
+def _cli() -> None:
+    """Local-only OAuth approval administration. Never expose this as a
+    remote MCP tool or HTTP route: approval must stay a human, local (or
+    private-channel) action, never something the remote client can invoke
+    on itself."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Hermes-GPT OAuth approval admin (local only).")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list-pending", help="List pending authorization requests.")
+    approve = sub.add_parser("approve", help="Approve a pending authorization request.")
+    approve.add_argument("request_id")
+    approve.add_argument("--source", default="local-cli", help="Approval source for the audit log.")
+    deny = sub.add_parser("deny", help="Deny a pending authorization request.")
+    deny.add_argument("request_id")
+    deny.add_argument("--source", default="local-cli", help="Denial source for the audit log.")
+    args = parser.parse_args()
+
+    config = AuthRuntimeConfig.from_env()
+    provider = PersistentOAuthProvider(config)
+
+    if args.cmd == "list-pending":
+        print(json.dumps(provider.list_pending_requests(), indent=2))
+    elif args.cmd == "approve":
+        provider.approve_request(args.request_id, decided_by=args.source)
+        print(json.dumps({"approved": args.request_id}, indent=2))
+    elif args.cmd == "deny":
+        provider.deny_request(args.request_id, decided_by=args.source)
+        print(json.dumps({"denied": args.request_id}, indent=2))
+
+
+if __name__ == "__main__":
+    _cli()
