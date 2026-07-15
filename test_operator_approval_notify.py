@@ -122,3 +122,67 @@ def test_send_failure_returns_false_without_raising(telegram_env, monkeypatch):
 def test_unknown_request_type_returns_false(telegram_env):
     result = notify.notify_pending_request("not-a-real-type", "id1", {})
     assert result is False
+
+
+def test_falls_back_to_shared_env_file_when_process_env_unset(tmp_path, monkeypatch):
+    """No systemd unit ever duplicates the real token into its own config --
+    this module reads it at call-time from the same .env file Hermes
+    Agent's gateway already loads it from."""
+    monkeypatch.delenv(notify.TELEGRAM_BOT_TOKEN_ENV, raising=False)
+    monkeypatch.delenv(notify.TELEGRAM_ALLOWED_USERS_ENV, raising=False)
+    env_file = tmp_path / "shared.env"
+    env_file.write_text(
+        "SOME_OTHER_VAR=irrelevant\n"
+        "TELEGRAM_BOT_TOKEN=fallback-token-value\n"
+        "TELEGRAM_ALLOWED_USERS=555,666\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_GPT_SHARED_ENV_FILE", str(env_file))
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        class FakeResponse:
+            status_code = 200
+        return FakeResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = notify.notify_pending_request("oauth", "abc123", {"client_id": "c1"})
+    assert result is True
+    assert "fallback-token-value" in captured["url"]
+    assert captured["json"]["chat_id"] == "555"
+
+
+def test_process_env_takes_priority_over_shared_env_file(tmp_path, monkeypatch):
+    env_file = tmp_path / "shared.env"
+    env_file.write_text("TELEGRAM_BOT_TOKEN=should-not-be-used\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_GPT_SHARED_ENV_FILE", str(env_file))
+    monkeypatch.setenv(notify.TELEGRAM_BOT_TOKEN_ENV, "process-env-token")
+    monkeypatch.setenv(notify.TELEGRAM_ALLOWED_USERS_ENV, "12345")
+
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        class FakeResponse:
+            status_code = 200
+        return FakeResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    notify.notify_pending_request("oauth", "abc123", {"client_id": "c1"})
+    assert "process-env-token" in captured["url"]
+    assert "should-not-be-used" not in captured["url"]
+
+
+def test_missing_shared_env_file_returns_false_without_raising(monkeypatch):
+    monkeypatch.delenv(notify.TELEGRAM_BOT_TOKEN_ENV, raising=False)
+    monkeypatch.delenv(notify.TELEGRAM_ALLOWED_USERS_ENV, raising=False)
+    monkeypatch.setenv("HERMES_GPT_SHARED_ENV_FILE", "/nonexistent/path/does/not/exist.env")
+    result = notify.notify_pending_request("oauth", "abc123", {"client_id": "c1"})
+    assert result is False

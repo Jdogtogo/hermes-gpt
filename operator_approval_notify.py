@@ -1,33 +1,68 @@
 """Send Hermes Operator approval notifications through the existing Hermes
 Agent Telegram bot -- never a second bot, never a duplicated token.
 
-Reuses the same bot identity (TELEGRAM_BOT_TOKEN, read from the same source
-Hermes Agent's gateway already loads it from) and the same authorized-user
-configuration (TELEGRAM_ALLOWED_USERS) the Telegram adapter already enforces
-for inbound callbacks. This module only ever sends -- it never polls
-getUpdates itself (that would race with Hermes Agent's own long-running
-poller for the same bot). The corresponding button press is received by a
-small, additive branch in Hermes Agent's own callback dispatcher, which
-calls back into hermes-gpt's local approval endpoint
-(POST http://127.0.0.1:7690/telegram-resolve) after authorizing the caller
-against the exact same TELEGRAM_ALLOWED_USERS allowlist.
+Reuses the same bot identity (TELEGRAM_BOT_TOKEN, read at call-time from the
+same .env file Hermes Agent's gateway loads it from -- never copied into
+systemd unit config, so it can never leak via `systemctl show`/`systemctl
+cat`) and the same authorized-user configuration (TELEGRAM_ALLOWED_USERS)
+the Telegram adapter already enforces for inbound callbacks. This module
+only ever sends -- it never polls getUpdates itself (that would race with
+Hermes Agent's own long-running poller for the same bot). The corresponding
+button press is received by a small, additive branch in Hermes Agent's own
+callback dispatcher, which calls back into hermes-gpt's local approval
+endpoint (POST http://127.0.0.1:7690/telegram-resolve) after authorizing the
+caller against the exact same TELEGRAM_ALLOWED_USERS allowlist.
+
+This module must only ever be imported/called from the localhost-only
+approval centre (127.0.0.1:7690), never from the internet-facing chatgpt-
+operator connector -- that process forwards to POST /notify on the approval
+centre instead, so the Telegram bot token never transits the internet-facing
+process at all.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 TELEGRAM_BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 TELEGRAM_ALLOWED_USERS_ENV = "TELEGRAM_ALLOWED_USERS"
 _API_BASE = "https://api.telegram.org"
+_ENV_FILE_PATH_ENV = "HERMES_GPT_SHARED_ENV_FILE"
+_DEFAULT_ENV_FILE = Path.home() / ".hermes" / ".env"
+
+
+def _read_env_value(key: str) -> str:
+    """Look up an env var from the process environment first (lets tests
+    and future deployments override cheaply), falling back to reading it
+    directly from the shared Hermes Agent .env file at call-time. Never
+    caches the value and never writes it anywhere -- this is what lets the
+    localhost approval centre reuse the real bot token without it ever
+    being duplicated into systemd unit config."""
+    value = os.environ.get(key, "").strip()
+    if value:
+        return value
+    env_path = Path(os.environ.get(_ENV_FILE_PATH_ENV, "") or _DEFAULT_ENV_FILE)
+    try:
+        with env_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                found_key, _, found_value = line.partition("=")
+                if found_key.strip() == key:
+                    return found_value.strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
 
 
 def _target_chat_id() -> str | None:
     """For a single-user private bot, the DM chat_id equals the user_id, so
     the first configured authorized user is also the notification target."""
-    raw = os.environ.get(TELEGRAM_ALLOWED_USERS_ENV, "").strip()
+    raw = _read_env_value(TELEGRAM_ALLOWED_USERS_ENV)
     if not raw:
         return None
     first = raw.split(",")[0].strip()
@@ -35,7 +70,7 @@ def _target_chat_id() -> str | None:
 
 
 def _send_message(text: str, callback_rows: list[list[tuple[str, str]]]) -> bool:
-    token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV, "").strip()
+    token = _read_env_value(TELEGRAM_BOT_TOKEN_ENV)
     chat_id = _target_chat_id()
     if not token or not chat_id:
         return False

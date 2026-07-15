@@ -219,3 +219,33 @@ def test_main_rejects_non_loopback_host(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["operator_approval_web.py", "--host", "0.0.0.0"])
     with pytest.raises(SystemExit, match="loopback"):
         web.main()
+
+
+def test_notify_endpoint_forwards_to_notify_module(env, audit_override, monkeypatch):
+    """This is the only process allowed to actually send Telegram messages
+    -- the internet-facing chatgpt-operator connector forwards here instead
+    of importing operator_approval_notify itself."""
+    calls = []
+
+    def fake_notify(request_type, request_id, details):
+        calls.append((request_type, request_id, details))
+        return True
+
+    import operator_approval_notify
+    monkeypatch.setattr(operator_approval_notify, "notify_pending_request", fake_notify)
+
+    with TestClient(web.app) as client:
+        resp = client.post(
+            "/notify",
+            json={"request_type": "oauth", "request_id": "abc123", "details": {"client_id": "c1"}},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"success": True}
+    assert calls == [("oauth", "abc123", {"client_id": "c1"})]
+
+
+def test_notify_endpoint_rejects_malformed_body(env, audit_override):
+    with TestClient(web.app) as client:
+        resp = client.post("/notify", json={"request_type": "oauth"})
+    assert resp.status_code == 400
+    assert resp.json()["success"] is False

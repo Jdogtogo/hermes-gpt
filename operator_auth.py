@@ -486,20 +486,29 @@ class PersistentOAuthProvider(
 
     def _notify_pending_oauth_request(self, request_id: str, payload: dict[str, Any], expires_at: int) -> None:
         """Best-effort: tell a human a new connection request is waiting.
-        Never raises, never blocks authorize()."""
+        Never raises, never blocks authorize().
+
+        Forwards to the localhost-only approval centre (127.0.0.1:7690)
+        rather than sending Telegram messages directly from this process --
+        this is the internet-facing OAuth connector, so it must never hold
+        the Telegram bot token. Only the loopback-bound approval centre does."""
         try:
-            import operator_approval_notify as notify
+            import httpx
 
             redirect_domain = urlparse(str(payload.get("redirect_uri", ""))).hostname or ""
-            notify.notify_pending_request(
-                "oauth",
-                request_id,
-                {
-                    "client_id": payload.get("client_id"),
-                    "redirect_domain": redirect_domain,
-                    "scope": " ".join(payload.get("scopes") or []),
-                    "expires_at": expires_at,
+            httpx.post(
+                "http://127.0.0.1:7690/notify",
+                json={
+                    "request_type": "oauth",
+                    "request_id": request_id,
+                    "details": {
+                        "client_id": payload.get("client_id"),
+                        "redirect_domain": redirect_domain,
+                        "scope": " ".join(payload.get("scopes") or []),
+                        "expires_at": expires_at,
+                    },
                 },
+                timeout=3.0,
             )
         except Exception:
             pass

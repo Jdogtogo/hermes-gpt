@@ -100,9 +100,37 @@ def test_cannot_submit_raw_roots_or_policy_json(isolated_session_root, audit_ove
 
 
 def test_notify_failure_never_breaks_the_tool(isolated_session_root, audit_override, monkeypatch):
-    """If Telegram (or any notify backend) is unavailable/misconfigured, the
-    request must still be recorded -- notification is best-effort only."""
+    """If the localhost approval centre is unreachable, the request must
+    still be recorded -- notification is best-effort only. (conftest.py
+    blocks real httpx.post globally, which exercises exactly this path.)"""
     out = json.loads(server.hermes_operator_session_request(
         policy_template="sandbox", requested_duration_minutes=60, reason="x",
     ))
-    assert out["success"] is True  # operator_approval_notify module doesn't exist yet in this test env
+    assert out["success"] is True
+
+
+def test_notify_forwards_to_localhost_approval_centre_only(isolated_session_root, audit_override, monkeypatch):
+    """The internet-facing chatgpt-operator connector must never hold the
+    Telegram bot token itself -- it forwards to the loopback-only approval
+    centre, which is the only process that ever imports
+    operator_approval_notify."""
+    calls = []
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        class FakeResponse:
+            status_code = 200
+        return FakeResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    server.hermes_operator_session_request(
+        policy_template="sandbox", requested_duration_minutes=60, reason="forward test",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "http://127.0.0.1:7690/notify"
+    body = calls[0]["json"]
+    assert body["request_type"] == "session_creation"
+    assert body["details"]["reason"] == "forward test"

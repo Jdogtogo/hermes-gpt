@@ -821,10 +821,19 @@ def _notify_pending_request(request_type: str, request_id: str, details: dict) -
     Telegram if configured. Never raises — a notification failure must never
     block or fail the tool call that created the request. The localhost
     approval page needs no push notification since it polls the same
-    pending-request tables directly."""
+    pending-request tables directly.
+
+    Forwards to the localhost-only approval centre (127.0.0.1:7690) rather
+    than sending Telegram messages directly -- this is the internet-facing
+    chatgpt-operator connector, so it must never hold the Telegram bot
+    token. Only the loopback-bound approval centre does."""
     try:
-        import operator_approval_notify as notify
-        notify.notify_pending_request(request_type, request_id, details)
+        import httpx
+        httpx.post(
+            "http://127.0.0.1:7690/notify",
+            json={"request_type": request_type, "request_id": request_id, "details": details},
+            timeout=3.0,
+        )
     except Exception:
         pass
 

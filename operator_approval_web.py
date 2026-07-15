@@ -299,6 +299,27 @@ async def healthz(request: Request):
     return PlainTextResponse("ok")
 
 
+async def notify(request: Request):
+    """Internal-only: the internet-facing chatgpt-operator connector calls
+    this instead of sending Telegram messages itself, so the bot token never
+    transits that internet-facing process. Loopback-bound like every other
+    route here; no additional secret is required since only this machine's
+    own operator service ever has a reason to call it."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False}, status_code=400)
+    request_type = str(body.get("request_type", ""))
+    request_id = str(body.get("request_id", ""))
+    details = body.get("details") or {}
+    if not request_type or not request_id or not isinstance(details, dict):
+        return JSONResponse({"success": False}, status_code=400)
+    import operator_approval_notify as approval_notify
+
+    sent = approval_notify.notify_pending_request(request_type, request_id, details)
+    return JSONResponse({"success": bool(sent)})
+
+
 app = Starlette(
     routes=[
         Route("/approvals", approvals_page, methods=["GET"]),
@@ -309,6 +330,7 @@ app = Starlette(
         Route("/approvals/extension/approve", extension_approve, methods=["POST"]),
         Route("/approvals/extension/deny", extension_deny, methods=["POST"]),
         Route("/telegram-resolve", telegram_resolve, methods=["POST"]),
+        Route("/notify", notify, methods=["POST"]),
         Route("/healthz", healthz, methods=["GET"]),
     ]
 )

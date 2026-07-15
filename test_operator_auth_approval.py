@@ -235,6 +235,35 @@ def test_pending_request_cap_rate_limits_new_authorizations(approval_setup):
     assert "too many pending" in (exc_info.value.error_description or "").lower()
 
 
+def test_authorize_forwards_notification_to_localhost_approval_centre_only(approval_setup, monkeypatch):
+    """The internet-facing OAuth connector must never hold the Telegram bot
+    token itself -- it forwards to the loopback-only approval centre, which
+    is the only process that ever imports operator_approval_notify."""
+    config, provider = approval_setup
+    c = client()
+    asyncio.run(provider.register_client(c))
+
+    calls = []
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        class FakeResponse:
+            status_code = 200
+        return FakeResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    asyncio.run(provider.authorize(c, make_params(config, state="notify-state")))
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "http://127.0.0.1:7690/notify"
+    body = calls[0]["json"]
+    assert body["request_type"] == "oauth"
+    assert body["details"]["client_id"] == "client-1"
+    assert body["details"]["redirect_domain"] == "chatgpt.example.test"
+
+
 def test_local_owner_password_flow_unaffected_by_default(tmp_path):
     """approval_mode defaults to False, so an owner-style config keeps the
     password form exactly as before."""
