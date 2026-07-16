@@ -56,6 +56,13 @@ RESTRICTED_TOOL_NAMES = frozenset(
 )
 NOAUTH_META = {"securitySchemes": [{"type": "noauth"}]}
 RUNTIME_TRANSPORT = "unknown"
+# Release-safety profile of the most recently built server, and the exact set
+# of tool names register_tools() actually registered on it. hermes_operator_status()
+# reports REGISTERED_TOOL_NAMES verbatim so its self-report can never drift from
+# the real MCP tool surface (the stale-inventory bug this replaces). Both are
+# populated by register_tools(); see build_server()/register_tools().
+RUNTIME_PROFILE = LOCAL_DEV_PROFILE
+REGISTERED_TOOL_NAMES: list[str] = []
 
 HERMES_ROOT: Path | None = None
 IMPORT_ERROR: str | None = None
@@ -637,60 +644,26 @@ def hermes_operator_status() -> str:
         default_root = str(_default_hermes_root()) if _default_hermes_root() else None
         active_profile = _active_profile_name()
 
-        # Discover registered operator tools by checking this module's
-        # attributes. We list the names we explicitly register below.
-        registered = [
-            "hermes_operator_policy",
-            "hermes_operator_status",
-            "hermes_operator_audit_tail",
-            "hermes_operator_doctor",
-            "hermes_operator_snapshot",
-            "hermes_release_doctor",
-            "hermes_operator_recover",
-            "hermes_cron_list",
-            "hermes_cron_status",
-            "hermes_skill_diff",
-            "hermes_config_get",
-            "hermes_env_status",
-            "hermes_gateway_status",
-            "hermes_git_status",
-            "hermes_git_diff",
-            "hermes_cron_run",
-            "hermes_cron_pause",
-            "hermes_cron_copy",
-            "hermes_cron_move",
-            "hermes_skill_create",
-            "hermes_skill_edit",
-            "hermes_skill_patch",
-            "hermes_skill_write_file",
-            "hermes_skill_copy",
-            "hermes_skill_sync_to_default",
-            "hermes_skill_delete",
-            "hermes_config_set",
-            "hermes_config_patch",
-            "hermes_env_set_nonsecret",
-            "hermes_env_copy_nonsecret",
-            "hermes_gateway_restart",
-            "hermes_workspace_read",
-            "hermes_workspace_patch",
-            "hermes_workspace_write_file",
-            "hermes_workspace_run_test",
-            "hermes_agent_run",
-            "hermes_owner_run_command",
-            "hermes_owner_patch",
-            "hermes_owner_write_file",
-        ]
+        # Report the tools ACTUALLY registered on the live server for the
+        # active release-safety profile. register_tools() captures the exact
+        # set it registered into REGISTERED_TOOL_NAMES, so this self-report can
+        # never drift from the real MCP tool surface (unlike the previous
+        # hardcoded list, which reflected the default profile and omitted the
+        # session tools while wrongly listing owner tools).
+        registered = list(REGISTERED_TOOL_NAMES)
         result = {
             "success": True,
             "hermes_gpt_project_path": project_path,
             "hermes_agent_root": agent_root,
             "default_hermes_root": default_root,
             "active_profile": active_profile,
+            "mcp_profile": RUNTIME_PROFILE,
             "enabled": policy.enabled,
             "level": policy.level,
             "apply_mode": policy.apply_mode,
             "owner_mode_ready": policy.owner_mode_ready,
             "registered_operator_tools": registered,
+            "registered_tool_count": len(registered),
             "audit_log_path": str(op_policy.audit_log_path()),
         }
         return json.dumps(result, indent=2)
@@ -1540,71 +1513,98 @@ def build_server(
     return server
 
 
+def chatgpt_operator_tool_list() -> list[Any]:
+    """Canonical, ordered tool set for the ``chatgpt-operator`` profile.
+
+    Single source of truth for that profile: ``register_tools()`` registers
+    exactly these, and ``hermes_operator_status()`` reports exactly the names
+    captured at registration time (``REGISTERED_TOOL_NAMES``). Keeping the set
+    here — rather than in two hand-maintained copies — is what makes the
+    self-report unable to silently drift from the real MCP tool surface.
+
+    Deliberately excludes: hermes_owner_run_command, hermes_owner_patch,
+    hermes_owner_write_file, bridge_submit_command, hermes_config_set,
+    hermes_config_patch, hermes_env_set_nonsecret, hermes_gateway_restart,
+    hermes_cron_*, hermes_skill_create/edit/patch/write_file/copy/
+    sync_to_default/delete, hermes_agent_run (unrestricted agent delegation),
+    and any arbitrary command tool. See
+    docs/hermes-operator-approval-system.md.
+    """
+    return [
+        hermes_ops_brain_query,
+        hermes_operator_policy,
+        hermes_operator_status,
+        hermes_operator_session_status,
+        hermes_operator_session_request,
+        hermes_operator_session_request_extension,
+        hermes_operator_session_revoke,
+        hermes_operator_audit_tail,
+        hermes_operator_doctor,
+        hermes_operator_snapshot,
+        hermes_config_get,
+        hermes_env_status,
+        hermes_gateway_status,
+        hermes_search_files,
+        hermes_workspace_read,
+        hermes_workspace_patch,
+        hermes_workspace_write_file,
+        hermes_workspace_run_test,
+        hermes_workspace_git_commit,
+        hermes_git_status,
+        hermes_git_diff,
+    ]
+
+
 def register_tools(
     server: FastMCP,
     *,
     include_bridge: bool = False,
     profile: str = LOCAL_DEV_PROFILE,
 ) -> None:
+    global RUNTIME_PROFILE
+    RUNTIME_PROFILE = profile
+    registered: list[str] = []
+
+    def add(tool: Any) -> None:
+        server.add_tool(tool, meta=tool_meta())
+        registered.append(tool.__name__)
+
+    def finalize() -> None:
+        global REGISTERED_TOOL_NAMES
+        REGISTERED_TOOL_NAMES = sorted(registered)
+
     if profile == CHATGPT_RESTRICTED_PROFILE:
         restricted_tools = {
             "hermes_restricted_status": hermes_restricted_status,
             "hermes_restricted_agent_run": hermes_restricted_agent_run,
             "hermes_ops_brain_query": hermes_ops_brain_query,
         }
-        registered = set(restricted_tools)
-        if registered != RESTRICTED_TOOL_NAMES:
+        if set(restricted_tools) != RESTRICTED_TOOL_NAMES:
             raise RuntimeError("Restricted tool registration drifted.")
         for tool in restricted_tools.values():
-            server.add_tool(tool, meta=tool_meta())
+            add(tool)
+        finalize()
         return
 
     if profile == CHATGPT_OPERATOR_PROFILE:
-        # Deliberately excludes: hermes_owner_run_command, hermes_owner_patch,
-        # hermes_owner_write_file, bridge_submit_command, hermes_config_set,
-        # hermes_config_patch, hermes_env_set_nonsecret, hermes_gateway_restart,
-        # hermes_cron_*, hermes_skill_create/edit/patch/write_file/copy/
-        # sync_to_default/delete, hermes_agent_run (unrestricted delegation),
-        # and any arbitrary command tool. See docs/operator-mode.md.
-        for tool in [
-            hermes_ops_brain_query,
-            hermes_operator_policy,
-            hermes_operator_status,
-            hermes_operator_session_status,
-            hermes_operator_session_request,
-            hermes_operator_session_request_extension,
-            hermes_operator_session_revoke,
-            hermes_operator_audit_tail,
-            hermes_operator_doctor,
-            hermes_operator_snapshot,
-            hermes_config_get,
-            hermes_env_status,
-            hermes_gateway_status,
-            hermes_search_files,
-            hermes_workspace_read,
-            hermes_workspace_patch,
-            hermes_workspace_write_file,
-            hermes_workspace_run_test,
-            hermes_workspace_git_commit,
-            hermes_git_status,
-            hermes_git_diff,
-        ]:
-            server.add_tool(tool, meta=tool_meta())
+        for tool in chatgpt_operator_tool_list():
+            add(tool)
+        finalize()
         return
 
-    server.add_tool(hermes_read_file, meta=tool_meta())
-    server.add_tool(hermes_search_files, meta=tool_meta())
-    server.add_tool(hermes_memory, meta=tool_meta())
-    server.add_tool(hermes_skill_list, meta=tool_meta())
-    server.add_tool(hermes_skill_view, meta=tool_meta())
+    add(hermes_read_file)
+    add(hermes_search_files)
+    add(hermes_memory)
+    add(hermes_skill_list)
+    add(hermes_skill_view)
 
     if env_enabled(ENABLE_WRITE_ENV):
-        server.add_tool(hermes_write_file, meta=tool_meta())
-        server.add_tool(hermes_patch, meta=tool_meta())
+        add(hermes_write_file)
+        add(hermes_patch)
     if env_enabled(ENABLE_TERMINAL_ENV):
-        server.add_tool(hermes_run_command, meta=tool_meta())
+        add(hermes_run_command)
     if env_enabled(ENABLE_SESSION_SEARCH_ENV):
-        server.add_tool(hermes_session_search, meta=tool_meta())
+        add(hermes_session_search)
 
     # --- Operator / Owner Mode tools -----------------------------------
     #
@@ -1614,59 +1614,60 @@ def register_tools(
     # when the operator policy is not enabled / level is insufficient /
     # apply_mode is dry_run / owner ack is missing.
     if include_bridge:
-        server.add_tool(bridge_status, meta=tool_meta())
-        server.add_tool(bridge_read, meta=tool_meta())
-        server.add_tool(bridge_submit_command, meta=tool_meta())
-        server.add_tool(bridge_read_result, meta=tool_meta())
-        server.add_tool(bridge_write_adjudication, meta=tool_meta())
-    server.add_tool(hermes_ops_brain_query, meta=tool_meta())
-    server.add_tool(hermes_operator_policy, meta=tool_meta())
-    server.add_tool(hermes_operator_status, meta=tool_meta())
-    server.add_tool(hermes_operator_audit_tail, meta=tool_meta())
-    server.add_tool(hermes_operator_doctor, meta=tool_meta())
-    server.add_tool(hermes_operator_snapshot, meta=tool_meta())
-    server.add_tool(hermes_release_doctor, meta=tool_meta())
-    server.add_tool(hermes_operator_recover, meta=tool_meta())
+        add(bridge_status)
+        add(bridge_read)
+        add(bridge_submit_command)
+        add(bridge_read_result)
+        add(bridge_write_adjudication)
+    add(hermes_ops_brain_query)
+    add(hermes_operator_policy)
+    add(hermes_operator_status)
+    add(hermes_operator_audit_tail)
+    add(hermes_operator_doctor)
+    add(hermes_operator_snapshot)
+    add(hermes_release_doctor)
+    add(hermes_operator_recover)
 
     # Cron
-    server.add_tool(hermes_cron_list, meta=tool_meta())
-    server.add_tool(hermes_cron_status, meta=tool_meta())
-    server.add_tool(hermes_cron_run, meta=tool_meta())
-    server.add_tool(hermes_cron_pause, meta=tool_meta())
-    server.add_tool(hermes_cron_copy, meta=tool_meta())
-    server.add_tool(hermes_cron_move, meta=tool_meta())
+    add(hermes_cron_list)
+    add(hermes_cron_status)
+    add(hermes_cron_run)
+    add(hermes_cron_pause)
+    add(hermes_cron_copy)
+    add(hermes_cron_move)
 
     # Skills
-    server.add_tool(hermes_skill_diff, meta=tool_meta())
-    server.add_tool(hermes_skill_create, meta=tool_meta())
-    server.add_tool(hermes_skill_edit, meta=tool_meta())
-    server.add_tool(hermes_skill_patch, meta=tool_meta())
-    server.add_tool(hermes_skill_write_file, meta=tool_meta())
-    server.add_tool(hermes_skill_copy, meta=tool_meta())
-    server.add_tool(hermes_skill_sync_to_default, meta=tool_meta())
-    server.add_tool(hermes_skill_delete, meta=tool_meta())
+    add(hermes_skill_diff)
+    add(hermes_skill_create)
+    add(hermes_skill_edit)
+    add(hermes_skill_patch)
+    add(hermes_skill_write_file)
+    add(hermes_skill_copy)
+    add(hermes_skill_sync_to_default)
+    add(hermes_skill_delete)
 
     # Config / env
-    server.add_tool(hermes_config_get, meta=tool_meta())
-    server.add_tool(hermes_config_set, meta=tool_meta())
-    server.add_tool(hermes_config_patch, meta=tool_meta())
-    server.add_tool(hermes_env_status, meta=tool_meta())
-    server.add_tool(hermes_env_set_nonsecret, meta=tool_meta())
-    server.add_tool(hermes_env_copy_nonsecret, meta=tool_meta())
+    add(hermes_config_get)
+    add(hermes_config_set)
+    add(hermes_config_patch)
+    add(hermes_env_status)
+    add(hermes_env_set_nonsecret)
+    add(hermes_env_copy_nonsecret)
 
     # Gateway / workspace / git / owner
-    server.add_tool(hermes_gateway_status, meta=tool_meta())
-    server.add_tool(hermes_gateway_restart, meta=tool_meta())
-    server.add_tool(hermes_workspace_read, meta=tool_meta())
-    server.add_tool(hermes_workspace_patch, meta=tool_meta())
-    server.add_tool(hermes_workspace_write_file, meta=tool_meta())
-    server.add_tool(hermes_workspace_run_test, meta=tool_meta())
-    server.add_tool(hermes_git_status, meta=tool_meta())
-    server.add_tool(hermes_git_diff, meta=tool_meta())
-    server.add_tool(hermes_agent_run, meta=tool_meta())
-    server.add_tool(hermes_owner_run_command, meta=tool_meta())
-    server.add_tool(hermes_owner_patch, meta=tool_meta())
-    server.add_tool(hermes_owner_write_file, meta=tool_meta())
+    add(hermes_gateway_status)
+    add(hermes_gateway_restart)
+    add(hermes_workspace_read)
+    add(hermes_workspace_patch)
+    add(hermes_workspace_write_file)
+    add(hermes_workspace_run_test)
+    add(hermes_git_status)
+    add(hermes_git_diff)
+    add(hermes_agent_run)
+    add(hermes_owner_run_command)
+    add(hermes_owner_patch)
+    add(hermes_owner_write_file)
+    finalize()
 
 
 mcp = build_server()

@@ -374,6 +374,50 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         }
 
 
+def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
+    """hermes_operator_status() must report exactly the live MCP tool surface.
+
+    Regression guard for the stale-inventory defect: the status tool used to
+    return a hardcoded list (default-profile tools, including hermes_agent_run
+    and owner tools, and missing the session tools). It must instead derive
+    from REGISTERED_TOOL_NAMES captured by register_tools().
+    """
+    clear_gate_envs(monkeypatch)
+    enable_operator_session(monkeypatch, tmp_path)
+
+    built = server.build_server(
+        http=True,
+        transport="streamable-http",
+        profile=server.CHATGPT_OPERATOR_PROFILE,
+    )
+    live_names = tool_names(built)
+
+    status = json.loads(server.hermes_operator_status())
+    assert status["success"] is True
+    assert status["mcp_profile"] == server.CHATGPT_OPERATOR_PROFILE
+    # Self-report matches the actual live tool surface, exactly.
+    assert sorted(status["registered_operator_tools"]) == live_names
+    assert status["registered_tool_count"] == len(live_names)
+    assert len(live_names) == 21
+
+    # The session tools that the connector needs must be reported...
+    for required in [
+        "hermes_operator_session_request",
+        "hermes_operator_session_status",
+        "hermes_operator_session_request_extension",
+        "hermes_operator_session_revoke",
+    ]:
+        assert required in status["registered_operator_tools"]
+    # ...and the deliberately-excluded tools must not be.
+    for forbidden in [
+        "hermes_agent_run",
+        "hermes_owner_run_command",
+        "hermes_owner_patch",
+        "hermes_owner_write_file",
+    ]:
+        assert forbidden not in status["registered_operator_tools"]
+
+
 def test_authenticated_http_bridge_requires_bearer_token(monkeypatch, tmp_path):
     clear_gate_envs(monkeypatch)
     auth_root = tmp_path / "auth"
