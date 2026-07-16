@@ -47,21 +47,20 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "baseline_required": False,
     },
     "tax-calculator-controller": {
-        # Defined but not yet activated: requesting this template must be
-        # rejected until an isolated clean worktree exists and is separately
-        # approved. Kept here so the shape of the eventual policy is fixed
-        # and reviewable now, not improvised later under time pressure.
-        "active": False,
-        "description": "Reserved for the Tax Calculator controller task. Not active.",
+        "active": True,
+        "description": (
+            "Tightly scoped maintenance access to the Tax Calculator repository "
+            "for reviewed line-ending repair and subsequent controlled development."
+        ),
         "policy": {
             "level": "workspace",
             "apply_mode": "direct",
-            "readable_roots": [],
-            "writable_roots": [],
-            "verbs": {"filesystem": ["read"]},
+            "readable_roots": ["/mnt/c/Dev/Tax Calculator"],
+            "writable_roots": ["/mnt/c/Dev/Tax Calculator"],
+            "verbs": {"filesystem": ["read", "edit"], "git": ["commit"], "tests": ["run"]},
         },
         "max_duration_seconds": _TWO_HOURS,
-        "allowed_branches": None,
+        "allowed_branches": ["feat/projection-architecture-discovery"],
         "baseline_required": True,
     },
 }

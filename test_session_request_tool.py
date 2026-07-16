@@ -66,12 +66,21 @@ def test_unknown_template_rejected(isolated_session_root, audit_override):
     assert op_sessions.list_pending_session_requests(root=isolated_session_root) == []
 
 
-def test_inactive_template_rejected(isolated_session_root, audit_override):
+def test_active_tax_calculator_template_creates_pending_request_only(
+    isolated_session_root, audit_override
+):
     out = json.loads(server.hermes_operator_session_request(
-        policy_template="tax-calculator-controller", requested_duration_minutes=60, reason="x",
+        policy_template="tax-calculator-controller",
+        requested_duration_minutes=60,
+        reason="reviewed line-ending repair",
     ))
-    assert out["success"] is False
-    assert op_sessions.list_pending_session_requests(root=isolated_session_root) == []
+    assert out["success"] is True
+    assert out["status"] == "pending"
+    assert out["resolved_policy"]["writable_roots"] == ["/mnt/c/Dev/Tax Calculator"]
+    assert op_sessions.active_session() is None
+    pending = op_sessions.list_pending_session_requests(root=isolated_session_root)
+    assert len(pending) == 1
+    assert pending[0]["policy_template"] == "tax-calculator-controller"
 
 
 def test_missing_reason_rejected(isolated_session_root, audit_override):

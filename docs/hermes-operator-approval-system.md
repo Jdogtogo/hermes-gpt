@@ -133,9 +133,10 @@ template — never submit raw paths, verbs, or policy JSON.
 - **`hermes-gpt-operator-maintenance`** (active) — read/write root is the
   operator worktree itself, restricted to branch
   `codex/operator-session-chatgpt-20260713`.
-- **`tax-calculator-controller`** (defined, **not activated** — empty
-  roots, rejected if requested). Do not activate this without a separate,
-  explicit task.
+- **`tax-calculator-controller`** (active) — read/write root is exactly
+  `/mnt/c/Dev/Tax Calculator`, restricted to branch
+  `feat/projection-architecture-discovery`, with a two-hour maximum and a
+  required pinned baseline for controlled commits.
 
 Every resolved policy also carries a fixed set of `hard_denied_paths`
 (`.ssh`, `.aws`, `.azure`, `.gnupg`, `.docker`, `.kube`,

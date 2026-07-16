@@ -26,13 +26,28 @@ def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
     assert resolved["allowed_branches"] == ["codex/operator-session-chatgpt-20260713"]
 
 
+def test_tax_calculator_resolves_to_exact_scope_and_branch():
+    resolved = templates.resolve_template("tax-calculator-controller")
+    policy = resolved["policy"]
+    assert policy["readable_roots"] == ["/mnt/c/Dev/Tax Calculator"]
+    assert policy["writable_roots"] == ["/mnt/c/Dev/Tax Calculator"]
+    assert resolved["allowed_branches"] == ["feat/projection-architecture-discovery"]
+    assert resolved["baseline_required"] is True
+    assert resolved["max_duration_seconds"] == 2 * 60 * 60
+
+
 def test_allowed_verbs_are_scoped_not_owner_level():
-    for name in ("sandbox", "hermes-gpt-operator-maintenance"):
+    for name in (
+        "sandbox",
+        "hermes-gpt-operator-maintenance",
+        "tax-calculator-controller",
+    ):
         resolved = templates.resolve_template(name)
         verbs = resolved["policy"]["verbs"]
         assert resolved["policy"]["level"] == "workspace"
         assert set(verbs["filesystem"]) == {"read", "edit"}
         assert verbs["git"] == ["commit"]
+        assert verbs["tests"] == ["run"]
         # No verb set here ever grants arbitrary command execution or owner
         # mode; only filesystem read/edit, git commit, and test execution.
         for verb_list in verbs.values():
@@ -52,15 +67,12 @@ def test_unknown_template_rejected():
         templates.resolve_template("does-not-exist")
 
 
-def test_inactive_template_rejected():
-    with pytest.raises(templates.InactivePolicyTemplateError):
-        templates.resolve_template("tax-calculator-controller")
-
-
-def test_inactive_template_not_in_active_list():
-    assert "tax-calculator-controller" not in templates.active_template_names()
+def test_tax_calculator_template_is_active():
+    assert "tax-calculator-controller" in templates.active_template_names()
     assert "sandbox" in templates.active_template_names()
     assert "hermes-gpt-operator-maintenance" in templates.active_template_names()
+    resolved = templates.resolve_template("tax-calculator-controller")
+    assert resolved["active"] is True
 
 
 def test_resolved_snapshot_is_immutable_from_caller_mutation():
@@ -99,11 +111,10 @@ def test_resolve_template_only_accepts_a_name_no_path_injection_channel():
             templates.resolve_template(attempt)
 
 
-def test_tax_calculator_template_has_no_writable_roots_while_inactive():
-    """Even reaching into the raw registry (bypassing resolve_template's
-    activation gate, as a defense-in-depth check) the reserved template
-    grants no write access and no roots at all yet."""
-    raw = templates.POLICY_TEMPLATES["tax-calculator-controller"]
-    assert raw["policy"]["writable_roots"] == []
-    assert raw["policy"]["readable_roots"] == []
-    assert raw["active"] is False
+def test_tax_calculator_template_has_only_the_intended_repository_root():
+    resolved = templates.resolve_template("tax-calculator-controller")
+    policy = resolved["policy"]
+    assert policy["readable_roots"] == policy["writable_roots"]
+    assert policy["writable_roots"] == ["/mnt/c/Dev/Tax Calculator"]
+    assert "/home/jfroh" not in policy["writable_roots"]
+    assert "/mnt/c/Dev" not in policy["writable_roots"]
