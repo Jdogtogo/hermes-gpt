@@ -6,7 +6,7 @@ Tools:
 - ``hermes_workspace_read``        : read_only  — read file with operator path policy
 - ``hermes_workspace_patch``       : workspace  — find-and-replace within an allowed path
 - ``hermes_workspace_write_file``  : workspace  — write file within an allowed path
-- ``hermes_workspace_run_test``    : workspace  — conservative allowlist of test/lint commands
+- ``hermes_workspace_run_test``    : workspace  — conservative test/lint commands plus repository-local scripts
 - ``hermes_git_status``            : read_only  — git status in a workdir
 - ``hermes_git_diff``              : read_only  — git diff in a workdir
 - ``hermes_workspace_git_commit``  : workspace  — narrow, session-gated commit of an explicit file list
@@ -603,7 +603,51 @@ _DANGEROUS_PATTERNS: tuple[str, ...] = (
 )
 
 
-def _is_allowed_test_command(argv: list[str]) -> tuple[bool, str]:
+def _is_repository_local_script_command(
+    argv: list[str], workdir: str | None
+) -> tuple[bool, str]:
+    """Allow direct execution of a repository-local Python or Node script.
+
+    The command is still executed as fixed argv with ``shell=False``. The script
+    must resolve inside the supplied working directory, exist as a regular file,
+    and use an expected extension. Interpreter code flags such as ``-c`` are
+    deliberately not accepted.
+    """
+    if len(argv) < 2 or argv[0] not in {"python", "python3", "node"}:
+        return (False, "")
+    if not workdir:
+        return (False, "Repository-local script execution requires workdir.")
+
+    expected_suffixes = {
+        "python": {".py"},
+        "python3": {".py"},
+        "node": {".js", ".mjs", ".cjs"},
+    }
+    script_arg = argv[1]
+    if script_arg.startswith("-"):
+        return (False, "Interpreter flags are not allowed for repository-local script execution.")
+    if len(argv[2:]) > 8:
+        return (False, "Too many arguments for repository-local script execution.")
+
+    root = Path(workdir).expanduser().resolve(strict=False)
+    script = Path(script_arg).expanduser()
+    if not script.is_absolute():
+        script = root / script
+    script = script.resolve(strict=False)
+    try:
+        script.relative_to(root)
+    except ValueError:
+        return (False, "Script path must remain inside workdir.")
+    if script.suffix.lower() not in expected_suffixes[argv[0]]:
+        return (False, f"Unsupported script type for {argv[0]}.")
+    if not script.is_file():
+        return (False, "Repository-local script does not exist.")
+    return (True, "")
+
+
+def _is_allowed_test_command(
+    argv: list[str], workdir: str | None = None
+) -> tuple[bool, str]:
     """Check whether argv matches the test/lint allowlist."""
     if not argv:
         return (False, "Empty command.")
@@ -618,6 +662,10 @@ def _is_allowed_test_command(argv: list[str]) -> tuple[bool, str]:
             if len(extra) > max_extra:
                 return (False, f"Too many arguments for {prefix!r}.")
             return (True, "")
+
+    local_script_allowed, local_script_reason = _is_repository_local_script_command(argv, workdir)
+    if local_script_allowed or local_script_reason:
+        return (local_script_allowed, local_script_reason)
     return (False, "Command not in the test/lint allowlist.")
 
 
@@ -642,7 +690,7 @@ def hermes_workspace_run_test(
                 "Command not in the test/lint allowlist: could not parse safely."
             ) from exc
 
-        allowed, reason = _is_allowed_test_command(argv)
+        allowed, reason = _is_allowed_test_command(argv, workdir=workdir)
         if not allowed:
             raise PermissionError(reason)
 

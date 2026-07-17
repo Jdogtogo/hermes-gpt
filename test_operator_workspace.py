@@ -245,6 +245,44 @@ def test_run_test_accepts_python3_pytest(workspace_tree, clean_env, audit_overri
     assert captured["argv"] == ["python3", "-m", "pytest", "-q"]
 
 
+def test_run_test_accepts_repository_local_python_script(workspace_tree):
+    (workspace_tree / "test_standalone.py").write_text("print('ok')\n", encoding="utf-8")
+    allowed, reason = ows._is_allowed_test_command(
+        ["python", "test_standalone.py", "--sample", "value"],
+        workdir=str(workspace_tree),
+    )
+    assert allowed is True
+    assert reason == ""
+
+
+def test_run_test_accepts_repository_local_node_script(workspace_tree):
+    (workspace_tree / "scripts").mkdir()
+    (workspace_tree / "scripts" / "check.mjs").write_text("console.log('ok');\n", encoding="utf-8")
+    allowed, reason = ows._is_allowed_test_command(
+        ["node", "scripts/check.mjs"], workdir=str(workspace_tree)
+    )
+    assert allowed is True
+    assert reason == ""
+
+
+@pytest.mark.parametrize(
+    ("argv", "reason_fragment"),
+    [
+        (["python", "-c", "print('unsafe')"], "flags"),
+        (["python", "../outside.py"], "inside workdir"),
+        (["node", "../outside.mjs"], "inside workdir"),
+        (["python", "missing.py"], "does not exist"),
+        (["python", "README.md"], "unsupported script type"),
+    ],
+)
+def test_run_test_rejects_unsafe_repository_script_forms(
+    workspace_tree, argv, reason_fragment
+):
+    allowed, reason = ows._is_allowed_test_command(argv, workdir=str(workspace_tree))
+    assert allowed is False
+    assert reason_fragment in reason.lower()
+
+
 @pytest.mark.parametrize(
     "bad_cmd",
     [
@@ -281,6 +319,10 @@ def test_run_test_accepts_python3_pytest(workspace_tree, clean_env, audit_overri
         "pytest && rm x",
         "pytest `rm x`",
         "pytest $(rm x)",
+        "python -c print('unsafe')",
+        "python ../outside.py",
+        "node ../outside.mjs",
+        "python missing.py",
         "evil-binary --flag",
     ],
 )
