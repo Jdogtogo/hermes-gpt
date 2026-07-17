@@ -33,7 +33,7 @@ def test_tax_calculator_resolves_to_exact_scope_and_branch():
     assert policy["writable_roots"] == ["/mnt/c/Dev/Tax Calculator"]
     assert resolved["allowed_branches"] == ["feat/projection-architecture-discovery"]
     assert resolved["baseline_required"] is True
-    assert resolved["max_duration_seconds"] == 2 * 60 * 60
+    assert resolved["max_duration_seconds"] == 4 * 60 * 60
 
 
 def test_allowed_verbs_are_scoped_not_owner_level():

@@ -59,7 +59,7 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "writable_roots": ["/mnt/c/Dev/Tax Calculator"],
             "verbs": {"filesystem": ["read", "edit"], "git": ["commit"], "tests": ["run"]},
         },
-        "max_duration_seconds": _TWO_HOURS,
+        "max_duration_seconds": _FOUR_HOURS,
         "allowed_branches": ["feat/projection-architecture-discovery"],
         "baseline_required": True,
     },

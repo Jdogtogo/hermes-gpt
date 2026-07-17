@@ -567,6 +567,7 @@ def hermes_workspace_write_file(
 _TEST_COMMAND_ALLOWLIST: tuple[tuple[tuple[str, ...], int], ...] = (
     (("pytest",), 8),
     (("python", "-m", "pytest"), 8),
+    (("python3", "-m", "pytest"), 8),
     (("npm", "test"), 4),
     (("npm", "run", "test"), 4),
     (("npm", "run", "lint"), 4),

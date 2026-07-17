@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.log
 *.err.log
+*.bak.*
 *.pem
 .env
 .env.*

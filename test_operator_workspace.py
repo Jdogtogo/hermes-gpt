@@ -225,6 +225,26 @@ def test_run_test_accepts_pytest(workspace_tree, clean_env, audit_override, monk
     assert captured["argv"] == ["pytest"]
 
 
+def test_run_test_accepts_python3_pytest(workspace_tree, clean_env, audit_override, monkeypatch):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    captured = {}
+
+    def fake_runner(argv, timeout=120, workdir=None):
+        captured["argv"] = argv
+        return (0, "tests passed", "")
+
+    out = ows.hermes_workspace_run_test(
+        command="python3 -m pytest -q", workdir=str(workspace_tree),
+        dry_run=False, runner=fake_runner,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert captured["argv"] == ["python3", "-m", "pytest", "-q"]
+
+
 @pytest.mark.parametrize(
     "bad_cmd",
     [
