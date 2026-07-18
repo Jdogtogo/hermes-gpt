@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -47,6 +49,15 @@ def audit_override(tmp_path):
     op.set_audit_log_override(log)
     yield log
     op.set_audit_log_override(None)
+
+
+@pytest.fixture
+def unpinned_skill_usage(monkeypatch):
+    tools_module = ModuleType("tools")
+    tools_module.skill_usage = SimpleNamespace(
+        get_record=lambda name: {"pinned": False}
+    )
+    monkeypatch.setitem(sys.modules, "tools", tools_module)
 
 
 _VALID_FRONTMATTER = """---
@@ -592,7 +603,9 @@ def test_skill_sync_to_default_refuses_direct_mutation(hermes_root, clean_env, a
     assert not (hermes_root / "skills" / "research-skill").exists()
 
 
-def test_skill_delete_dry_run_does_not_mutate(hermes_root, clean_env, audit_override, monkeypatch):
+def test_skill_delete_dry_run_does_not_mutate(
+    hermes_root, clean_env, audit_override, monkeypatch, unpinned_skill_usage
+):
     monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
     monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "skills")
     skill_dir = _make_skill(hermes_root, "my-skill")
@@ -607,7 +620,9 @@ def test_skill_delete_dry_run_does_not_mutate(hermes_root, clean_env, audit_over
     assert skill_dir.exists()
 
 
-def test_skill_delete_direct_uses_skill_manager_when_available(hermes_root, clean_env, audit_override, monkeypatch):
+def test_skill_delete_direct_uses_skill_manager_when_available(
+    hermes_root, clean_env, audit_override, monkeypatch, unpinned_skill_usage
+):
     monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
     monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "skills")
     monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
@@ -634,7 +649,9 @@ def test_skill_delete_direct_uses_skill_manager_when_available(hermes_root, clea
     assert not skill_dir.exists()
 
 
-def test_skill_delete_refuses_direct_mutation_without_skill_manager(hermes_root, clean_env, audit_override, monkeypatch):
+def test_skill_delete_refuses_direct_mutation_without_skill_manager(
+    hermes_root, clean_env, audit_override, monkeypatch, unpinned_skill_usage
+):
     monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
     monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "skills")
     monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
