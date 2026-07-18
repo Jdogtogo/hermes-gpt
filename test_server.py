@@ -218,6 +218,7 @@ def test_chatgpt_restricted_agent_denies_secret_path_before_execution(monkeypatc
 
 def test_chatgpt_restricted_agent_forces_read_only_execution(monkeypatch, tmp_path):
     enable_restricted_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(server, "RUNTIME_TRANSPORT", "streamable-http")
     captured = {}
 
