@@ -54,6 +54,200 @@ class SessionRecord:
     approval_state: str
 
 
+@dataclass(frozen=True)
+class EffectiveAuthority:
+    """The single authoritative answer to "what may the operator runtime do
+    right now, and why". Produced only by resolve_effective_authority();
+    consumed by OperatorPolicy (all mutation guards) and by both operator
+    status tools, so status reporting and enforcement can never diverge.
+
+    When ``is_active`` is False the level/apply_mode fields are always the
+    fail-closed pair ("read_only"/"dry_run") REGARDLESS of environment
+    variables; env-derived authority is layered on separately by
+    OperatorPolicy only when no session deployment is configured at all
+    (``status == "none_configured"``).
+    """
+
+    session_id: str | None       # the active session's id (None unless is_active)
+    pointed_session_id: str | None  # what the pointer/env referenced, even if invalid
+    status: str                  # active | expired | revoked | not_approved |
+                                 # missing | malformed | none_configured
+    level: str
+    apply_mode: str
+    approved_at: int | None      # session created_at (approval bound)
+    expires_at: int | None       # reported even for expired sessions, for diagnostics
+    policy_template: str | None
+    snapshot_hash: str | None
+    readable_roots: list[str]
+    writable_roots: list[str]
+    verbs: dict[str, Any]
+    is_active: bool
+    failure_reason: str | None   # human-readable, secret-free; None when active
+
+
+def _session_files_secure(root: Path) -> str | None:
+    """Best-effort ownership/permission validation of persisted session
+    state. Returns a failure reason string, or None when acceptable. Never
+    raises. Windows (os.name != 'posix') has no comparable uid/mode model, so
+    the check is a no-op there rather than a false failure."""
+    if os.name != "posix":
+        return None
+    try:
+        uid = os.getuid()
+        for candidate in (_active_pointer_path(root), db_path(root)):
+            if not candidate.exists():
+                continue
+            info = candidate.stat()
+            if info.st_uid != uid:
+                return f"Session state file {candidate.name} is not owned by the current user."
+            if info.st_mode & 0o022:
+                return f"Session state file {candidate.name} is group/other-writable."
+    except OSError as exc:
+        return f"Session state could not be validated: {exc.__class__.__name__}."
+    return None
+
+
+def session_deployment_configured() -> bool:
+    """True when THIS process is explicitly configured as a session-governed
+    deployment (session root and/or active-session id set in the
+    environment, as the operator sidecar units do). Env-authority
+    deployments (e.g. the local owner sidecar) configure neither and must
+    not have their env-granted authority overridden by session state found
+    in the shared default root."""
+    return bool(
+        os.environ.get(SESSION_ROOT_ENV, "").strip()
+        or os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip()
+    )
+
+
+def resolve_effective_authority(*, now: int | None = None) -> EffectiveAuthority:
+    """Resolve the runtime's effective operator authority from the
+    authoritative session record (pointer file first, env id fallback),
+    classifying every non-active outcome instead of collapsing them to None.
+
+    Fail-closed contract: every path that is not a fully validated, approved,
+    unexpired, unrevoked session with intact persisted state yields
+    level="read_only", apply_mode="dry_run", is_active=False, and a
+    failure_reason explaining why -- so status tools can SHOW the reason and
+    guards can act on exactly the same answer.
+    """
+    current = int(time.time() if now is None else now)
+
+    def _closed(status: str, pointed: str | None, reason: str | None,
+                *, approved_at: int | None = None, expires_at: int | None = None) -> EffectiveAuthority:
+        return EffectiveAuthority(
+            session_id=None, pointed_session_id=pointed, status=status,
+            level="read_only", apply_mode="dry_run",
+            approved_at=approved_at, expires_at=expires_at,
+            policy_template=None, snapshot_hash=None,
+            readable_roots=[], writable_roots=[], verbs={},
+            is_active=False, failure_reason=reason,
+        )
+
+    try:
+        root = session_root()
+    except Exception as exc:  # session root itself unresolvable
+        return _closed("malformed", None, f"Session root could not be resolved: {exc.__class__.__name__}.")
+
+    sid = ""
+    try:
+        pointer_path = _active_pointer_path(root)
+        if pointer_path.is_file():
+            sid = pointer_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return _closed("malformed", None, "Active-session pointer exists but could not be read.")
+    if not sid:
+        sid = os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip()
+    if not sid:
+        return _closed("none_configured", None, "No operator session is configured for this deployment.")
+
+    perm_reason = _session_files_secure(root)
+    if perm_reason is not None:
+        return _closed("malformed", sid, perm_reason)
+
+    try:
+        with _connect(root) as connection:
+            row = connection.execute(
+                "SELECT s.session_id, s.snapshot_hash, p.canonical_json, s.created_at, s.expires_at, "
+                "s.revoked_at, s.approval_state "
+                "FROM operator_sessions s JOIN policy_snapshots p ON p.snapshot_hash = s.snapshot_hash "
+                "WHERE s.session_id = ?",
+                (sid,),
+            ).fetchone()
+    except Exception as exc:
+        return _closed("malformed", sid, f"Session store could not be read: {exc.__class__.__name__}.")
+
+    if row is None:
+        return _closed("missing", sid, f"Pointed-to operator session {sid!r} does not exist in the session store.")
+
+    created_at = int(row["created_at"])
+    expires_at = int(row["expires_at"])
+    if row["approval_state"] != "approved":
+        return _closed(
+            "not_approved", sid,
+            f"Operator session {sid!r} has approval state {row['approval_state']!r}, not 'approved'.",
+            approved_at=created_at, expires_at=expires_at,
+        )
+    if row["revoked_at"] is not None:
+        return _closed(
+            "revoked", sid,
+            f"Operator session {sid!r} was revoked at {int(row['revoked_at'])}.",
+            approved_at=created_at, expires_at=expires_at,
+        )
+    if expires_at < current:
+        return _closed(
+            "expired", sid,
+            f"Operator session {sid!r} expired at {expires_at} "
+            f"({current - expires_at}s ago). Request and approve a new session.",
+            approved_at=created_at, expires_at=expires_at,
+        )
+
+    try:
+        snapshot = json.loads(str(row["canonical_json"]))
+        if not isinstance(snapshot, dict):
+            raise ValueError("snapshot is not an object")
+    except Exception:
+        return _closed(
+            "malformed", sid,
+            f"Operator session {sid!r} has a malformed policy snapshot.",
+            approved_at=created_at, expires_at=expires_at,
+        )
+
+    raw_level = str(snapshot.get("level") or "workspace").strip().lower()
+    level = raw_level if raw_level in _POLICY_LEVELS else "workspace"
+    raw_mode = str(snapshot.get("apply_mode") or "direct").strip().lower()
+    apply_mode = raw_mode if raw_mode in {"dry_run", "direct"} else "direct"
+    writable = [str(p) for p in snapshot.get("writable_roots", [])]
+    if level == "workspace" and not writable:
+        return _closed(
+            "malformed", sid,
+            f"Operator session {sid!r} grants workspace level but has no writable roots.",
+            approved_at=created_at, expires_at=expires_at,
+        )
+
+    return EffectiveAuthority(
+        session_id=sid,
+        pointed_session_id=sid,
+        status="active",
+        level=level,
+        apply_mode=apply_mode,
+        approved_at=created_at,
+        expires_at=expires_at,
+        policy_template=(str(snapshot["policy_template"]) if snapshot.get("policy_template") else None),
+        snapshot_hash=str(row["snapshot_hash"]),
+        readable_roots=[str(p) for p in snapshot.get("readable_roots", [])],
+        writable_roots=writable,
+        verbs=dict(snapshot.get("verbs", {})),
+        is_active=True,
+        failure_reason=None,
+    )
+
+
+# Mirrors operator_policy.LEVELS without importing it (operator_policy imports
+# this module at top level; importing back would be circular).
+_POLICY_LEVELS = {"read_only", "cron", "skills", "skills_config", "workspace", "owner"}
+
+
 def session_root() -> Path:
     return Path(os.environ.get(SESSION_ROOT_ENV, str(DEFAULT_SESSION_ROOT))).expanduser().resolve()
 
@@ -539,19 +733,11 @@ def active_session(*, now: int | None = None) -> SessionRecord | None:
     caller-mutated os.name mid-call, whatever) must never take down policy
     evaluation. It only ever downgrades to "no pointer file found".
     """
-    sid = ""
-    try:
-        pointer_path = _active_pointer_path()
-        if pointer_path.is_file():
-            sid = pointer_path.read_text(encoding="utf-8").strip()
-    except Exception:
-        sid = ""
-    if not sid:
-        sid = os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip()
-    if not sid:
+    authority = resolve_effective_authority(now=now)
+    if not authority.is_active or authority.session_id is None:
         return None
     try:
-        return load_session(sid, now=now)
+        return load_session(authority.session_id, now=now)
     except PermissionError:
         return None
 

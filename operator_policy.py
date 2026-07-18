@@ -616,10 +616,23 @@ class OperatorPolicy:
         "session_id",
         "snapshot_hash",
         "expires_at",
+        "session_status",
+        "session_failure_reason",
+        "pointed_session_id",
+        "session_approved_at",
     )
 
     def __init__(self) -> None:
-        session = operator_sessions.active_session()
+        # Single authoritative resolution path: both status tools and every
+        # mutation guard construct OperatorPolicy(), and OperatorPolicy derives
+        # session authority exclusively from resolve_effective_authority() --
+        # so what status REPORTS and what guards ENFORCE cannot diverge.
+        authority = operator_sessions.resolve_effective_authority()
+        self.session_status = authority.status
+        self.session_failure_reason = authority.failure_reason
+        self.pointed_session_id = authority.pointed_session_id
+        self.session_approved_at = authority.approved_at
+        session = operator_sessions.active_session() if authority.is_active else None
         if session is not None:
             snapshot = session.policy
             self.enabled = True
@@ -660,6 +673,20 @@ class OperatorPolicy:
             raw_mode = "dry_run"
         self.apply_mode = raw_mode
 
+        # Fail-closed override: in an EXPLICITLY session-governed deployment
+        # (session root / session id set in the environment, as the operator
+        # sidecar units do), a session that is expired, revoked, missing, not
+        # approved, or malformed must not be replaceable by env-granted
+        # authority -- stale environment variables cannot outrank the
+        # authoritative session record. Env-authority deployments that never
+        # configured sessions (e.g. the local owner sidecar) are unaffected.
+        if (
+            operator_sessions.session_deployment_configured()
+            and self.session_status != "none_configured"
+        ):
+            self.level = "read_only"
+            self.apply_mode = "dry_run"
+
         self.allowed_profiles = parse_allowed_profiles(
             os.environ.get(OPERATOR_ALLOWED_PROFILES_ENV)
         )
@@ -694,7 +721,10 @@ class OperatorPolicy:
         )
         self.session_id = None
         self.snapshot_hash = None
-        self.expires_at = None
+        # Carries the POINTED session's expiry even when that session has
+        # lapsed (session_id stays None), so status output can show when and
+        # why authority was lost rather than silently reporting read_only.
+        self.expires_at = authority.expires_at
 
     # --- convenience -------------------------------------------------------
 
@@ -715,6 +745,15 @@ class OperatorPolicy:
     def require_level(self, required: str) -> None:
         self.require_enabled()
         if not has_level(required, self.level):
+            # In a session deployment the env var is NOT the fix -- a lapsed
+            # session is. Say what actually happened and what actually helps.
+            if self.session_status not in ("none_configured", "active"):
+                reason = self.session_failure_reason or f"session state: {self.session_status}"
+                raise PermissionError(
+                    f"Operator level {self.level!r} does not satisfy required level {required!r}. "
+                    f"Cause: {reason} Request a new session via "
+                    "hermes_operator_session_request and have it approved, then retry."
+                )
             raise PermissionError(
                 f"Operator level {self.level!r} does not satisfy required level {required!r}. "
                 f"Set {OPERATOR_LEVEL_ENV} to at least {required!r}."
@@ -853,6 +892,9 @@ class OperatorPolicy:
             "session_id": self.session_id,
             "snapshot_hash": self.snapshot_hash,
             "expires_at": self.expires_at,
+            "session_status": self.session_status,
+            "session_failure_reason": self.session_failure_reason,
+            "pointed_session_id": self.pointed_session_id,
         }
 
 

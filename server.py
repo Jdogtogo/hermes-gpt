@@ -662,6 +662,18 @@ def hermes_operator_status() -> str:
             "level": policy.level,
             "apply_mode": policy.apply_mode,
             "owner_mode_ready": policy.owner_mode_ready,
+            # Session-derived authority state, from the same resolver the
+            # mutation guards use -- when level is read_only because a session
+            # lapsed, this says so instead of leaving the downgrade silent.
+            "session": {
+                "status": policy.session_status,
+                "session_id": policy.session_id,
+                "pointed_session_id": policy.pointed_session_id,
+                "approved_at": policy.session_approved_at,
+                "expires_at": policy.expires_at,
+                "failure_reason": policy.session_failure_reason,
+                "writable_roots": [str(p) for p in policy.writable_roots] if policy.session_id else [],
+            },
             "registered_operator_tools": registered,
             "registered_tool_count": len(registered),
             "audit_log_path": str(op_policy.audit_log_path()),
@@ -703,7 +715,28 @@ def hermes_operator_session_status() -> str:
     try:
         policy = op_policy.OperatorPolicy()
         if not policy.session_id:
-            raise PermissionError("No active Operator Session is configured.")
+            # Distinguish "nothing configured" from "configured but lapsed":
+            # an expired/revoked/missing/malformed session must be visible AS
+            # SUCH, with its identity and expiry, so a client can tell that a
+            # previously-approved session lost authority (and why) instead of
+            # seeing an unexplained read_only runtime.
+            return json.dumps(
+                {
+                    "success": False,
+                    "session_status": policy.session_status,
+                    "pointed_session_id": policy.pointed_session_id,
+                    "approved_at": policy.session_approved_at,
+                    "expires_at": policy.expires_at,
+                    "failure_reason": policy.session_failure_reason,
+                    "effective_level": policy.level,
+                    "effective_apply_mode": policy.apply_mode,
+                    "suggested_action": (
+                        "Request a new session via hermes_operator_session_request "
+                        "and approve it at the local approval centre, then retry."
+                    ),
+                },
+                indent=2,
+            )
         record = op_sessions.load_session(policy.session_id)
         oauth_subject, oauth_client_id = op_policy.current_oauth_identity()
         return json.dumps(
