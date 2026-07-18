@@ -1178,6 +1178,20 @@ def hermes_workspace_run_test(command: str, workdir: str | None = None, timeout:
     )
 
 
+def hermes_workspace_exec(
+    argv: list[str],
+    workdir: str,
+    timeout: int = 300,
+    dry_run: bool = True,
+) -> str:
+    return op_workspace.hermes_workspace_exec(
+        argv=argv,
+        workdir=workdir,
+        timeout=timeout,
+        dry_run=dry_run,
+    )
+
+
 def hermes_git_status(workdir: str) -> str:
     return op_workspace.hermes_git_status(workdir=workdir)
 
@@ -1527,8 +1541,8 @@ def chatgpt_operator_tool_list() -> list[Any]:
     hermes_config_patch, hermes_env_set_nonsecret, hermes_gateway_restart,
     hermes_cron_*, hermes_skill_create/edit/patch/write_file/copy/
     sync_to_default/delete, hermes_agent_run (unrestricted agent delegation),
-    and any arbitrary command tool. See
-    docs/hermes-operator-approval-system.md.
+    and any unrestricted host command tool. The registered workspace executor
+    is argv-only and Docker-confined. See docs/hermes-operator-approval-system.md.
     """
     return [
         hermes_ops_brain_query,
@@ -1549,6 +1563,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_workspace_patch,
         hermes_workspace_write_file,
         hermes_workspace_run_test,
+        hermes_workspace_exec,
         hermes_workspace_git_commit,
         hermes_git_status,
         hermes_git_diff,
@@ -1661,6 +1676,7 @@ def register_tools(
     add(hermes_workspace_patch)
     add(hermes_workspace_write_file)
     add(hermes_workspace_run_test)
+    add(hermes_workspace_exec)
     add(hermes_git_status)
     add(hermes_git_diff)
     add(hermes_agent_run)

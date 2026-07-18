@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import operator_policy as op
+import operator_sessions as op_sessions
 import operator_workspace as ows
 
 
@@ -28,6 +29,7 @@ def clean_env(monkeypatch):
         op.OPERATOR_ENABLED_ENV, op.OPERATOR_LEVEL_ENV, op.OPERATOR_APPLY_MODE_ENV,
         op.OPERATOR_ALLOWED_PROFILES_ENV, op.OPERATOR_ALLOWED_PATHS_ENV,
         op.OPERATOR_DENIED_PATHS_ENV, op.OWNER_ACK_ENV,
+        op_sessions.SESSION_ROOT_ENV, op_sessions.ACTIVE_SESSION_ID_ENV,
     ]:
         monkeypatch.delenv(name, raising=False)
 
@@ -49,6 +51,24 @@ def _enable_owner(monkeypatch, *, ack=True, direct=True):
         monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "dry_run")
     if ack:
         monkeypatch.setenv(op.OWNER_ACK_ENV, op.OWNER_ACK_REQUIRED_VALUE)
+
+
+def _enable_workspace(monkeypatch, workspace: Path, *, direct: bool = True) -> None:
+    session_root = workspace.parent / "operator-sessions"
+    record = op_sessions.create_session(
+        {
+            "level": "workspace",
+            "apply_mode": "direct" if direct else "dry_run",
+            "readable_roots": [str(workspace)],
+            "writable_roots": [str(workspace)],
+            "verbs": {"tests": ["run"]},
+        },
+        duration_seconds=600,
+        root=session_root,
+        session_id="ops-workspace-test",
+    )
+    monkeypatch.setenv(op_sessions.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.setenv(op_sessions.ACTIVE_SESSION_ID_ENV, record.session_id)
 
 
 # --- workspace read ------------------------------------------------------
@@ -338,8 +358,8 @@ def test_run_test_rejects_dangerous_or_unallowed_commands(
     )
     parsed = json.loads(out)
     assert parsed["success"] is False, f"{bad_cmd} should be refused"
-    err_lower = parsed["error"].lower()
-    assert "forbidden" in err_lower or "not in" in err_lower or "allowlist" in err_lower
+    assert parsed["code"] == "WORKSPACE_RUN_TEST_ERROR"
+    assert parsed["error"]
 
 
 def test_run_test_dry_run_returns_plan(workspace_tree, clean_env, audit_override, monkeypatch):
@@ -353,6 +373,340 @@ def test_run_test_dry_run_returns_plan(workspace_tree, clean_env, audit_override
     assert parsed["success"] is True
     assert parsed["dry_run"] is True
     assert parsed["plan"]["argv"] == ["pytest", "-x"]
+
+
+# --- general workspace exec ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["git", "status"],
+        ["git", "diff"],
+        ["git", "log", "-3"],
+        ["git", "grep", "TODO"],
+        ["python", "script.py"],
+        ["python", "-m", "pytest"],
+        ["pytest", "-q"],
+        ["uv", "run", "pytest"],
+        ["npm", "install"],
+        ["npm", "run", "test"],
+        ["ruff", "check", "."],
+        ["mypy", "."],
+        ["cargo", "test"],
+        ["go", "test", "./..."],
+        ["dotnet", "test"],
+        ["cmake", "--build", "build"],
+        ["make", "test"],
+    ],
+)
+def test_workspace_exec_accepts_normal_developer_argv(
+    workspace_tree, clean_env, audit_override, monkeypatch, argv
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    (workspace_tree / "script.py").write_text("print('ok')\n", encoding="utf-8")
+    (workspace_tree / "build").mkdir(exist_ok=True)
+    captured = {}
+
+    def fake_runner(container_argv, timeout=120, workdir=None):
+        captured["argv"] = container_argv
+        captured["timeout"] = timeout
+        captured["workdir"] = workdir
+        return (0, "command output", "")
+
+    out = ows.hermes_workspace_exec(
+        argv=argv,
+        workdir=str(workspace_tree),
+        timeout=45,
+        dry_run=False,
+        runner=fake_runner,
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["argv"] == argv
+    assert parsed["backend"] == "docker"
+    assert parsed["network"] == "none"
+    assert captured["argv"][0] == "/usr/bin/docker"
+    entrypoint_index = captured["argv"].index("--entrypoint")
+    assert captured["argv"][entrypoint_index + 1] == argv[0]
+    if len(argv) > 1:
+        assert captured["argv"][-(len(argv) - 1):] == argv[1:]
+    assert "--network=none" in captured["argv"]
+    assert "--read-only" in captured["argv"]
+    assert "--cap-drop=ALL" in captured["argv"]
+    assert captured["timeout"] == 45
+    assert captured["workdir"] is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["bash", "-c", "echo unsafe"],
+        ["sh", "-c", "echo unsafe"],
+        ["cmd", "/c", "dir"],
+        ["powershell", "-EncodedCommand", "AAAA"],
+        ["pwsh", "-enc", "AAAA"],
+        ["curl", "https://example.com"],
+        ["wget", "https://example.com"],
+        ["rm", "-rf", "."],
+        ["del", "file.txt"],
+        ["format", "C:"],
+        ["python", "-c", "print('unsafe')"],
+        ["python3.11", "-cprint('unsafe')"],
+        ["pypy3", "-c", "print('unsafe')"],
+        ["node", "--eval", "process.exit()"],
+        ["nodejs", "-eprocess.exit()"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-m", "x"],
+        ["git", "push"],
+        ["git", "-c", "alias.x=!sh", "x"],
+        ["pytest", "|", "tee", "log"],
+        ["pytest", ">", "log"],
+        ["pytest", "tests;rm"],
+        ["pytest", "$(whoami)"],
+        ["base64", "payload"],
+        ["docker", "run", "alpine"],
+        ["env", "bash", "-c", "echo unsafe"],
+        ["timeout", "5", "sh", "-c", "echo unsafe"],
+        ["busybox", "sh", "-c", "echo unsafe"],
+    ],
+)
+def test_workspace_exec_rejects_shell_destructive_download_and_encoded_forms(
+    workspace_tree, clean_env, audit_override, monkeypatch, argv
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    out = ows.hermes_workspace_exec(
+        argv=argv,
+        workdir=str(workspace_tree),
+        dry_run=False,
+        runner=lambda *args, **kwargs: pytest.fail("runner must not be called"),
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert parsed["code"] == "WORKSPACE_EXEC_ERROR"
+
+
+def test_workspace_exec_rejects_string_command_input(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    out = ows.hermes_workspace_exec(
+        argv="pytest -q",  # type: ignore[arg-type]
+        workdir=str(workspace_tree),
+        dry_run=False,
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "argv" in parsed["error"].lower()
+
+
+def test_workspace_exec_rejects_path_traversal_and_outside_scripts(
+    workspace_tree, tmp_path, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    outside = tmp_path / "outside.py"
+    outside.write_text("print('outside')\n", encoding="utf-8")
+    for argv in (["python", "../outside.py"], ["python", str(outside)]):
+        out = ows.hermes_workspace_exec(
+            argv=argv,
+            workdir=str(workspace_tree),
+            dry_run=False,
+            docker_binary="/usr/bin/docker",
+        )
+        parsed = json.loads(out)
+        assert parsed["success"] is False
+
+
+def test_workspace_exec_rejects_linked_worktree_metadata_outside_workspace(
+    workspace_tree, tmp_path, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    external_gitdir = tmp_path / "main-repo" / ".git" / "worktrees" / "linked"
+    external_gitdir.mkdir(parents=True)
+    (workspace_tree / ".git").write_text(
+        f"gitdir: {external_gitdir}\n", encoding="utf-8"
+    )
+    out = ows.hermes_workspace_exec(
+        argv=["git", "status"],
+        workdir=str(workspace_tree),
+        dry_run=False,
+        runner=lambda *args, **kwargs: pytest.fail("runner must not be called"),
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "linked git worktree" in parsed["error"].lower()
+
+
+def test_workspace_exec_rejects_workdir_outside_approved_root(
+    workspace_tree, tmp_path, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    out = ows.hermes_workspace_exec(
+        argv=["git", "status"],
+        workdir=str(outside),
+        dry_run=False,
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "readable root" in parsed["error"].lower() or "writable" in parsed["error"].lower()
+
+
+def test_workspace_exec_translates_approved_absolute_paths_into_container(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    script = workspace_tree / "script.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    captured = {}
+
+    def fake_runner(container_argv, timeout=120, workdir=None):
+        captured["argv"] = container_argv
+        return (0, "ok", "")
+
+    out = ows.hermes_workspace_exec(
+        argv=["python", str(script)],
+        workdir=str(workspace_tree),
+        dry_run=False,
+        runner=fake_runner,
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    entrypoint_index = captured["argv"].index("--entrypoint")
+    assert captured["argv"][entrypoint_index + 1] == "python"
+    assert captured["argv"][-1] == "/workspace/script.py"
+
+
+def test_workspace_exec_masks_standard_secret_paths_from_container(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    (workspace_tree / ".env").write_text("SECRET=value\n", encoding="utf-8")
+    credentials = workspace_tree / "credentials"
+    credentials.mkdir()
+    (credentials / "token.json").write_text("{}\n", encoding="utf-8")
+    captured = {}
+
+    def fake_runner(container_argv, timeout=120, workdir=None):
+        captured["argv"] = container_argv
+        return (0, "ok", "")
+
+    out = ows.hermes_workspace_exec(
+        argv=["git", "status"],
+        workdir=str(workspace_tree),
+        dry_run=False,
+        runner=fake_runner,
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    joined = "\n".join(captured["argv"])
+    assert "source=/dev/null,destination=/workspace/.env,readonly" in joined
+    assert "destination=/workspace/credentials,tmpfs-mode=0000" in joined
+
+
+def test_workspace_exec_dry_run_returns_confined_plan_without_execution(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree, direct=False)
+    out = ows.hermes_workspace_exec(
+        argv=["pytest", "-q"],
+        workdir=str(workspace_tree),
+        timeout=999,
+        dry_run=True,
+        runner=lambda *args, **kwargs: pytest.fail("runner must not be called"),
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["dry_run"] is True
+    assert parsed["plan"]["shell"] is False
+    assert parsed["plan"]["backend"] == "docker"
+    assert parsed["plan"]["network"] == "none"
+    assert parsed["plan"]["timeout"] == 600
+
+
+def test_workspace_exec_requires_active_approved_session(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    out = ows.hermes_workspace_exec(
+        argv=["pytest"],
+        workdir=str(workspace_tree),
+        dry_run=False,
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "approved operator session" in parsed["error"].lower()
+
+
+def test_workspace_exec_requires_docker(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    monkeypatch.setattr(ows.shutil, "which", lambda name: None)
+    out = ows.hermes_workspace_exec(
+        argv=["pytest"],
+        workdir=str(workspace_tree),
+        dry_run=False,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert "docker" in parsed["error"].lower()
+
+
+def test_workspace_exec_audit_records_session_command_timing_and_output(
+    workspace_tree, tmp_path, clean_env, audit_override, monkeypatch
+):
+    session_root = tmp_path / "sessions"
+    record = op_sessions.create_session(
+        {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "readable_roots": [str(workspace_tree)],
+            "writable_roots": [str(workspace_tree)],
+            "verbs": {"tests": ["run"]},
+        },
+        duration_seconds=600,
+        root=session_root,
+        session_id="ops-workspace-exec-test",
+    )
+    monkeypatch.setenv(op_sessions.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.setenv(op_sessions.ACTIVE_SESSION_ID_ENV, record.session_id)
+    output = "x" * 900
+
+    out = ows.hermes_workspace_exec(
+        argv=["pytest", "-q"],
+        workdir=str(workspace_tree),
+        timeout=33,
+        dry_run=False,
+        runner=lambda argv, timeout=120, workdir=None: (0, output, "warning"),
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    audit = json.loads(audit_override.read_text(encoding="utf-8").splitlines()[-1])
+    assert audit["tool"] == "hermes_workspace_exec"
+    assert audit["session_id"] == record.session_id
+    assert audit["argv"] == ["pytest", "-q"]
+    assert audit["workdir"] == str(workspace_tree)
+    assert audit["timeout_seconds"] == 33
+    assert audit["exit_code"] == 0
+    assert isinstance(audit["duration_ms"], int)
+    assert audit["stdout"] == output
+    assert audit["stderr"] == "warning"
+    assert "timestamp" in audit
 
 
 # --- git status / diff ---------------------------------------------------
@@ -676,6 +1030,7 @@ def test_tool_registration_includes_new_operator_tools(monkeypatch):
         "hermes_workspace_patch",
         "hermes_workspace_write_file",
         "hermes_workspace_run_test",
+        "hermes_workspace_exec",
         "hermes_git_status",
         "hermes_git_diff",
         "hermes_owner_run_command",
@@ -721,6 +1076,7 @@ def test_operator_policy_tool_returns_default_safe_summary(monkeypatch):
     for name in [
         op.OPERATOR_ENABLED_ENV, op.OPERATOR_LEVEL_ENV,
         op.OPERATOR_APPLY_MODE_ENV, op.OWNER_ACK_ENV,
+        op_sessions.SESSION_ROOT_ENV, op_sessions.ACTIVE_SESSION_ID_ENV,
     ]:
         monkeypatch.delenv(name, raising=False)
 

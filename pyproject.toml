@@ -56,6 +56,10 @@ py-modules = [
   "docs/release-notes-v0.4.0.md",
   "docs/file-bridge.md",
   "docs/split-endpoint-architecture.md",
+  "docs/hermes-operator-approval-system.md",
+  "docs/chatgpt-operator-deployment.md",
+  "docs/workspace-test-runner.md",
+  "docs/workspace-command-execution.md",
 ]
 "share/hermes-gpt/examples" = [
   "examples/start-hermes-gpt.example.ps1",

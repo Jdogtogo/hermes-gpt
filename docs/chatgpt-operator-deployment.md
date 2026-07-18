@@ -2,7 +2,7 @@
 
 > **Superseded:** this connector is now publicly deployed (via Cloudflare
 > Tunnel, `operator.frohnert-hermes.org`) with a full Telegram + localhost
-> approval system and a 21-tool surface (this file's tool list and "no
+> approval system and a 22-tool surface (this file's tool list and "no
 > public exposure" framing below are historical, from before that work).
 > See `hermes-operator-approval-system.md` for the current, authoritative
 > reference.

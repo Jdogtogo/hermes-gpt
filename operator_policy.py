@@ -982,7 +982,8 @@ def audit_record(
         # string values to avoid accidental giant dumps.
         for k, v in extra.items():
             if isinstance(v, str):
-                record[k] = v[:500]
+                limit = 4096 if k in {"stdout", "stderr"} else 500
+                record[k] = v[:limit]
             else:
                 record[k] = v
     try:

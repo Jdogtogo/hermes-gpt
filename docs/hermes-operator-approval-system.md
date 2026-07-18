@@ -175,11 +175,19 @@ has expired/been revoked:
   `hermes_operator_session_request_extension`) remain fully available with
   no active session.
 
+## 9A. Workspace command execution
+
+`hermes_workspace_exec` is part of the authenticated ChatGPT operator tool surface. It requires an active workspace-level Operator Session carrying the `tests:run` verb and accepts structured argv only.
+
+The tool does not expose the host shell. It launches a pre-provisioned Docker image with `shell=False`, a read-only container root, no network, all capabilities dropped, no host credentials/environment, and only the approved workspace mounted read-write. Direct shell launchers, destructive utilities, downloader/remote-access tools, inline interpreter code, encoded commands, shell metacharacters, path traversal, and mutating Git subcommands are rejected before Docker is invoked.
+
+The Docker boundary is essential: `cwd` checking and `shell=False` alone cannot confine Python scripts, npm lifecycle hooks, Makefiles, pytest plugins, or compiler processes. The selected image is never pulled automatically. See `workspace-command-execution.md` for the complete API, audit fields, examples, and limitations.
+
 ## 10. Services and ports
 
 | Service | Port | Bind | Purpose |
 |---|---|---|---|
-| `hermes-gpt-chatgpt-operator.service` | 7680 | 127.0.0.1 only (public via Cloudflare Tunnel → `operator.frohnert-hermes.org`) | OAuth-gated ChatGPT connector, 21 tools |
+| `hermes-gpt-chatgpt-operator.service` | 7680 | 127.0.0.1 only (public via Cloudflare Tunnel → `operator.frohnert-hermes.org`) | OAuth-gated ChatGPT connector, 22 tools |
 | `hermes-gpt-approval-web.service` | 7690 | 127.0.0.1 only, **never tunneled** | Localhost approval page + internal `/notify` + `/telegram-resolve` |
 | `hermes-gpt-sidecar-bridge.service` | 7677 | 127.0.0.1 only (public via Cloudflare Tunnel → `mcp.frohnert-hermes.org`) | `chatgpt-restricted` profile, read-only, unrelated to this system, unchanged |
 | `hermes-gpt-owner-local.service` | 7679 | 127.0.0.1 only, **local only, never tunneled** | `local-owner` profile, full owner surface, unrelated to this system, unchanged |
