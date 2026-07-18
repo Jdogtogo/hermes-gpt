@@ -666,6 +666,30 @@ def test_workspace_exec_requires_docker(
     assert "docker" in parsed["error"].lower()
 
 
+def test_workspace_exec_uses_preprovisioned_default_image(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    captured = {}
+
+    def fake_runner(container_argv, timeout=120, workdir=None):
+        captured["argv"] = container_argv
+        return (0, "ok", "")
+
+    out = ows.hermes_workspace_exec(
+        argv=["pytest", "-q"],
+        workdir=str(workspace_tree),
+        dry_run=False,
+        runner=fake_runner,
+        docker_binary="/usr/bin/docker",
+    )
+    parsed = json.loads(out)
+    expected = "hermes-gpt-workspace-exec:python3.11-nodejs20"
+    assert parsed["success"] is True
+    assert parsed["image"] == expected
+    assert expected in captured["argv"]
+
+
 def test_workspace_exec_audit_records_session_command_timing_and_output(
     workspace_tree, tmp_path, clean_env, audit_override, monkeypatch
 ):

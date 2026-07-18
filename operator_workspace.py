@@ -772,7 +772,7 @@ def hermes_workspace_run_test(
 # ---------------------------------------------------------------------------
 
 WORKSPACE_EXEC_IMAGE_ENV = "HERMES_GPT_WORKSPACE_EXEC_IMAGE"
-_WORKSPACE_EXEC_DEFAULT_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
+_WORKSPACE_EXEC_DEFAULT_IMAGE = "hermes-gpt-workspace-exec:python3.11-nodejs20"
 _WORKSPACE_EXEC_MAX_ARGS = 128
 _WORKSPACE_EXEC_MAX_ARG_LENGTH = 4096
 _WORKSPACE_EXEC_BLOCKED_COMMANDS: frozenset[str] = frozenset(

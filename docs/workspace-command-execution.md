@@ -87,19 +87,27 @@ Commands such as `npm run`, `make`, and language test runners may internally inv
 
 ## Docker image
 
-The default image is:
+The default deployment image is:
 
 ```text
-nikolaik/python-nodejs:python3.11-nodejs20
+hermes-gpt-workspace-exec:python3.11-nodejs20
 ```
 
-Override it for a deployment with:
+Build it deliberately before deploying or restarting the sidecar:
+
+```text
+docker build --file Dockerfile.workspace-exec --tag hermes-gpt-workspace-exec:python3.11-nodejs20 .
+```
+
+`Dockerfile.workspace-exec` inherits the reviewed Python 3.11 and Node 20 base image and installs `requirements-dev.txt`, so the default executor can run this repository's pytest smoke test. Its companion Docker ignore file limits the build context to the two requirements files.
+
+Override the image for another deployment with:
 
 ```text
 HERMES_GPT_WORKSPACE_EXEC_IMAGE=<pre-provisioned-image>
 ```
 
-The executor uses `--pull=never`. It will not silently download an image. The selected image must already exist locally and must contain the required toolchain. A polyglot repository may need a purpose-built, reviewed image.
+The executor uses `--pull=never` at runtime. It will not silently download an image or install packages during an Operator Session. The selected image must already exist locally and must contain the required toolchain. A repository with additional dependencies may need its own purpose-built, reviewed image.
 
 ## Network and package installation
 

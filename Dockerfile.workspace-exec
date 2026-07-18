@@ -1,0 +1,10 @@
+FROM nikolaik/python-nodejs:python3.11-nodejs20
+
+LABEL org.opencontainers.image.title="Hermes GPT workspace executor"
+LABEL org.opencontainers.image.description="Air-gapped Python and Node developer toolchain for hermes_workspace_exec"
+
+WORKDIR /opt/hermes-gpt
+COPY requirements.txt requirements-dev.txt ./
+RUN python -m pip install --no-cache-dir --requirement requirements-dev.txt
+
+WORKDIR /workspace
