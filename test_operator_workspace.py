@@ -71,6 +71,38 @@ def _enable_workspace(monkeypatch, workspace: Path, *, direct: bool = True) -> N
     monkeypatch.setenv(op_sessions.ACTIVE_SESSION_ID_ENV, record.session_id)
 
 
+def _enable_service_restart_session(
+    monkeypatch,
+    workspace: Path,
+    *,
+    template: str = "hermes-gpt-operator-maintenance",
+    grant_restart: bool = True,
+    direct: bool = True,
+) -> None:
+    session_root = workspace.parent / "operator-service-sessions"
+    verbs = {"tests": ["run"]}
+    service_units: list[str] = []
+    if grant_restart:
+        verbs["services"] = ["restart"]
+        service_units = ["hermes-gpt-chatgpt-operator.service"]
+    record = op_sessions.create_session(
+        {
+            "policy_template": template,
+            "level": "workspace",
+            "apply_mode": "direct" if direct else "dry_run",
+            "readable_roots": [str(workspace)],
+            "writable_roots": [str(workspace)],
+            "service_units": service_units,
+            "verbs": verbs,
+        },
+        duration_seconds=600,
+        root=session_root,
+        session_id="ops-service-restart-test",
+    )
+    monkeypatch.setenv(op_sessions.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.setenv(op_sessions.ACTIVE_SESSION_ID_ENV, record.session_id)
+
+
 # --- workspace read ------------------------------------------------------
 
 
@@ -612,6 +644,77 @@ def test_workspace_exec_masks_standard_secret_paths_from_container(
     assert "destination=/workspace/credentials,tmpfs-mode=0000" in joined
 
 
+def test_workspace_exec_git_fast_path_avoids_recursive_filesystem_walk(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    (workspace_tree / ".git").mkdir()
+    (workspace_tree / ".env").write_text("SECRET=value\n", encoding="utf-8")
+    nested = workspace_tree / "nested"
+    nested.mkdir()
+    (nested / ".env.local").write_text("SECRET=other\n", encoding="utf-8")
+    credentials = workspace_tree / "credentials"
+    credentials.mkdir()
+    (credentials / "token.json").write_text("{}\n", encoding="utf-8")
+    calls = []
+
+    def fake_discovery_runner(argv, timeout=120, workdir=None):
+        calls.append((argv, timeout, workdir))
+        if "--ignored" in argv:
+            return (0, "nested/.env.local\x00", "")
+        return (0, ".env\x00credentials/token.json\x00", "")
+
+    monkeypatch.setattr(
+        ows.os,
+        "walk",
+        lambda *args, **kwargs: pytest.fail(
+            "normal Git repositories must not use the recursive walk"
+        ),
+    )
+    policy = op.OperatorPolicy()
+    mount_args, masked_count = ows._workspace_exec_denied_mounts(
+        workspace_tree,
+        policy,
+        discovery_runner=fake_discovery_runner,
+    )
+
+    assert len(calls) == 2
+    assert all(call[1] == 20 for call in calls)
+    assert all(call[2] == str(workspace_tree) for call in calls)
+    assert masked_count == 3
+    joined = "\n".join(mount_args)
+    assert "source=/dev/null,destination=/workspace/.env,readonly" in joined
+    assert "destination=/workspace/credentials,tmpfs-mode=0000" in joined
+    assert (
+        "source=/dev/null,destination=/workspace/nested/.env.local,readonly"
+        in joined
+    )
+
+
+def test_workspace_exec_git_discovery_exception_falls_back_to_walk(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_workspace(monkeypatch, workspace_tree)
+    (workspace_tree / ".git").mkdir()
+    (workspace_tree / ".env").write_text("SECRET=value\n", encoding="utf-8")
+    policy = op.OperatorPolicy()
+
+    def failed_discovery(*args, **kwargs):
+        raise TimeoutError("git discovery timed out")
+
+    mount_args, masked_count = ows._workspace_exec_denied_mounts(
+        workspace_tree,
+        policy,
+        discovery_runner=failed_discovery,
+    )
+
+    assert masked_count == 1
+    assert (
+        "type=bind,source=/dev/null,destination=/workspace/.env,readonly"
+        in mount_args
+    )
+
+
 def test_workspace_exec_dry_run_returns_confined_plan_without_execution(
     workspace_tree, clean_env, audit_override, monkeypatch
 ):
@@ -846,6 +949,106 @@ def test_gateway_restart_dry_run_returns_plan(tmp_path, clean_env, audit_overrid
     assert parsed["dry_run"] is True
     assert parsed["plan"]["argv"] == ["hermes", "gateway", "restart"]
     assert parsed["plan"]["shell"] is False
+
+
+def test_operator_service_restart_dry_run_returns_exact_delayed_plan(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_service_restart_session(monkeypatch, workspace_tree)
+    out = ows.hermes_operator_service_restart(
+        dry_run=True,
+        runner=lambda *args, **kwargs: pytest.fail("runner must not be called"),
+        systemd_run_binary="/usr/bin/systemd-run",
+        systemctl_binary="/usr/bin/systemctl",
+    )
+    parsed = json.loads(out)
+
+    assert parsed["success"] is True
+    assert parsed["dry_run"] is True
+    plan = parsed["plan"]
+    assert plan["service_unit"] == "hermes-gpt-chatgpt-operator.service"
+    assert plan["delay_seconds"] == 3
+    assert plan["shell"] is False
+    assert "--on-active=3s" in plan["argv"]
+    assert plan["argv"][-4:] == [
+        "/usr/bin/systemctl",
+        "--user",
+        "restart",
+        "hermes-gpt-chatgpt-operator.service",
+    ]
+
+
+def test_operator_service_restart_direct_schedules_exact_unit(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_service_restart_session(monkeypatch, workspace_tree)
+    captured = {}
+
+    def fake_runner(argv, timeout=120, workdir=None):
+        captured["argv"] = argv
+        captured["timeout"] = timeout
+        captured["workdir"] = workdir
+        return (0, "Running timer as unit", "")
+
+    out = ows.hermes_operator_service_restart(
+        dry_run=False,
+        runner=fake_runner,
+        systemd_run_binary="/usr/bin/systemd-run",
+        systemctl_binary="/usr/bin/systemctl",
+    )
+    parsed = json.loads(out)
+
+    assert parsed["success"] is True
+    assert parsed["scheduled"] is True
+    assert captured["timeout"] == 30
+    assert captured["workdir"] is None
+    assert captured["argv"][0] == "/usr/bin/systemd-run"
+    assert captured["argv"][-4:] == [
+        "/usr/bin/systemctl",
+        "--user",
+        "restart",
+        "hermes-gpt-chatgpt-operator.service",
+    ]
+
+
+def test_operator_service_restart_refuses_other_policy_template(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_service_restart_session(
+        monkeypatch,
+        workspace_tree,
+        template="tax-calculator-controller",
+    )
+    out = ows.hermes_operator_service_restart(
+        dry_run=False,
+        runner=lambda *args, **kwargs: pytest.fail("runner must not be called"),
+        systemd_run_binary="/usr/bin/systemd-run",
+        systemctl_binary="/usr/bin/systemctl",
+    )
+    parsed = json.loads(out)
+
+    assert parsed["success"] is False
+    assert "policy template" in parsed["error"].lower()
+
+
+def test_operator_service_restart_refuses_session_without_restart_grant(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    _enable_service_restart_session(
+        monkeypatch,
+        workspace_tree,
+        grant_restart=False,
+    )
+    out = ows.hermes_operator_service_restart(
+        dry_run=False,
+        runner=lambda *args, **kwargs: pytest.fail("runner must not be called"),
+        systemd_run_binary="/usr/bin/systemd-run",
+        systemctl_binary="/usr/bin/systemctl",
+    )
+    parsed = json.loads(out)
+
+    assert parsed["success"] is False
+    assert "services:restart" in parsed["error"].lower()
 
 
 # --- Owner Mode ----------------------------------------------------------

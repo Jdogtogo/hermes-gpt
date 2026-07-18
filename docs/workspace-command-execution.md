@@ -45,6 +45,14 @@ The container is created with:
 
 Standard credential paths inside the workspace, including `.env`, `.npmrc`, credential directories, and explicit session-denied paths, are masked inside the container.
 
+For an ordinary Git repository, secret discovery uses two fixed `git ls-files`
+queries with narrow pathspecs: one for tracked/non-ignored files and one for
+ignored files. This avoids recursively walking a large workspace before every
+command. Non-Git repositories, linked worktrees, repositories with submodules,
+and failed Git discovery fall back to the conservative filesystem walk.
+Explicit session-denied paths are added before discovery and are pruned by that
+fallback walk.
+
 This container boundary is load-bearing. `cwd` validation and `shell=False` alone do not prevent a Python script, npm lifecycle script, Makefile, pytest plugin, compiler, or build tool from reading or writing elsewhere on the host.
 
 ## Command validation

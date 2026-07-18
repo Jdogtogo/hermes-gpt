@@ -2,7 +2,7 @@
 
 > **Superseded:** this connector is now publicly deployed (via Cloudflare
 > Tunnel, `operator.frohnert-hermes.org`) with a full Telegram + localhost
-> approval system and a 22-tool surface (this file's tool list and "no
+> approval system and a 23-tool surface (this file's tool list and "no
 > public exposure" framing below are historical, from before that work).
 > See `hermes-operator-approval-system.md` for the current, authoritative
 > reference.
@@ -17,9 +17,10 @@ reachable only from this machine.
 - Source: `/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt`
   (branch `codex/operator-session-chatgpt-20260713`)
 - Local endpoint: `http://127.0.0.1:7680/mcp` (loopback only)
-- Profile: `chatgpt-operator` — refuses to start without OAuth enabled and an
-  active, non-owner Operator Session snapshot (`validate_chatgpt_operator_runtime`
-  in `server.py`).
+- Profile: `chatgpt-operator` — refuses to start without OAuth enabled and
+  refuses owner mode (`validate_chatgpt_operator_runtime` in `server.py`).
+  It stays available without an active session so status and session-request
+  tools can recover from expiry without a service restart.
 
 This is intentionally separate from:
 - `hermes-gpt-sidecar-bridge.service` (port 7677, `chatgpt-restricted` profile,
@@ -29,16 +30,18 @@ This is intentionally separate from:
   no session model) — unchanged apart from the Stage A OAuth drop-in. This
   remains a local maintenance endpoint only and must never be tunneled.
 
-## Tool surface (20 tools)
+## Tool surface (23 tools)
 
 `hermes_ops_brain_query`, `hermes_operator_policy`, `hermes_operator_status`,
-`hermes_operator_session_status`, `hermes_operator_session_request_extension`,
-`hermes_operator_session_revoke`, `hermes_operator_audit_tail`,
+`hermes_operator_session_status`, `hermes_operator_session_request`,
+`hermes_operator_session_request_extension`, `hermes_operator_session_revoke`,
+`hermes_operator_audit_tail`,
 `hermes_operator_doctor`, `hermes_operator_snapshot`, `hermes_config_get`,
-`hermes_env_status`, `hermes_gateway_status`, `hermes_search_files`,
+`hermes_env_status`, `hermes_gateway_status`,
+`hermes_operator_service_restart`, `hermes_search_files`,
 `hermes_workspace_read`, `hermes_workspace_patch`, `hermes_workspace_write_file`,
-`hermes_workspace_run_test`, `hermes_workspace_git_commit`, `hermes_git_status`,
-`hermes_git_diff`.
+`hermes_workspace_run_test`, `hermes_workspace_exec`,
+`hermes_workspace_git_commit`, `hermes_git_status`, `hermes_git_diff`.
 
 Deliberately excluded: `hermes_owner_run_command`, `hermes_owner_patch`,
 `hermes_owner_write_file`, `bridge_submit_command`, `hermes_config_set`,
@@ -46,11 +49,13 @@ Deliberately excluded: `hermes_owner_run_command`, `hermes_owner_patch`,
 `hermes_cron_*` mutation, `hermes_skill_delete`/`write_file`/etc mutation, and
 `hermes_agent_run` (unrestricted agent delegation).
 
-## Session lifecycle (local-only administration)
+## Session lifecycle and local approval
 
-Session creation and extension approval are **never** exposed as remote MCP
-tools — only status, extension *request*, and revoke are. Use
-`operator_sessions.py` directly on the host:
+Session and extension **approval** are never exposed as remote MCP tools.
+Remote callers may request a named local policy template, inspect status,
+request an extension, or revoke the active session; only Telegram, the
+localhost approval page, or the break-glass local CLI can grant authority.
+Use `operator_sessions.py` directly on the host for break-glass administration:
 
 ```bash
 cd /home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt

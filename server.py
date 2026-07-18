@@ -1182,6 +1182,11 @@ def hermes_gateway_restart(profile: str = "default", dry_run: bool = True) -> st
     )
 
 
+def hermes_operator_service_restart(dry_run: bool = True) -> str:
+    """Queue the exact ChatGPT operator unit restart after an approval-gated delay."""
+    return op_workspace.hermes_operator_service_restart(dry_run=dry_run)
+
+
 def hermes_workspace_read(path: str, offset: int = 1, limit: int = 500) -> str:
     return op_workspace.hermes_workspace_read(path=path, offset=offset, limit=limit)
 
@@ -1575,7 +1580,10 @@ def chatgpt_operator_tool_list() -> list[Any]:
     hermes_cron_*, hermes_skill_create/edit/patch/write_file/copy/
     sync_to_default/delete, hermes_agent_run (unrestricted agent delegation),
     and any unrestricted host command tool. The registered workspace executor
-    is argv-only and Docker-confined. See docs/hermes-operator-approval-system.md.
+    is argv-only and Docker-confined. The one service mutation is an exact,
+    delayed restart of this connector's own unit, gated by the maintenance
+    template and its immutable services:restart grant. See
+    docs/hermes-operator-approval-system.md.
     """
     return [
         hermes_ops_brain_query,
@@ -1591,6 +1599,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_config_get,
         hermes_env_status,
         hermes_gateway_status,
+        hermes_operator_service_restart,
         hermes_search_files,
         hermes_workspace_read,
         hermes_workspace_patch,

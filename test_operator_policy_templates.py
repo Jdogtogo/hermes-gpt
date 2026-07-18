@@ -24,6 +24,8 @@ def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
         "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"
     ]
     assert resolved["allowed_branches"] == ["codex/operator-session-chatgpt-20260713"]
+    assert policy["service_units"] == ["hermes-gpt-chatgpt-operator.service"]
+    assert policy["verbs"]["services"] == ["restart"]
 
 
 def test_tax_calculator_resolves_to_exact_scope_and_branch():
@@ -34,6 +36,10 @@ def test_tax_calculator_resolves_to_exact_scope_and_branch():
     assert resolved["allowed_branches"] == ["feat/projection-architecture-discovery"]
     assert resolved["baseline_required"] is True
     assert resolved["max_duration_seconds"] == 4 * 60 * 60
+    assert policy["hard_denied_paths"] == [
+        "/mnt/c/Dev/Tax Calculator/.claude",
+        "/mnt/c/Dev/Tax Calculator/powerautomate_flow_rebuild",
+    ]
 
 
 def test_allowed_verbs_are_scoped_not_owner_level():
@@ -48,8 +54,17 @@ def test_allowed_verbs_are_scoped_not_owner_level():
         assert set(verbs["filesystem"]) == {"read", "edit"}
         assert verbs["git"] == ["commit"]
         assert verbs["tests"] == ["run"]
+        if name == "hermes-gpt-operator-maintenance":
+            assert verbs["services"] == ["restart"]
+            assert resolved["policy"]["service_units"] == [
+                "hermes-gpt-chatgpt-operator.service"
+            ]
+        else:
+            assert "services" not in verbs
+            assert "service_units" not in resolved["policy"]
         # No verb set here ever grants arbitrary command execution or owner
-        # mode; only filesystem read/edit, git commit, and test execution.
+        # mode. The maintenance-only service grant is exact and separately
+        # bound to the single ChatGPT operator service unit.
         for verb_list in verbs.values():
             assert "run_command" not in verb_list
             assert "force_push" not in verb_list

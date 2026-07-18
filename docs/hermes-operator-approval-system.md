@@ -165,11 +165,12 @@ The service must run continuously whether or not a session is active or
 has expired/been revoked:
 
 - `operator_sessions.active_session()` returns `None` (never raises) when
-  there is no pointer file, an unreadable pointer file, or the pointed-to
-  session has expired/been revoked — treated identically, by design.
-- Every mutating tool call without an active session returns a structured
-  `{"success": false, "error": "... requires an active Operator Session."}`
-  — never a crash, never a 500.
+  the pointed-to session is absent, unreadable, expired, revoked, or otherwise
+  invalid. `resolve_effective_authority()` retains the distinct status,
+  pointed session ID, expiry, and safe failure reason for guards and status
+  tools.
+- Every mutating tool call without an active session returns a structured,
+  cause-specific error — never a crash or a 500.
 - Read-only tools (`hermes_operator_status`, `hermes_operator_policy`,
   `hermes_operator_audit_tail`, `hermes_operator_session_request`,
   `hermes_operator_session_request_extension`) remain fully available with
@@ -183,11 +184,24 @@ The tool does not expose the host shell. It launches a pre-provisioned Docker im
 
 The Docker boundary is essential: `cwd` checking and `shell=False` alone cannot confine Python scripts, npm lifecycle hooks, Makefiles, pytest plugins, or compiler processes. The selected image is never pulled automatically. See `workspace-command-execution.md` for the complete API, audit fields, examples, and limitations.
 
+## 9B. Approval-gated operator restart
+
+`hermes_operator_service_restart` can only schedule a three-second delayed
+restart of `hermes-gpt-chatgpt-operator.service`. It accepts no service-unit
+or command input and invokes fixed argv with `shell=False`. Both dry-run and
+direct calls require an active `hermes-gpt-operator-maintenance` session whose
+immutable snapshot grants `services:restart` for that exact unit. A session
+approved before that grant was added cannot acquire it retroactively.
+
+The delay lets the MCP response flush before the service disconnects. Reconnect
+the client after a direct restart; the approved session remains in the
+persistent session store and is re-resolved on the next call.
+
 ## 10. Services and ports
 
 | Service | Port | Bind | Purpose |
 |---|---|---|---|
-| `hermes-gpt-chatgpt-operator.service` | 7680 | 127.0.0.1 only (public via Cloudflare Tunnel → `operator.frohnert-hermes.org`) | OAuth-gated ChatGPT connector, 22 tools |
+| `hermes-gpt-chatgpt-operator.service` | 7680 | 127.0.0.1 only (public via Cloudflare Tunnel → `operator.frohnert-hermes.org`) | OAuth-gated ChatGPT connector, 23 tools |
 | `hermes-gpt-approval-web.service` | 7690 | 127.0.0.1 only, **never tunneled** | Localhost approval page + internal `/notify` + `/telegram-resolve` |
 | `hermes-gpt-sidecar-bridge.service` | 7677 | 127.0.0.1 only (public via Cloudflare Tunnel → `mcp.frohnert-hermes.org`) | `chatgpt-restricted` profile, read-only, unrelated to this system, unchanged |
 | `hermes-gpt-owner-local.service` | 7679 | 127.0.0.1 only, **local only, never tunneled** | `local-owner` profile, full owner surface, unrelated to this system, unchanged |

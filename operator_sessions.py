@@ -290,6 +290,11 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
             normalized_verbs[key] = _normalize_list(value)
     return {
         "version": 1,
+        "policy_template": (
+            str(policy.get("policy_template")).strip()
+            if policy.get("policy_template")
+            else None
+        ),
         "level": str(policy.get("level") or "workspace"),
         "apply_mode": str(policy.get("apply_mode") or "direct"),
         "readable_roots": _normalize_list(policy.get("readable_roots"), paths=True),
@@ -632,8 +637,8 @@ def approve_session_request(
     current = int(time.time() if now is None else now)
     with _connect(root) as connection:
         row = connection.execute(
-            "SELECT resolved_policy_json, requested_duration_seconds, status, expires_at "
-            "FROM session_creation_requests WHERE request_id = ?",
+            "SELECT policy_template, resolved_policy_json, requested_duration_seconds, "
+            "status, expires_at FROM session_creation_requests WHERE request_id = ?",
             (request_id,),
         ).fetchone()
         if row is None:
@@ -647,6 +652,10 @@ def approve_session_request(
             )
             raise ValueError("Session request has expired.")
         policy = json.loads(row["resolved_policy_json"])
+        # Bind the locally resolved template identity into the immutable
+        # approved snapshot. The remote caller can only name a registered
+        # template; raw policy JSON is never accepted over MCP.
+        policy["policy_template"] = str(row["policy_template"])
         duration = int(row["requested_duration_seconds"])
     # create_session opens its own connection; keep it outside the block
     # above so a same-thread nested SQLite write never deadlocks.

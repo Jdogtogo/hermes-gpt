@@ -3,6 +3,7 @@
 Tools:
 - ``hermes_gateway_status``        : read_only  — gateway / ticker / adapter health
 - ``hermes_gateway_restart``       : workspace  — fixed-argv gateway restart
+- ``hermes_operator_service_restart``: workspace — exact, delayed ChatGPT operator restart
 - ``hermes_workspace_read``        : read_only  — read file with operator path policy
 - ``hermes_workspace_patch``       : workspace  — find-and-replace within an allowed path
 - ``hermes_workspace_write_file``  : workspace  — write file within an allowed path
@@ -25,6 +26,8 @@ Safety rules:
   direct shell/destructive/downloader commands and dangerous Git mutations,
   and runs inside an air-gapped Docker container with only the approved
   workspace mounted read-write.
+- Operator-service restart accepts no unit or command input and requires the
+  maintenance template's immutable services:restart grant for the exact unit.
 - Owner run_command blocks obvious catastrophic patterns: rm -rf /, del /s,
   format, powershell -EncodedCommand, curl|bash, wget|bash, git push --force,
   git add -A, anything touching .env/vault/token/ssh paths.
@@ -42,6 +45,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import operator_policy as op
+import operator_sessions as op_sessions
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +353,161 @@ def hermes_gateway_restart(
                 layer="gateway",
                 code="GATEWAY_RESTART_ERROR",
                 suggested_action="Check Hermes CLI availability, profile, and operator level/apply mode.",
+            ),
+            indent=2,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Narrow operator-service restart
+# ---------------------------------------------------------------------------
+
+
+_OPERATOR_SERVICE_UNIT = "hermes-gpt-chatgpt-operator.service"
+_OPERATOR_SERVICE_RESTART_TEMPLATE = "hermes-gpt-operator-maintenance"
+_OPERATOR_SERVICE_RESTART_DELAY_SECONDS = 3
+
+
+def _operator_service_restart_argv(
+    *,
+    systemd_run_binary: str,
+    systemctl_binary: str,
+    schedule_unit: str,
+) -> list[str]:
+    return [
+        systemd_run_binary,
+        "--user",
+        f"--unit={schedule_unit}",
+        f"--on-active={_OPERATOR_SERVICE_RESTART_DELAY_SECONDS}s",
+        "--collect",
+        systemctl_binary,
+        "--user",
+        "restart",
+        _OPERATOR_SERVICE_UNIT,
+    ]
+
+
+def hermes_operator_service_restart(
+    dry_run: bool = True,
+    runner=None,
+    systemd_run_binary: str | None = None,
+    systemctl_binary: str | None = None,
+) -> str:
+    """Queue an exact, delayed restart of the ChatGPT operator service."""
+
+    try:
+        policy = op.OperatorPolicy()
+        policy.require_level("workspace")
+        if policy.session_id is None:
+            raise PermissionError("An active approved Operator Session is required.")
+        authority = op_sessions.resolve_effective_authority()
+        if authority.policy_template != _OPERATOR_SERVICE_RESTART_TEMPLATE:
+            raise PermissionError(
+                "Operator service restart requires the "
+                f"{_OPERATOR_SERVICE_RESTART_TEMPLATE!r} policy template."
+            )
+        policy.require_verb("services", "restart")
+        if _OPERATOR_SERVICE_UNIT not in set(policy.service_units):
+            raise PermissionError(
+                f"Service unit {_OPERATOR_SERVICE_UNIT!r} is not granted by this Operator Session."
+            )
+
+        schedule_unit = (
+            f"hermes-gpt-operator-restart-{os.getpid()}-{time.time_ns()}"
+        )
+        selected_systemd_run = (
+            systemd_run_binary or shutil.which("systemd-run") or "systemd-run"
+        )
+        selected_systemctl = (
+            systemctl_binary or shutil.which("systemctl") or "systemctl"
+        )
+        argv = _operator_service_restart_argv(
+            systemd_run_binary=selected_systemd_run,
+            systemctl_binary=selected_systemctl,
+            schedule_unit=schedule_unit,
+        )
+
+        if policy.effective_dry_run(dry_run):
+            plan = {
+                "would_schedule_restart": True,
+                "service_unit": _OPERATOR_SERVICE_UNIT,
+                "delay_seconds": _OPERATOR_SERVICE_RESTART_DELAY_SECONDS,
+                "argv": argv,
+                "shell": False,
+            }
+            op.audit_record(
+                tool="hermes_operator_service_restart",
+                level=policy.level,
+                apply_mode=policy.apply_mode,
+                dry_run=True,
+                success=True,
+                changed=False,
+                summary="dry-run operator service restart plan",
+                extra={
+                    "service_unit": _OPERATOR_SERVICE_UNIT,
+                    "delay_seconds": _OPERATOR_SERVICE_RESTART_DELAY_SECONDS,
+                },
+            )
+            return json.dumps({"success": True, "dry_run": True, "plan": plan}, indent=2)
+
+        policy.require_mutation(dry_run)
+        if systemd_run_binary is None and shutil.which("systemd-run") is None:
+            raise RuntimeError("systemd-run is required to schedule the operator service restart.")
+        if systemctl_binary is None and shutil.which("systemctl") is None:
+            raise RuntimeError("systemctl is required to restart the operator service.")
+
+        run_fn = runner or op.run_argv
+        rc, stdout, stderr = run_fn(argv, timeout=30, workdir=None)
+        result = {
+            "success": rc == 0,
+            "dry_run": False,
+            "scheduled": rc == 0,
+            "service_unit": _OPERATOR_SERVICE_UNIT,
+            "delay_seconds": _OPERATOR_SERVICE_RESTART_DELAY_SECONDS,
+            "returncode": rc,
+            "stdout": op.redact_output(stdout),
+            "stderr": op.redact_output(stderr),
+            "note": (
+                "The operator connector will briefly disconnect when the delayed "
+                "restart runs; reconnect and continue with the same approved session."
+            ),
+        }
+        op.audit_record(
+            tool="hermes_operator_service_restart",
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=rc == 0,
+            changed=rc == 0,
+            summary=f"scheduled operator service restart rc={rc}",
+            error=op.redact_output(stderr) if rc != 0 else "",
+            extra={
+                "service_unit": _OPERATOR_SERVICE_UNIT,
+                "delay_seconds": _OPERATOR_SERVICE_RESTART_DELAY_SECONDS,
+                "schedule_unit": schedule_unit,
+            },
+        )
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        op.audit_record(
+            tool="hermes_operator_service_restart",
+            level="unknown",
+            apply_mode="unknown",
+            dry_run=dry_run,
+            success=False,
+            changed=False,
+            error=str(exc),
+            extra={"service_unit": _OPERATOR_SERVICE_UNIT},
+        )
+        return json.dumps(
+            op.error_from_exception(
+                exc,
+                layer="operator",
+                code="OPERATOR_SERVICE_RESTART_ERROR",
+                suggested_action=(
+                    "Use an active hermes-gpt-operator-maintenance session whose "
+                    "immutable policy grants services:restart for the exact operator unit."
+                ),
             ),
             indent=2,
         )
@@ -1122,38 +1281,159 @@ def _workspace_exec_should_mask(path: Path, policy: op.OperatorPolicy) -> bool:
     return False
 
 
+_WORKSPACE_EXEC_SECRET_DISCOVERY_TIMEOUT_SECONDS = 20
+
+
+def _workspace_exec_secret_pathspecs() -> list[str]:
+    names = sorted(op.DEFAULT_DENIED_BASENAMES | op.DEFAULT_DENIED_DIR_NAMES)
+    patterns: set[str] = {
+        ":(glob).env.*",
+        ":(glob)**/.env.*",
+    }
+    for name in names:
+        patterns.update(
+            {
+                f":(glob){name}",
+                f":(glob)**/{name}",
+                f":(glob){name}/**",
+                f":(glob)**/{name}/**",
+            }
+        )
+    return sorted(patterns)
+
+
+def _workspace_exec_git_secret_candidates(
+    workspace_root: Path,
+    *,
+    runner=None,
+) -> list[Path] | None:
+    """Use Git index-aware traversal to find mask candidates quickly.
+
+    Returns None when the fast path is unavailable or fails, causing the
+    caller to fall back to the conservative filesystem walk. Linked worktrees
+    and repositories containing submodules retain the walk because their
+    external or nested metadata needs the more conservative treatment.
+    """
+
+    if not (workspace_root / ".git").is_dir():
+        return None
+    if (workspace_root / ".gitmodules").exists():
+        return None
+
+    run_fn = runner or op.run_argv
+    pathspecs = _workspace_exec_secret_pathspecs()
+    modes = (
+        ("--cached", "--others", "--exclude-standard"),
+        ("--others", "--ignored", "--exclude-standard"),
+    )
+    found: set[Path] = set()
+    for mode in modes:
+        argv = ["git", "ls-files", "-z", *mode, "--", *pathspecs]
+        try:
+            rc, stdout, _ = run_fn(
+                argv,
+                timeout=_WORKSPACE_EXEC_SECRET_DISCOVERY_TIMEOUT_SECONDS,
+                workdir=str(workspace_root),
+            )
+        except Exception:
+            return None
+        if rc != 0:
+            return None
+        for raw_path in stdout.split("\x00"):
+            if not raw_path:
+                continue
+            relative = Path(raw_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            candidate = workspace_root / relative
+            if candidate.exists() or candidate.is_symlink():
+                found.add(candidate)
+    return sorted(found, key=lambda item: item.as_posix())
+
+
+def _workspace_exec_mask_target(
+    candidate: Path,
+    *,
+    workspace_root: Path,
+    policy: op.OperatorPolicy,
+) -> Path | None:
+    try:
+        relative = candidate.relative_to(workspace_root)
+    except ValueError:
+        return None
+    current = workspace_root
+    for part in relative.parts:
+        current = current / part
+        if _workspace_exec_should_mask(current, policy):
+            return current
+    return None
+
+
+def _workspace_exec_mount_args(
+    targets: set[Path],
+    *,
+    workspace_root: Path,
+) -> tuple[list[str], int]:
+    docker_args: list[str] = []
+    for target in sorted(targets, key=lambda item: item.as_posix()):
+        destination = _workspace_exec_container_path(workspace_root, target)
+        if target.is_dir() and not target.is_symlink():
+            docker_args.extend(
+                ["--mount", f"type=tmpfs,destination={destination},tmpfs-mode=0000"]
+            )
+        else:
+            docker_args.extend(
+                [
+                    "--mount",
+                    f"type=bind,source=/dev/null,destination={destination},readonly",
+                ]
+            )
+    return docker_args, len(targets)
+
+
 def _workspace_exec_denied_mounts(
     workspace_root: Path,
     policy: op.OperatorPolicy,
+    *,
+    discovery_runner=None,
 ) -> tuple[list[str], int]:
-    docker_args: list[str] = []
-    count = 0
+    targets: set[Path] = set()
+
+    for denied_root in policy.denied_paths:
+        denied = Path(denied_root).expanduser().resolve(strict=False)
+        if denied.exists() and op.path_under_allowed(denied, [workspace_root]):
+            targets.add(denied)
+
+    git_candidates = _workspace_exec_git_secret_candidates(
+        workspace_root,
+        runner=discovery_runner,
+    )
+    if git_candidates is not None:
+        for candidate in git_candidates:
+            target = _workspace_exec_mask_target(
+                candidate,
+                workspace_root=workspace_root,
+                policy=policy,
+            )
+            if target is not None:
+                targets.add(target)
+        return _workspace_exec_mount_args(targets, workspace_root=workspace_root)
+
     for current, dirnames, filenames in os.walk(workspace_root, followlinks=False):
         current_path = Path(current)
         kept_dirs: list[str] = []
         for dirname in dirnames:
             candidate = current_path / dirname
             if _workspace_exec_should_mask(candidate, policy):
-                destination = _workspace_exec_container_path(workspace_root, candidate)
-                docker_args.extend(
-                    ["--mount", f"type=tmpfs,destination={destination},tmpfs-mode=0000"]
-                )
-                count += 1
+                targets.add(candidate)
             else:
                 kept_dirs.append(dirname)
         dirnames[:] = kept_dirs
         for filename in filenames:
             candidate = current_path / filename
             if _workspace_exec_should_mask(candidate, policy):
-                destination = _workspace_exec_container_path(workspace_root, candidate)
-                docker_args.extend(
-                    [
-                        "--mount",
-                        f"type=bind,source=/dev/null,destination={destination},readonly",
-                    ]
-                )
-                count += 1
-    return docker_args, count
+                targets.add(candidate)
+    return _workspace_exec_mount_args(targets, workspace_root=workspace_root)
 
 
 def _workspace_exec_image(image: str | None = None) -> str:

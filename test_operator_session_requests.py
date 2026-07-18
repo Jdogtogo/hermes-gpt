@@ -75,6 +75,10 @@ def test_approved_session_uses_exact_resolved_policy(session_env, audit_override
     loaded = sessions.load_session(record.session_id, root=session_env)
     assert loaded.policy["readable_roots"] == resolved["policy"]["readable_roots"]
     assert loaded.policy["writable_roots"] == resolved["policy"]["writable_roots"]
+    assert loaded.policy["policy_template"] == "hermes-gpt-operator-maintenance"
+    authority = sessions.resolve_effective_authority()
+    assert authority.is_active is True
+    assert authority.policy_template == "hermes-gpt-operator-maintenance"
 
     audit = op.audit_tail(limit=10)
     approvals = [r for r in audit if r.get("tool") == "session_approval" and r.get("request_type") == "session_creation"]
