@@ -748,6 +748,10 @@ _TEST_COMMAND_ALLOWLIST: tuple[tuple[tuple[str, ...], int], ...] = (
     (("git", "diff"), 4),
 )
 
+_WINDOWS_POWERSHELL_FALLBACK = Path(
+    "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+)
+
 # Substrings that mark a command as dangerous and must be refused.
 _DANGEROUS_PATTERNS: tuple[str, ...] = (
     "rm ",
@@ -856,6 +860,21 @@ def _is_repository_local_powershell_script_command(
     return (True, "")
 
 
+def _resolve_test_argv(argv: list[str]) -> list[str]:
+    """Resolve fixed host executables after the command has passed validation."""
+    if not argv or argv[0].lower() != "powershell.exe":
+        return list(argv)
+    resolved = shutil.which(argv[0])
+    if resolved:
+        return [resolved, *argv[1:]]
+    if _WINDOWS_POWERSHELL_FALLBACK.is_file():
+        return [str(_WINDOWS_POWERSHELL_FALLBACK), *argv[1:]]
+    raise FileNotFoundError(
+        "Windows PowerShell executable was not found on PATH or at "
+        f"{_WINDOWS_POWERSHELL_FALLBACK}"
+    )
+
+
 def _is_allowed_test_command(
     argv: list[str], workdir: str | None = None
 ) -> tuple[bool, str]:
@@ -910,6 +929,7 @@ def hermes_workspace_run_test(
         allowed, reason = _is_allowed_test_command(argv, workdir=workdir)
         if not allowed:
             raise PermissionError(reason)
+        execution_argv = _resolve_test_argv(argv)
 
         # workdir policy: must be under an allowed_path if any are set.
         if workdir:
@@ -921,7 +941,8 @@ def hermes_workspace_run_test(
         if policy.effective_dry_run(dry_run):
             plan = {
                 "would_run": True,
-                "argv": argv,
+                "argv": execution_argv,
+                "requested_argv": argv,
                 "shell": False,
                 "workdir": workdir,
                 "timeout": max(1, min(int(timeout), 600)),
@@ -940,12 +961,13 @@ def hermes_workspace_run_test(
 
         policy.require_mutation(dry_run)
         run_fn = runner or op.run_argv
-        rc, out, err = run_fn(argv, timeout=timeout, workdir=workdir)
+        rc, out, err = run_fn(execution_argv, timeout=timeout, workdir=workdir)
         result = {
             "success": rc == 0,
             "dry_run": False,
             "returncode": rc,
-            "argv": argv,
+            "argv": execution_argv,
+            "requested_argv": argv,
             "stdout": op.redact_output(out),
             "stderr": op.redact_output(err),
         }

@@ -336,6 +336,10 @@ def test_run_test_executes_repository_local_powershell_as_fixed_argv(
     monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
     monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
     (workspace_tree / "run-smoke.ps1").write_text("Write-Output 'ok'\n", encoding="utf-8")
+    fallback = workspace_tree / "powershell.exe"
+    fallback.write_text("fixed host executable placeholder\n", encoding="utf-8")
+    monkeypatch.setattr(ows.shutil, "which", lambda command: None)
+    monkeypatch.setattr(ows, "_WINDOWS_POWERSHELL_FALLBACK", fallback)
     captured = {}
 
     def fake_runner(argv, timeout=120, workdir=None):
@@ -352,7 +356,7 @@ def test_run_test_executes_repository_local_powershell_as_fixed_argv(
     parsed = json.loads(out)
     assert parsed["success"] is True
     assert captured["argv"] == [
-        "powershell.exe",
+        str(fallback),
         "-NoProfile",
         "-File",
         "run-smoke.ps1",
