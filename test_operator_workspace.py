@@ -308,6 +308,46 @@ def test_run_test_accepts_repository_local_python_script(workspace_tree):
     assert reason == ""
 
 
+def test_run_test_accepts_repository_local_windows_python313_script(workspace_tree):
+    (workspace_tree / "run-smoke.py").write_text("print('ok')\n", encoding="utf-8")
+    allowed, reason = ows._is_allowed_test_command(
+        ["windows-python313", "run-smoke.py", "--sample", "value"],
+        workdir=str(workspace_tree),
+    )
+    assert allowed is True
+    assert reason == ""
+
+
+def test_run_test_executes_repository_local_windows_python313_as_fixed_argv(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    (workspace_tree / "run-smoke.py").write_text("print('ok')\n", encoding="utf-8")
+    executable = workspace_tree / "python.exe"
+    executable.write_text("fixed Windows Python placeholder\n", encoding="utf-8")
+    monkeypatch.setattr(ows, "_WINDOWS_PYTHON313", executable)
+    captured = {}
+
+    def fake_runner(argv, timeout=120, workdir=None):
+        captured["argv"] = argv
+        captured["workdir"] = workdir
+        return (0, "ok", "")
+
+    out = ows.hermes_workspace_run_test(
+        command="windows-python313 run-smoke.py",
+        workdir=str(workspace_tree),
+        dry_run=False,
+        runner=fake_runner,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert captured["argv"] == [str(executable), "run-smoke.py"]
+    assert captured["workdir"] == str(workspace_tree)
+
+
 def test_run_test_accepts_repository_local_node_script(workspace_tree):
     (workspace_tree / "scripts").mkdir()
     (workspace_tree / "scripts" / "check.mjs").write_text("console.log('ok');\n", encoding="utf-8")
@@ -368,6 +408,9 @@ def test_run_test_executes_repository_local_powershell_as_fixed_argv(
     ("argv", "reason_fragment"),
     [
         (["python", "-c", "print('unsafe')"], "flags"),
+        (["windows-python313", "-c", "print('unsafe')"], "flags"),
+        (["windows-python313", "../outside.py"], "inside workdir"),
+        (["windows-python313", "missing.py"], "does not exist"),
         (["python", "../outside.py"], "inside workdir"),
         (["node", "../outside.mjs"], "inside workdir"),
         (["python", "missing.py"], "does not exist"),

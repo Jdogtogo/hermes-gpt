@@ -751,6 +751,9 @@ _TEST_COMMAND_ALLOWLIST: tuple[tuple[tuple[str, ...], int], ...] = (
 _WINDOWS_POWERSHELL_FALLBACK = Path(
     "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 )
+_WINDOWS_PYTHON313 = Path(
+    "/mnt/c/Users/jfroh/AppData/Local/Programs/Python/Python313/python.exe"
+)
 
 # Substrings that mark a command as dangerous and must be refused.
 _DANGEROUS_PATTERNS: tuple[str, ...] = (
@@ -791,7 +794,7 @@ def _is_repository_local_script_command(
     and use an expected extension. Interpreter code flags such as ``-c`` are
     deliberately not accepted.
     """
-    if len(argv) < 2 or argv[0] not in {"python", "python3", "node"}:
+    if len(argv) < 2 or argv[0] not in {"python", "python3", "windows-python313", "node"}:
         return (False, "")
     if not workdir:
         return (False, "Repository-local script execution requires workdir.")
@@ -799,6 +802,7 @@ def _is_repository_local_script_command(
     expected_suffixes = {
         "python": {".py"},
         "python3": {".py"},
+        "windows-python313": {".py"},
         "node": {".js", ".mjs", ".cjs"},
     }
     script_arg = argv[1]
@@ -862,7 +866,15 @@ def _is_repository_local_powershell_script_command(
 
 def _resolve_test_argv(argv: list[str]) -> list[str]:
     """Resolve fixed host executables after the command has passed validation."""
-    if not argv or argv[0].lower() != "powershell.exe":
+    if not argv:
+        return []
+    if argv[0] == "windows-python313":
+        if not _WINDOWS_PYTHON313.is_file():
+            raise FileNotFoundError(
+                f"Windows Python 3.13 executable was not found at {_WINDOWS_PYTHON313}"
+            )
+        return [str(_WINDOWS_PYTHON313), *argv[1:]]
+    if argv[0].lower() != "powershell.exe":
         return list(argv)
     resolved = shutil.which(argv[0])
     if resolved:
