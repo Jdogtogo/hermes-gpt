@@ -43,6 +43,20 @@ DEFAULT_HARD_DENIES = (
 )
 
 
+class SessionPolicyInvariantError(ValueError):
+    """Raised when a session would be persisted in a state that violates a hard
+    invariant.
+
+    Currently the enforced invariant is: an *approved* session snapshot must
+    always carry a non-empty ``policy_template`` that binds it to the named,
+    human-approved template it was granted from. Failing loudly here -- rather
+    than silently storing an unbound snapshot -- is what stops a stale writer
+    process from minting an approved session that the template-scoped guards
+    (e.g. operator-service restart) can never accept. See
+    ``docs/OPERATOR_RESTART_INVESTIGATION.md``.
+    """
+
+
 @dataclass(frozen=True)
 class SessionRecord:
     session_id: str
@@ -379,6 +393,22 @@ def create_session(
     requested = DEFAULT_SESSION_DURATION_SECONDS if duration_seconds is None else int(duration_seconds)
     ttl = max(60, min(requested, MAX_SESSION_DURATION_SECONDS))
     normalized = normalize_policy(policy)
+    # Hard invariant: an approved session snapshot must always be bound to a
+    # named policy template. This is the single chokepoint through which every
+    # snapshot is written, so enforcing here means no path -- normal approval,
+    # break-glass CLI, or a future caller -- can persist an unbound approved
+    # session. A pending (not-yet-approved) request row is exempt; the binding
+    # is asserted again at approval time in approve_session_request().
+    if approval_state == "approved" and not normalized.get("policy_template"):
+        raise SessionPolicyInvariantError(
+            "Refusing to create an approved operator session without a "
+            "policy_template. Every approved session snapshot must be bound to "
+            "the named, human-approved template it was granted from. If this "
+            "surfaced in production it almost always means a stale writer "
+            "process approved the request with pre-template code -- restart "
+            "every service that imports operator_sessions (see "
+            "docs/OPERATOR_RESTART_INVESTIGATION.md) and re-approve."
+        )
     canonical = canonical_policy(normalized)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     sid = session_id or f"ops_{secrets.token_urlsafe(24)}"
@@ -654,8 +684,17 @@ def approve_session_request(
         policy = json.loads(row["resolved_policy_json"])
         # Bind the locally resolved template identity into the immutable
         # approved snapshot. The remote caller can only name a registered
-        # template; raw policy JSON is never accepted over MCP.
-        policy["policy_template"] = str(row["policy_template"])
+        # template; raw policy JSON is never accepted over MCP. Fail the
+        # approval explicitly if the request carries no template rather than
+        # minting an unbound session (create_session enforces the same
+        # invariant, but asserting here gives a request-scoped error message).
+        template_name = str(row["policy_template"] or "").strip()
+        if not template_name:
+            raise SessionPolicyInvariantError(
+                f"Session creation request {request_id!r} has no policy_template; "
+                "refusing to approve an unbound operator session."
+            )
+        policy["policy_template"] = template_name
         duration = int(row["requested_duration_seconds"])
     # create_session opens its own connection; keep it outside the block
     # above so a same-thread nested SQLite write never deadlocks.

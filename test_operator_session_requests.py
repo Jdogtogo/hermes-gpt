@@ -134,7 +134,8 @@ def test_session_request_expires(session_env, monkeypatch):
 
 def test_extension_requires_separate_approval_and_cannot_self_approve(session_env):
     resolved = templates.resolve_template("sandbox")
-    record = sessions.create_session(resolved["policy"], duration_seconds=3600, root=session_env)
+    policy = {**resolved["policy"], "policy_template": "sandbox"}
+    record = sessions.create_session(policy, duration_seconds=3600, root=session_env)
     request_id = sessions.request_extension(record.session_id, root=session_env)
     # The request alone must not have changed the session's expiry.
     unchanged = sessions.load_session(record.session_id, root=session_env)
@@ -148,7 +149,8 @@ def test_extension_requires_separate_approval_and_cannot_self_approve(session_en
 
 def test_extension_approval_is_audited_with_source(session_env, audit_override):
     resolved = templates.resolve_template("sandbox")
-    record = sessions.create_session(resolved["policy"], duration_seconds=3600, root=session_env)
+    policy = {**resolved["policy"], "policy_template": "sandbox"}
+    record = sessions.create_session(policy, duration_seconds=3600, root=session_env)
     request_id = sessions.request_extension(record.session_id, root=session_env)
     sessions.approve_extension(request_id, decided_by="telegram:12345", root=session_env)
 

@@ -57,6 +57,7 @@ def _enable_workspace(monkeypatch, workspace: Path, *, direct: bool = True) -> N
     session_root = workspace.parent / "operator-sessions"
     record = op_sessions.create_session(
         {
+            "policy_template": "sandbox",
             "level": "workspace",
             "apply_mode": "direct" if direct else "dry_run",
             "readable_roots": [str(workspace)],
@@ -799,6 +800,7 @@ def test_workspace_exec_audit_records_session_command_timing_and_output(
     session_root = tmp_path / "sessions"
     record = op_sessions.create_session(
         {
+            "policy_template": "sandbox",
             "level": "workspace",
             "apply_mode": "direct",
             "readable_roots": [str(workspace_tree)],

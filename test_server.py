@@ -276,6 +276,7 @@ def enable_operator_session(monkeypatch, tmp_path: Path) -> None:
     op_auth.bootstrap_credentials(config)
     record = op_sessions.create_session(
         {
+            "policy_template": "sandbox",
             "level": "workspace",
             "apply_mode": "direct",
             "readable_roots": [str(workspace)],
@@ -305,6 +306,7 @@ def test_chatgpt_operator_requires_oauth(monkeypatch, tmp_path):
     workspace.mkdir()
     record = op_sessions.create_session(
         {
+            "policy_template": "sandbox",
             "level": "workspace",
             "apply_mode": "direct",
             "readable_roots": [str(workspace)],

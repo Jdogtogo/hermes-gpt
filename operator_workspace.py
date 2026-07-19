@@ -45,7 +45,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import operator_policy as op
-import operator_sessions as op_sessions
 
 
 # ---------------------------------------------------------------------------
@@ -396,15 +395,25 @@ def hermes_operator_service_restart(
     """Queue an exact, delayed restart of the ChatGPT operator service."""
 
     try:
+        # Single authoritative policy-resolution path: OperatorPolicy() derives
+        # its entire session authority (level, apply_mode, verbs, service_units,
+        # AND policy_template) from one resolve_effective_authority() snapshot.
+        # Every gate condition below reads that same object; the tool never
+        # performs a second, independently resolved lookup that could disagree
+        # with the authority actually being enforced.
         policy = op.OperatorPolicy()
         policy.require_level("workspace")
-        if policy.session_id is None:
-            raise PermissionError("An active approved Operator Session is required.")
-        authority = op_sessions.resolve_effective_authority()
-        if authority.policy_template != _OPERATOR_SERVICE_RESTART_TEMPLATE:
+        if policy.session_status != "active" or policy.session_id is None:
+            state = policy.session_status or "unknown"
+            raise PermissionError(
+                "Operator service restart requires an active, approved Operator "
+                f"Session (current session state: {state!r})."
+            )
+        if policy.policy_template != _OPERATOR_SERVICE_RESTART_TEMPLATE:
             raise PermissionError(
                 "Operator service restart requires the "
-                f"{_OPERATOR_SERVICE_RESTART_TEMPLATE!r} policy template."
+                f"{_OPERATOR_SERVICE_RESTART_TEMPLATE!r} policy template "
+                f"(active session template: {policy.policy_template!r})."
             )
         policy.require_verb("services", "restart")
         if _OPERATOR_SERVICE_UNIT not in set(policy.service_units):

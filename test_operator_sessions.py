@@ -11,6 +11,7 @@ import operator_sessions as sessions
 
 def sample_policy(read_root: Path, write_root: Path) -> dict:
     return {
+        "policy_template": "sandbox",
         "level": "workspace",
         "apply_mode": "direct",
         "readable_roots": [str(read_root)],
@@ -55,6 +56,7 @@ def test_snapshot_hash_is_deterministic(session_env, tmp_path):
         "readable_roots": [str(read_root)],
         "apply_mode": "direct",
         "level": "workspace",
+        "policy_template": "sandbox",
     }
 
     assert sessions.snapshot_hash(first) == sessions.snapshot_hash(second)

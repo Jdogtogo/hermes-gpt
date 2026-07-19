@@ -29,6 +29,7 @@ import server
 
 def sample_policy(read_root: Path, write_root: Path) -> dict:
     return {
+        "policy_template": "sandbox",
         "level": "workspace",
         "apply_mode": "direct",
         "readable_roots": [str(read_root), str(write_root)],

@@ -187,7 +187,7 @@ def test_telegram_resolve_approves_session(env, audit_override):
 
 def test_telegram_resolve_infers_extension_type(env, audit_override):
     record = op_sessions.create_session(
-        op_templates.resolve_template("sandbox")["policy"],
+        {**op_templates.resolve_template("sandbox")["policy"], "policy_template": "sandbox"},
         duration_seconds=3600, root=env["session_root"],
     )
     request_id = op_sessions.request_extension(record.session_id, root=env["session_root"])

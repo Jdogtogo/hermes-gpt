@@ -56,6 +56,7 @@ def _make_session(tmp_path, repo, *, verbs, session_id="ops-commit-test", durati
     session_root = tmp_path / "sessions"
     return op_sessions.create_session(
         {
+            "policy_template": "sandbox",
             "level": "workspace",
             "apply_mode": "direct",
             "readable_roots": [str(repo)],

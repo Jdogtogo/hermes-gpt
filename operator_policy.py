@@ -615,6 +615,7 @@ class OperatorPolicy:
         "mutation_allowed",
         "session_id",
         "snapshot_hash",
+        "policy_template",
         "expires_at",
         "session_status",
         "session_failure_reason",
@@ -659,6 +660,11 @@ class OperatorPolicy:
             self.mutation_allowed = self.apply_mode == "direct" and level_rank(self.level) >= level_rank("workspace")
             self.session_id = session.session_id
             self.snapshot_hash = session.snapshot_hash
+            # Sourced from the SAME immutable snapshot as level/verbs/
+            # service_units above, so template-scoped guards read exactly the
+            # authority that is being enforced -- no second, independently
+            # resolved lookup that could disagree.
+            self.policy_template = snapshot.get("policy_template") or None
             self.expires_at = session.expires_at
             return
 
@@ -721,6 +727,9 @@ class OperatorPolicy:
         )
         self.session_id = None
         self.snapshot_hash = None
+        # Env-authority deployments are never template-bound; only an active,
+        # approved, snapshot-backed session can carry a policy template.
+        self.policy_template = None
         # Carries the POINTED session's expiry even when that session has
         # lapsed (session_id stays None), so status output can show when and
         # why authority was lost rather than silently reporting read_only.
