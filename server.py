@@ -21,6 +21,7 @@ import operator_bridge as op_bridge
 import operator_auth as op_auth
 import operator_sessions as op_sessions
 import operator_policy_templates as op_templates
+import operator_delegation as op_delegation
 import dcr_compat
 
 try:
@@ -1256,6 +1257,47 @@ def hermes_workspace_git_commit(
     )
 
 
+def hermes_delegate_task(
+    prompt: str,
+    workdir: str,
+    mode: str = "apply",
+    profile: str = "default",
+    max_turns: int = 30,
+    timeout: int = 1800,
+    allow_web: bool = False,
+) -> str:
+    """Queue a durable, workspace-confined Hermes task."""
+    return op_delegation.hermes_delegate_task(
+        prompt=prompt,
+        workdir=workdir,
+        mode=mode,
+        profile=profile,
+        max_turns=max_turns,
+        timeout=timeout,
+        allow_web=allow_web,
+    )
+
+
+def hermes_delegated_task_status(task_id: str) -> str:
+    """Return current state for a delegated Hermes task."""
+    return op_delegation.hermes_delegated_task_status(task_id)
+
+
+def hermes_delegated_task_result(task_id: str) -> str:
+    """Return output once a delegated Hermes task reaches a terminal state."""
+    return op_delegation.hermes_delegated_task_result(task_id)
+
+
+def hermes_delegated_task_message(task_id: str, message: str) -> str:
+    """Attach durable guidance to a delegated Hermes task."""
+    return op_delegation.hermes_delegated_task_message(task_id, message)
+
+
+def hermes_delegated_task_cancel(task_id: str) -> str:
+    """Request cancellation of a queued or running delegated Hermes task."""
+    return op_delegation.hermes_delegated_task_cancel(task_id)
+
+
 def hermes_owner_run_command(command: str, timeout: int = 120, workdir: str | None = None, dry_run: bool = True) -> str:
     return op_workspace.hermes_owner_run_command(
         command=command, timeout=timeout, workdir=workdir, dry_run=dry_run,
@@ -1607,6 +1649,11 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_workspace_run_test,
         hermes_workspace_exec,
         hermes_workspace_git_commit,
+        hermes_delegate_task,
+        hermes_delegated_task_status,
+        hermes_delegated_task_result,
+        hermes_delegated_task_message,
+        hermes_delegated_task_cancel,
         hermes_git_status,
         hermes_git_diff,
     ]

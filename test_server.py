@@ -350,6 +350,11 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_workspace_run_test",
         "hermes_workspace_exec",
         "hermes_workspace_git_commit",
+        "hermes_delegate_task",
+        "hermes_delegated_task_status",
+        "hermes_delegated_task_result",
+        "hermes_delegated_task_message",
+        "hermes_delegated_task_cancel",
         "hermes_git_status",
         "hermes_git_diff",
     ]:
@@ -403,7 +408,7 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     # Self-report matches the actual live tool surface, exactly.
     assert sorted(status["registered_operator_tools"]) == live_names
     assert status["registered_tool_count"] == len(live_names)
-    assert len(live_names) == 23
+    assert len(live_names) == 28
 
     # The session tools that the connector needs must be reported...
     for required in [
