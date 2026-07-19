@@ -63,6 +63,38 @@ def test_apply_delegation_is_durable_and_excludes_terminal_web_and_skills(monkey
     assert task["prompt_bytes"] == len("Edit the requested file.".encode("utf-8"))
 
 
+def test_prepare_runtime_home_is_writable_and_profile_minimal(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "model:\n  provider: openrouter\n  default: test/model\nplugins:\n  enabled:\n    - chronos\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENROUTER_API_KEY=secret\n", encoding="utf-8")
+    monkeypatch.setattr(
+        delegation.op,
+        "resolve_profile_home",
+        lambda profile, hermes_root: profile_home,
+    )
+
+    runtime_home = delegation._prepare_runtime_home(
+        {"task_id": "dt_" + "c" * 32, "profile": "default"}
+    )
+
+    loaded = delegation.yaml.safe_load(
+        (runtime_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert loaded == {
+        "model": {"provider": "openrouter", "default": "test/model"},
+        "display": {"interface": "cli"},
+    }
+    assert (runtime_home / ".env").is_symlink()
+    assert (runtime_home / "logs").parent == runtime_home
+    (runtime_home / "logs").mkdir()
+    (runtime_home / "logs" / "agent.log").write_text("ok\n", encoding="utf-8")
+
+
 def test_apply_delegation_rejects_web_before_launch(monkeypatch, tmp_path):
     monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
     result = json.loads(

@@ -753,7 +753,10 @@ _DANGEROUS_PATTERNS: tuple[str, ...] = (
     "rm ",
     "del ",
     "format ",
-    "powershell",
+    "powershell -c",
+    "powershell.exe -c",
+    "pwsh -c",
+    "pwsh.exe -c",
     "curl ",
     "wget ",
     "bash -c",
@@ -816,6 +819,43 @@ def _is_repository_local_script_command(
     return (True, "")
 
 
+def _is_repository_local_powershell_script_command(
+    argv: list[str], workdir: str | None
+) -> tuple[bool, str]:
+    """Allow a repository-local PowerShell script through fixed host argv.
+
+    Only ``powershell.exe -NoProfile -File <script.ps1>`` is accepted. The
+    script must resolve inside ``workdir`` and no command-string flags are
+    permitted, so this does not introduce a general PowerShell surface.
+    """
+    if not argv or argv[0].lower() != "powershell.exe":
+        return (False, "")
+    if not workdir:
+        return (False, "Repository-local PowerShell execution requires workdir.")
+    if len(argv) < 4 or argv[1:3] != ["-NoProfile", "-File"]:
+        return (
+            False,
+            "PowerShell must use exactly -NoProfile -File with a repository-local script.",
+        )
+    if len(argv[4:]) > 8:
+        return (False, "Too many arguments for repository-local PowerShell execution.")
+
+    root = Path(workdir).expanduser().resolve(strict=False)
+    script = Path(argv[3]).expanduser()
+    if not script.is_absolute():
+        script = root / script
+    script = script.resolve(strict=False)
+    try:
+        script.relative_to(root)
+    except ValueError:
+        return (False, "PowerShell script path must remain inside workdir.")
+    if script.suffix.lower() != ".ps1":
+        return (False, "Unsupported PowerShell script type.")
+    if not script.is_file():
+        return (False, "Repository-local PowerShell script does not exist.")
+    return (True, "")
+
+
 def _is_allowed_test_command(
     argv: list[str], workdir: str | None = None
 ) -> tuple[bool, str]:
@@ -833,6 +873,12 @@ def _is_allowed_test_command(
             if len(extra) > max_extra:
                 return (False, f"Too many arguments for {prefix!r}.")
             return (True, "")
+
+    powershell_allowed, powershell_reason = _is_repository_local_powershell_script_command(
+        argv, workdir
+    )
+    if powershell_allowed or powershell_reason:
+        return (powershell_allowed, powershell_reason)
 
     local_script_allowed, local_script_reason = _is_repository_local_script_command(argv, workdir)
     if local_script_allowed or local_script_reason:

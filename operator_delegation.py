@@ -18,6 +18,8 @@ import time
 import uuid
 from typing import Any
 
+import yaml
+
 import operator_policy as op
 
 HERMES_BIN = str(Path.home() / ".local" / "bin" / "hermes")
@@ -61,6 +63,50 @@ def _save(task: dict[str, Any]) -> None:
     _atomic_write(_task_path(str(task["task_id"])), task)
 
 
+def _prepare_runtime_home(task: dict[str, Any]) -> Path:
+    """Create a writable, isolated Hermes home for one delegated process.
+
+    The operator service runs with ``ProtectHome=read-only``. A child Hermes
+    process therefore cannot write its normal ``~/.hermes/logs/agent.log``.
+    Materialising only the selected profile's model configuration and a
+    read-only ``.env`` link keeps logging/state inside the operator worktree
+    while preserving the configured inference provider without loading the
+    owner's plugins, MCP servers, memory, or unrelated profile state.
+    """
+    runtime_home = _TASKS_ROOT / "runtime" / str(task["task_id"])
+    runtime_home.mkdir(parents=True, exist_ok=True)
+
+    hermes_root = Path.home() / ".hermes"
+    profile_home = op.resolve_profile_home(str(task.get("profile", "default")), hermes_root)
+    config_path = profile_home / "config.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Hermes profile config not found: {config_path}")
+
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    model_config = loaded.get("model")
+    if not isinstance(model_config, dict) or not model_config:
+        raise ValueError(f"Hermes profile has no usable model configuration: {config_path}")
+
+    # Keep the runtime profile deliberately minimal. Credentials remain in the
+    # profile .env and are linked read-only below rather than copied into task
+    # records or output.
+    runtime_config = {
+        "model": model_config,
+        "display": {"interface": "cli"},
+    }
+    (runtime_home / "config.yaml").write_text(
+        yaml.safe_dump(runtime_config, sort_keys=False), encoding="utf-8"
+    )
+
+    source_env = profile_home / ".env"
+    runtime_env = runtime_home / ".env"
+    if source_env.is_file():
+        if runtime_env.exists() or runtime_env.is_symlink():
+            runtime_env.unlink()
+        runtime_env.symlink_to(source_env)
+    return runtime_home
+
+
 def _safe_text(value: str) -> str:
     redacted = op.redact_output(value or "")
     if len(redacted) <= MAX_OUTPUT_CHARS:
@@ -79,9 +125,10 @@ def _resolve_workdir(workdir: str) -> Path:
 
 
 def _build_argv(*, prompt: str, mode: str, profile: str, workdir: Path, max_turns: int, allow_web: bool) -> list[str]:
+    # The selected profile is materialised into a task-specific HERMES_HOME by
+    # _prepare_runtime_home(). Passing --profile here would make Hermes append a
+    # second profiles/<name> layer beneath that isolated runtime directory.
     argv = [HERMES_BIN]
-    if profile != "default":
-        argv.extend(["--profile", profile])
     argv.extend(["chat", "-Q", "--source", "tool", "--max-turns", str(max_turns)])
     if mode == "apply":
         toolsets = ["file", "todo"]
@@ -143,7 +190,10 @@ def _worker(task_id: str) -> None:
 
     env = os.environ.copy()
     env[FILE_READ_SAFE_ROOT_ENV] = task["workdir"]
+    runtime_home: Path | None = None
     try:
+        runtime_home = _prepare_runtime_home(task)
+        env["HERMES_HOME"] = str(runtime_home)
         process = subprocess.Popen(
             task["argv"],
             cwd=task["workdir"],
@@ -192,6 +242,13 @@ def _worker(task_id: str) -> None:
             _save(task)
             _audit(task, success=False, summary="delegated task launch failed", error=str(exc))
     finally:
+        if runtime_home is not None:
+            runtime_env = runtime_home / ".env"
+            try:
+                if runtime_env.is_symlink():
+                    runtime_env.unlink()
+            except OSError:
+                pass
         with _LOCK:
             _PROCESSES.pop(task_id, None)
 

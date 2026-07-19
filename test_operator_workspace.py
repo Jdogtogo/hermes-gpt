@@ -318,6 +318,48 @@ def test_run_test_accepts_repository_local_node_script(workspace_tree):
     assert reason == ""
 
 
+def test_run_test_accepts_repository_local_powershell_script(workspace_tree):
+    (workspace_tree / "run-smoke.ps1").write_text("Write-Output 'ok'\n", encoding="utf-8")
+    allowed, reason = ows._is_allowed_test_command(
+        ["powershell.exe", "-NoProfile", "-File", "run-smoke.ps1"],
+        workdir=str(workspace_tree),
+    )
+    assert allowed is True
+    assert reason == ""
+
+
+def test_run_test_executes_repository_local_powershell_as_fixed_argv(
+    workspace_tree, clean_env, audit_override, monkeypatch
+):
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "workspace")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, str(workspace_tree))
+    (workspace_tree / "run-smoke.ps1").write_text("Write-Output 'ok'\n", encoding="utf-8")
+    captured = {}
+
+    def fake_runner(argv, timeout=120, workdir=None):
+        captured["argv"] = argv
+        captured["workdir"] = workdir
+        return (0, "ok", "")
+
+    out = ows.hermes_workspace_run_test(
+        command="powershell.exe -NoProfile -File run-smoke.ps1",
+        workdir=str(workspace_tree),
+        dry_run=False,
+        runner=fake_runner,
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert captured["argv"] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-File",
+        "run-smoke.ps1",
+    ]
+    assert captured["workdir"] == str(workspace_tree)
+
+
 @pytest.mark.parametrize(
     ("argv", "reason_fragment"),
     [
@@ -326,6 +368,10 @@ def test_run_test_accepts_repository_local_node_script(workspace_tree):
         (["node", "../outside.mjs"], "inside workdir"),
         (["python", "missing.py"], "does not exist"),
         (["python", "README.md"], "unsupported script type"),
+        (["powershell.exe", "-Command", "Get-ChildItem"], "exactly"),
+        (["powershell.exe", "-NoProfile", "-File", "../outside.ps1"], "inside workdir"),
+        (["powershell.exe", "-NoProfile", "-File", "missing.ps1"], "does not exist"),
+        (["powershell.exe", "-NoProfile", "-File", "README.md"], "unsupported powershell"),
     ],
 )
 def test_run_test_rejects_unsafe_repository_script_forms(
