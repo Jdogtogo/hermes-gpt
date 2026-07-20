@@ -11,10 +11,6 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-# Seconds. A template's max_duration_seconds bounds both the initial
-# requested duration and (transitively, via operator_sessions'
-# MAX_SESSION_DURATION_SECONDS) how far extensions can push expiry.
-_TWO_HOURS = 2 * 60 * 60
 _FOUR_HOURS = 4 * 60 * 60
 
 POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
@@ -72,6 +68,63 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "max_duration_seconds": _FOUR_HOURS,
         "allowed_branches": ["feat/projection-architecture-discovery"],
         "baseline_required": True,
+    },
+    "hermes-context-maintenance": {
+        "active": True,
+        "description": (
+            "Allow ChatGPT's Hermes operator to inspect and maintain the native Hermes Agent "
+            "context system and OpsBrain without granting unrestricted owner-level access."
+        ),
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "readable_roots": [
+                "/home/jfroh/.hermes/hermes-agent",
+                "/home/jfroh/.hermes/ops-brain",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/hermes-agent",
+                "/home/jfroh/.hermes/ops-brain",
+            ],
+            "hard_denied_paths": [
+                "/home/jfroh/.hermes/hermes-agent/.env",
+                "/home/jfroh/.hermes/hermes-agent/.env.*",
+                "/home/jfroh/.hermes/hermes-agent/credentials",
+                "/home/jfroh/.hermes/hermes-agent/*/credentials",
+                "/home/jfroh/.hermes/hermes-agent/*/API keys",
+                "/home/jfroh/.hermes/hermes-agent/*/OAuth tokens",
+                "/home/jfroh/.hermes/hermes-agent/*/authentication databases",
+                "/home/jfroh/.hermes/hermes-agent/*/secret stores",
+                "/home/jfroh/.hermes/hermes-agent/*/private keys",
+                "/home/jfroh/.hermes/hermes-agent/*/SSH material",
+                "/home/jfroh/.hermes/hermes-agent/*/.git/config",
+                "/home/jfroh/.hermes/hermes-agent/*/runtime session databases",
+                "/home/jfroh/.hermes/hermes-agent/*/operator approval databases",
+                "/home/jfroh/.hermes/hermes-agent/*/operator policy/session state",
+                "/home/jfroh/.hermes/ops-brain/.env",
+                "/home/jfroh/.hermes/ops-brain/.env.*",
+                "/home/jfroh/.hermes/ops-brain/credentials",
+                "/home/jfroh/.hermes/ops-brain/*/credentials",
+                "/home/jfroh/.hermes/ops-brain/*/API keys",
+                "/home/jfroh/.hermes/ops-brain/*/OAuth tokens",
+                "/home/jfroh/.hermes/ops-brain/*/authentication databases",
+                "/home/jfroh/.hermes/ops-brain/*/secret stores",
+                "/home/jfroh/.hermes/ops-brain/*/private keys",
+                "/home/jfroh/.hermes/ops-brain/*/SSH material",
+                "/home/jfroh/.hermes/ops-brain/*/.git/config",
+                "/home/jfroh/.hermes/ops-brain/*/runtime session databases",
+                "/home/jfroh/.hermes/ops-brain/*/operator approval databases",
+                "/home/jfroh/.hermes/ops-brain/*/operator policy/session state",
+            ],
+            "verbs": {
+                "filesystem": ["read", "edit"],
+                "git": ["commit"],
+                "tests": ["run"],
+            },
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": None,
+        "baseline_required": False,
     },
 }
 

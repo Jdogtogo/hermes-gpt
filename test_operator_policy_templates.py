@@ -133,3 +133,100 @@ def test_tax_calculator_template_has_only_the_intended_repository_root():
     assert policy["writable_roots"] == ["/mnt/c/Dev/Tax Calculator"]
     assert "/home/jfroh" not in policy["writable_roots"]
     assert "/mnt/c/Dev" not in policy["writable_roots"]
+
+
+def test_hermes_context_maintenance_resolves_to_exact_roots():
+    resolved = templates.resolve_template("hermes-context-maintenance")
+    policy = resolved["policy"]
+    assert policy["readable_roots"] == [
+        "/home/jfroh/.hermes/hermes-agent",
+        "/home/jfroh/.hermes/ops-brain",
+    ]
+    assert policy["writable_roots"] == [
+        "/home/jfroh/.hermes/hermes-agent",
+        "/home/jfroh/.hermes/ops-brain",
+    ]
+    assert resolved["max_duration_seconds"] == 4 * 60 * 60
+    assert resolved["allowed_branches"] is None
+    assert resolved["baseline_required"] is False
+
+
+def test_hermes_context_maintenance_hard_denied_paths_cover_secrets():
+    resolved = templates.resolve_template("hermes-context-maintenance")
+    policy = resolved["policy"]
+    denied = policy["hard_denied_paths"]
+
+    # Must include the critical secret paths for both roots
+    assert "/home/jfroh/.hermes/hermes-agent/.env" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/.env.*" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/credentials" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/credentials" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/API keys" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/OAuth tokens" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/authentication databases" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/secret stores" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/private keys" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/SSH material" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/.git/config" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/runtime session databases" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/operator approval databases" in denied
+    assert "/home/jfroh/.hermes/hermes-agent/*/operator policy/session state" in denied
+
+    assert "/home/jfroh/.hermes/ops-brain/.env" in denied
+    assert "/home/jfroh/.hermes/ops-brain/.env.*" in denied
+    assert "/home/jfroh/.hermes/ops-brain/credentials" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/credentials" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/API keys" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/OAuth tokens" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/authentication databases" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/secret stores" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/private keys" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/SSH material" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/.git/config" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/runtime session databases" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/operator approval databases" in denied
+    assert "/home/jfroh/.hermes/ops-brain/*/operator policy/session state" in denied
+
+
+def test_hermes_context_maintenance_verbs_are_scoped():
+    resolved = templates.resolve_template("hermes-context-maintenance")
+    verbs = resolved["policy"]["verbs"]
+    assert resolved["policy"]["level"] == "workspace"
+    assert set(verbs["filesystem"]) == {"read", "edit"}
+    assert verbs["git"] == ["commit"]
+    assert verbs["tests"] == ["run"]
+    # No owner-level verbs
+    for verb_list in verbs.values():
+        assert "run_command" not in verb_list
+        assert "force_push" not in verb_list
+        assert "reset_hard" not in verb_list
+    # No service control, no egress hosts, no git remotes
+    assert "services" not in verbs
+    assert "service_units" not in resolved["policy"]
+    assert "egress_hosts" not in resolved["policy"]
+    assert "git_remotes" not in resolved["policy"]
+
+
+def test_hermes_context_maintenance_template_is_active():
+    assert "hermes-context-maintenance" in templates.active_template_names()
+    resolved = templates.resolve_template("hermes-context-maintenance")
+    assert resolved["active"] is True
+
+
+def test_hermes_context_maintenance_template_must_be_requested_by_exact_name():
+    # Unknown or injection attempts must fail closed
+    injection_attempts = [
+        "../../../etc/passwd",
+        "/home/jfroh/.hermes/hermes-agent",
+        "hermes-context-maintenance/../sandbox",
+        "hermes-context-maintenance\x00tax-calculator-controller",
+        "",
+        "hermes-context-maintenance ",  # trailing space
+        " hermes-context-maintenance",  # leading space
+    ]
+    for attempt in injection_attempts:
+        try:
+            templates.resolve_template(attempt)
+            assert False, f"Should have rejected: {attempt!r}"
+        except templates.UnknownPolicyTemplateError:
+            pass
