@@ -976,7 +976,9 @@ def hermes_operator_doctor(profile: str = "default") -> str:
 def hermes_operator_snapshot(profile: str = "default") -> str:
     """Return a single current-state summary of the operator."""
     return op_diagnostics.hermes_operator_snapshot(
-        profile=profile, hermes_root=_default_hermes_root()
+        profile=profile,
+        hermes_root=_default_hermes_root(),
+        prefer_systemd=(profile == "default"),
     )
 
 

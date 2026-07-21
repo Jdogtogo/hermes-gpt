@@ -294,6 +294,76 @@ def test_snapshot_never_includes_env_values(hermes_root, clean_env, audit_overri
     assert "sk-abcdef" not in text
 
 
+def test_snapshot_prefers_systemd_when_pid_file_is_absent(
+    hermes_root, clean_env, audit_override, monkeypatch
+):
+    monkeypatch.setattr(
+        od.op_workspace,
+        "_systemd_default_gateway_status",
+        lambda: {
+            "running": True,
+            "pid": 4242,
+            "active_state": "active",
+            "sub_state": "running",
+            "unit": "hermes-gateway.service",
+        },
+    )
+
+    parsed = json.loads(
+        od.hermes_operator_snapshot(
+            profile="default", hermes_root=hermes_root, prefer_systemd=True
+        )
+    )
+
+    assert parsed["gateway"]["running"] is True
+    assert parsed["gateway"]["pid"] == 4242
+    assert parsed["gateway"]["status_source"] == "systemd"
+
+
+def test_snapshot_reports_systemd_inactive(
+    hermes_root, clean_env, audit_override, monkeypatch
+):
+    monkeypatch.setattr(
+        od.op_workspace,
+        "_systemd_default_gateway_status",
+        lambda: {
+            "running": False,
+            "pid": None,
+            "active_state": "inactive",
+            "sub_state": "dead",
+            "unit": "hermes-gateway.service",
+        },
+    )
+
+    parsed = json.loads(
+        od.hermes_operator_snapshot(
+            profile="default", hermes_root=hermes_root, prefer_systemd=True
+        )
+    )
+
+    assert parsed["gateway"]["running"] is False
+    assert parsed["gateway"]["status_source"] == "systemd"
+    assert parsed["gateway"]["systemd_active_state"] == "inactive"
+
+
+def test_snapshot_falls_back_to_pid_when_systemd_is_unavailable(
+    hermes_root, clean_env, audit_override, monkeypatch
+):
+    (hermes_root / "gateway.pid").write_text("5151\n", encoding="utf-8")
+    monkeypatch.setattr(od.op_workspace, "_systemd_default_gateway_status", lambda: None)
+    monkeypatch.setattr(od, "_is_process_alive", lambda pid: pid == 5151)
+
+    parsed = json.loads(
+        od.hermes_operator_snapshot(
+            profile="default", hermes_root=hermes_root, prefer_systemd=True
+        )
+    )
+
+    assert parsed["gateway"]["running"] is True
+    assert parsed["gateway"]["pid"] == 5151
+    assert parsed["gateway"]["status_source"] == "pid_file"
+
+
 # ---------------------------------------------------------------------------
 # hermes_release_doctor
 # ---------------------------------------------------------------------------

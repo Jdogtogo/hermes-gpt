@@ -664,6 +664,7 @@ def hermes_operator_doctor(
 def hermes_operator_snapshot(
     profile: str = "default",
     hermes_root: Path | None = None,
+    prefer_systemd: bool = False,
 ) -> str:
     """Return a single current-state summary of the operator and its surfaces."""
     trace_id = op.new_trace_id()
@@ -697,6 +698,22 @@ def hermes_operator_snapshot(
                         pid = None
                 gateway["pid"] = pid
                 gateway["running"] = _is_process_alive(pid) if pid is not None else False
+                gateway["status_source"] = "pid_file" if pid is not None else "unavailable"
+
+                if profile == "default" and prefer_systemd:
+                    systemd_status = op_workspace._systemd_default_gateway_status()
+                    if systemd_status is not None:
+                        gateway.update(
+                            {
+                                "running": bool(systemd_status["running"]),
+                                "pid": systemd_status["pid"],
+                                "status_source": "systemd",
+                                "systemd_unit": systemd_status["unit"],
+                                "systemd_active_state": systemd_status["active_state"],
+                                "systemd_sub_state": systemd_status["sub_state"],
+                            }
+                        )
+
                 hb_path = _ticker_heartbeat_path(profile_home)
                 if hb_path.exists():
                     try:
