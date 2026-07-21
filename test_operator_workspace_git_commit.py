@@ -52,7 +52,10 @@ def audit_override(tmp_path):
     op.set_audit_log_override(None)
 
 
-def _make_session(tmp_path, repo, *, verbs, session_id="ops-commit-test", duration_seconds=600):
+def _make_session(
+    tmp_path, repo, *, verbs, session_id="ops-commit-test", duration_seconds=600,
+    allowed_branches=None,
+):
     session_root = tmp_path / "sessions"
     return op_sessions.create_session(
         {
@@ -61,6 +64,7 @@ def _make_session(tmp_path, repo, *, verbs, session_id="ops-commit-test", durati
             "apply_mode": "direct",
             "readable_roots": [str(repo)],
             "writable_roots": [str(repo)],
+            "allowed_branches": allowed_branches,
             "verbs": verbs,
         },
         duration_seconds=duration_seconds,
@@ -158,6 +162,61 @@ def test_commit_rejects_branch_mismatch(git_repo, clean_env, audit_override, mon
     ))
     assert out["success"] is False
     assert "branch" in out["error"].lower()
+
+
+def test_commit_rejects_branch_outside_session_allowed_branches(git_repo, clean_env, audit_override, monkeypatch, tmp_path):
+    """A session restricted to specific branches must refuse a commit on any
+    other branch — even when the caller-supplied expected_branch truthfully
+    matches the checked-out branch. This is the enforcement the template's
+    allowed_branches was previously missing entirely.
+    """
+    branch = _run_git(["branch", "--show-current"], git_repo)
+    record, session_root = _make_session(
+        tmp_path, git_repo,
+        verbs={"git": ["commit"], "filesystem": ["read", "edit"]},
+        allowed_branches=["some-other-protected-branch"],
+    )
+    _activate(monkeypatch, record, session_root)
+    (git_repo / "f.txt").write_text("x\n", encoding="utf-8")
+    baseline = _run_git(["rev-parse", "HEAD"], git_repo)
+
+    out = json.loads(ows.hermes_workspace_git_commit(
+        workdir=str(git_repo),
+        expected_branch=branch,          # honest: matches the real branch
+        expected_baseline=baseline,
+        allowed_files=["f.txt"],
+        message="msg",
+        dry_run=False,
+    ))
+    assert out["success"] is False
+    assert "not permitted" in out["error"].lower() and "branch" in out["error"].lower()
+    # Nothing was committed.
+    assert _run_git(["rev-parse", "HEAD"], git_repo) == baseline
+
+
+def test_commit_allows_branch_inside_session_allowed_branches(git_repo, clean_env, audit_override, monkeypatch, tmp_path):
+    """A branch-restricted session must still permit a commit on an allowed
+    branch — the restriction must not over-block the intended branch."""
+    branch = _run_git(["branch", "--show-current"], git_repo)
+    record, session_root = _make_session(
+        tmp_path, git_repo,
+        verbs={"git": ["commit"], "filesystem": ["read", "edit"]},
+        allowed_branches=[branch],
+    )
+    _activate(monkeypatch, record, session_root)
+    (git_repo / "f.txt").write_text("x\n", encoding="utf-8")
+    baseline = _run_git(["rev-parse", "HEAD"], git_repo)
+
+    out = json.loads(ows.hermes_workspace_git_commit(
+        workdir=str(git_repo),
+        expected_branch=branch,
+        expected_baseline=baseline,
+        allowed_files=["f.txt"],
+        message="msg",
+        dry_run=False,
+    ))
+    assert out["success"] is True
+    assert out["commit_hash"] != baseline
 
 
 def test_commit_rejects_baseline_mismatch(git_repo, clean_env, audit_override, monkeypatch, tmp_path):

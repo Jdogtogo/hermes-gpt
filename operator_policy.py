@@ -608,6 +608,7 @@ class OperatorPolicy:
         "egress_hosts",
         "git_remotes",
         "service_units",
+        "allowed_branches",
         "verbs",
         "denied_paths",
         "owner_ack",
@@ -653,6 +654,11 @@ class OperatorPolicy:
             self.egress_hosts = list(snapshot.get("egress_hosts", []))
             self.git_remotes = list(snapshot.get("git_remotes", []))
             self.service_units = list(snapshot.get("service_units", []))
+            # None (or absent) means "any branch"; a list restricts commits to
+            # exactly those branch names. Sourced from the same immutable
+            # snapshot as the other authority fields.
+            raw_branches = snapshot.get("allowed_branches")
+            self.allowed_branches = list(raw_branches) if isinstance(raw_branches, list) else None
             self.verbs = dict(snapshot.get("verbs", {}))
             self.denied_paths = [Path(p) for p in snapshot.get("hard_denied_paths", [])]
             self.owner_ack = ""
@@ -704,6 +710,7 @@ class OperatorPolicy:
         self.egress_hosts = []
         self.git_remotes = []
         self.service_units = []
+        self.allowed_branches = None
         self.verbs = {}
         # Denied paths env adds to the built-in defaults; it cannot remove
         # the defaults. We don't store the env list as paths here because
@@ -874,6 +881,24 @@ class OperatorPolicy:
         if verb not in granted:
             raise PermissionError(f"Verb {resource}:{verb} is not granted by this Operator Session.")
 
+    def require_branch(self, branch: str) -> None:
+        """Enforce the session's branch restriction, if any.
+
+        ``allowed_branches is None`` means unrestricted (any branch within the
+        granted roots). A list restricts to exactly those branch names — a
+        session bound to one branch can never write history to another, even if
+        the caller-supplied ``expected_branch`` truthfully matches the checked-
+        out branch.
+        """
+        if self.allowed_branches is None:
+            return
+        actual = (branch or "").strip()
+        if actual not in self.allowed_branches:
+            raise PermissionError(
+                f"Branch {actual!r} is not permitted by this Operator Session "
+                f"(allowed branches: {', '.join(self.allowed_branches)})."
+            )
+
     def require_recursive_delete(self) -> None:
         self.require_verb("filesystem", "recursive_delete")
 
@@ -897,6 +922,7 @@ class OperatorPolicy:
             ],
             "owner_mode_ready": self.owner_mode_ready,
             "mutation_allowed": self.mutation_allowed,
+            "allowed_branches": self.allowed_branches,
             "available_capability_groups": _capability_groups(self.level),
             "session_id": self.session_id,
             "snapshot_hash": self.snapshot_hash,

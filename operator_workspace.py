@@ -1889,6 +1889,11 @@ def hermes_workspace_git_commit(
             raise PermissionError(
                 f"Branch mismatch: expected {expected_branch!r}, found {actual_branch!r}."
             )
+        # expected_branch above is only a caller-supplied consistency check
+        # (does the repo's branch match what ChatGPT claimed). The session's own
+        # branch restriction is enforced independently here, so a branch-scoped
+        # session can never commit to a branch outside its template's grant.
+        policy.require_branch(actual_branch)
 
         head_rc, head_out, _ = _git(["rev-parse", "HEAD"], workdir, runner=runner)
         actual_head = head_out.strip()

@@ -53,8 +53,31 @@ def test_request_returns_resolved_policy_not_just_template_name(isolated_session
         reason="maintenance",
     ))
     assert out["success"] is True
-    expected = op_templates.resolve_template("hermes-gpt-operator-maintenance")["policy"]
+    tmpl = op_templates.resolve_template("hermes-gpt-operator-maintenance")
+    # The returned/stored/approver-shown snapshot carries the template's branch
+    # restriction alongside its policy block, so the human approver sees it and
+    # OperatorPolicy can enforce it at commit time.
+    expected = {**tmpl["policy"], "allowed_branches": tmpl["allowed_branches"]}
     assert out["resolved_policy"] == expected
+    assert out["resolved_policy"]["allowed_branches"] == [
+        "codex/operator-session-chatgpt-20260713"
+    ]
+
+
+def test_request_snapshot_carries_template_branch_restriction(isolated_session_root, audit_override):
+    """The pending request stored for approval must carry allowed_branches, so
+    the approved session snapshot enforces it (regression: it was dropped)."""
+    out = json.loads(server.hermes_operator_session_request(
+        policy_template="tax-calculator-controller",
+        requested_duration_minutes=60,
+        reason="reviewed development",
+    ))
+    assert out["success"] is True
+    pending = op_sessions.list_pending_session_requests(root=isolated_session_root)
+    assert len(pending) == 1
+    assert pending[0]["resolved_policy"]["allowed_branches"] == [
+        "feat/projection-architecture-discovery"
+    ]
 
 
 def test_unknown_template_rejected(isolated_session_root, audit_override):

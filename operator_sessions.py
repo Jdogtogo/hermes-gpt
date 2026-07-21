@@ -302,6 +302,14 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
     for key, value in sorted(verbs.items()):
         if isinstance(key, str):
             normalized_verbs[key] = _normalize_list(value)
+    # allowed_branches is part of the canonical, hashed snapshot so a session's
+    # branch restriction is immutable and tamper-evident. None (or an absent /
+    # malformed value) means "any branch"; a list restricts commits to exactly
+    # those branch names. An explicit empty list denies every branch.
+    raw_branches = policy.get("allowed_branches")
+    allowed_branches = (
+        _normalize_list(raw_branches) if isinstance(raw_branches, list) else None
+    )
     return {
         "version": 1,
         "policy_template": (
@@ -316,6 +324,7 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
         "egress_hosts": _normalize_list(policy.get("egress_hosts")),
         "git_remotes": _normalize_list(policy.get("git_remotes")),
         "service_units": _normalize_list(policy.get("service_units")),
+        "allowed_branches": allowed_branches,
         "hard_denied_paths": _normalize_list(
             [*DEFAULT_HARD_DENIES, *(policy.get("hard_denied_paths") or [])],
             paths=True,

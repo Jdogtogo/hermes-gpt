@@ -138,6 +138,15 @@ template — never submit raw paths, verbs, or policy JSON.
   `feat/projection-architecture-discovery`, with a two-hour maximum and a
   required pinned baseline for controlled commits.
 
+A template's `allowed_branches` is carried into the immutable, hashed session
+snapshot and enforced at commit time by `OperatorPolicy.require_branch` inside
+`hermes_workspace_git_commit`. `None` means any branch within the granted
+roots; a list restricts commits to exactly those branches. This is independent
+of the caller-supplied `expected_branch` argument, which is only a consistency
+check that the working tree is on the branch the caller claimed — a
+branch-scoped session can never write history to a branch outside its grant
+even if `expected_branch` truthfully matches the checkout.
+
 Every resolved policy also carries a fixed set of `hard_denied_paths`
 (`.ssh`, `.aws`, `.azure`, `.gnupg`, `.docker`, `.kube`,
 `.hermes/auth`, `.hermes/mcp-tokens`, `.cloudflared`) regardless of

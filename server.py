@@ -860,11 +860,19 @@ def hermes_operator_session_request(
         if not reason or not reason.strip():
             raise ValueError("reason is required.")
         resolved = op_templates.resolve_template(policy_template)
+        # Carry the template's branch restriction into the policy snapshot so it
+        # is shown to the human approver, stored immutably in the approved
+        # session, and enforced at commit time by OperatorPolicy.require_branch.
+        # (allowed_branches is template-level metadata; without this it never
+        # reached the session snapshot and was silently unenforced.) None means
+        # "any branch within the granted roots".
+        policy_snapshot = dict(resolved["policy"])
+        policy_snapshot["allowed_branches"] = resolved.get("allowed_branches")
         requested_seconds = max(60, int(requested_duration_minutes) * 60)
         capped_seconds = min(requested_seconds, resolved["max_duration_seconds"])
         request_id = op_sessions.request_session(
             policy_template=policy_template,
-            resolved_policy=resolved["policy"],
+            resolved_policy=policy_snapshot,
             requested_duration_seconds=capped_seconds,
             reason=reason.strip(),
         )
@@ -886,7 +894,7 @@ def hermes_operator_session_request(
             request_id,
             {
                 "policy_template": policy_template,
-                "resolved_policy": resolved["policy"],
+                "resolved_policy": policy_snapshot,
                 "requested_duration_seconds": capped_seconds,
                 "reason": reason.strip(),
             },
@@ -896,7 +904,7 @@ def hermes_operator_session_request(
                 "success": True,
                 "request_id": request_id,
                 "policy_template": policy_template,
-                "resolved_policy": resolved["policy"],
+                "resolved_policy": policy_snapshot,
                 "requested_duration_seconds": capped_seconds,
                 "status": "pending",
                 "note": "Requires local (Telegram or localhost) approval before any session is created.",
