@@ -159,3 +159,102 @@ def test_extension_approval_is_audited_with_source(session_env, audit_override):
     assert approvals
     assert approvals[-1]["approval_source"] == "telegram:12345"
     assert approvals[-1]["session_id"] == record.session_id
+
+
+def test_policy_bound_session_durations(session_env):
+    ordinary = templates.resolve_template("sandbox")
+    ordinary_policy = {**ordinary["policy"], "policy_template": "sandbox"}
+    ordinary_record = sessions.create_session(
+        ordinary_policy,
+        duration_seconds=10 * 60 * 60,
+        root=session_env,
+        now=1_000_000,
+    )
+    assert ordinary_record.expires_at - ordinary_record.created_at == 4 * 60 * 60
+
+    overnight = templates.resolve_template("hermes-overnight-maintenance")
+    overnight_policy = {
+        **overnight["policy"],
+        "policy_template": "hermes-overnight-maintenance",
+    }
+    overnight_record = sessions.create_session(
+        overnight_policy,
+        duration_seconds=10 * 60 * 60,
+        root=session_env,
+        now=2_000_000,
+    )
+    assert overnight_record.expires_at - overnight_record.created_at == 10 * 60 * 60
+
+    with sessions._connect(session_env) as connection:
+        stored = connection.execute(
+            "SELECT policy_max_duration_seconds FROM operator_sessions WHERE session_id = ?",
+            (overnight_record.session_id,),
+        ).fetchone()
+    assert stored["policy_max_duration_seconds"] == 10 * 60 * 60
+
+
+def test_long_extension_request_is_retained_and_policy_bounded(session_env):
+    overnight = templates.resolve_template("hermes-overnight-maintenance")
+    policy = {
+        **overnight["policy"],
+        "policy_template": "hermes-overnight-maintenance",
+    }
+    record = sessions.create_session(
+        policy,
+        duration_seconds=4 * 60 * 60,
+        root=session_env,
+        now=3_000_000,
+    )
+    request_id = sessions.request_extension(
+        record.session_id,
+        seconds=330 * 60,
+        root=session_env,
+        now=3_000_100,
+    )
+    pending = sessions.list_pending_extensions(root=session_env)
+    assert pending[0]["requested_seconds"] == 330 * 60
+
+    extended = sessions.approve_extension(
+        request_id,
+        root=session_env,
+        now=3_000_100,
+    )
+    assert extended.expires_at - extended.created_at == (4 * 60 + 330) * 60
+    assert extended.expires_at - extended.created_at <= 10 * 60 * 60
+
+
+def test_extension_default_remains_thirty_minutes(session_env):
+    resolved = templates.resolve_template("sandbox")
+    policy = {**resolved["policy"], "policy_template": "sandbox"}
+    record = sessions.create_session(policy, duration_seconds=60 * 60, root=session_env)
+    sessions.request_extension(record.session_id, root=session_env)
+    pending = sessions.list_pending_extensions(root=session_env)
+    assert pending[0]["requested_seconds"] == 30 * 60
+
+
+def test_legacy_null_policy_max_fails_closed_to_four_hours(session_env):
+    resolved = templates.resolve_template("sandbox")
+    policy = {**resolved["policy"], "policy_template": "sandbox"}
+    record = sessions.create_session(
+        policy,
+        duration_seconds=3 * 60 * 60,
+        root=session_env,
+        now=4_000_000,
+    )
+    with sessions._connect(session_env) as connection:
+        connection.execute(
+            "UPDATE operator_sessions SET policy_max_duration_seconds = NULL WHERE session_id = ?",
+            (record.session_id,),
+        )
+    request_id = sessions.request_extension(
+        record.session_id,
+        seconds=5 * 60 * 60,
+        root=session_env,
+        now=4_000_100,
+    )
+    extended = sessions.approve_extension(
+        request_id,
+        root=session_env,
+        now=4_000_100,
+    )
+    assert extended.expires_at - extended.created_at == 4 * 60 * 60

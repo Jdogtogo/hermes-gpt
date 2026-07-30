@@ -780,7 +780,10 @@ def hermes_operator_session_request_extension(minutes: int = 30) -> str:
         policy = op_policy.OperatorPolicy()
         if not policy.session_id:
             raise PermissionError("No active Operator Session is configured.")
-        seconds = max(60, min(int(minutes) * 60, op_sessions.EXTENSION_SECONDS))
+        seconds = max(
+            60,
+            min(int(minutes) * 60, op_sessions.GLOBAL_MAX_SESSION_DURATION_SECONDS),
+        )
         request_id = op_sessions.request_extension(policy.session_id, seconds=seconds)
         op_policy.audit_record(
             tool="hermes_operator_session_request_extension",
@@ -1198,6 +1201,11 @@ def hermes_operator_service_restart(dry_run: bool = True) -> str:
     return op_workspace.hermes_operator_service_restart(dry_run=dry_run)
 
 
+def hermes_approval_web_service_restart(dry_run: bool = True) -> str:
+    """Queue the exact localhost approval web unit restart after an approval-gated delay."""
+    return op_workspace.hermes_approval_web_service_restart(dry_run=dry_run)
+
+
 def hermes_workspace_read(path: str, offset: int = 1, limit: int = 500) -> str:
     return op_workspace.hermes_workspace_read(path=path, offset=offset, limit=limit)
 
@@ -1267,6 +1275,25 @@ def hermes_workspace_git_commit(
     )
 
 
+def hermes_delegate_task_forecast(
+    workdir: str,
+    mode: str = "apply",
+    profile: str = "default",
+    max_turns: int = 30,
+    timeout: int = 1800,
+    allow_web: bool = False,
+) -> str:
+    """Forecast the authority required for a delegated task without queuing it."""
+    return op_delegation.hermes_delegate_task_forecast(
+        workdir=workdir,
+        mode=mode,
+        profile=profile,
+        max_turns=max_turns,
+        timeout=timeout,
+        allow_web=allow_web,
+    )
+
+
 def hermes_delegate_task(
     prompt: str,
     workdir: str,
@@ -1301,6 +1328,21 @@ def hermes_delegated_task_result(task_id: str) -> str:
 def hermes_delegated_task_message(task_id: str, message: str) -> str:
     """Attach durable guidance to a delegated Hermes task."""
     return op_delegation.hermes_delegated_task_message(task_id, message)
+
+
+def hermes_delegated_task_continue(
+    task_id: str,
+    prompt: str,
+    max_turns: int | None = None,
+    timeout: int | None = None,
+) -> str:
+    """Queue an explicit continuation from a resumable delegated task checkpoint."""
+    return op_delegation.hermes_delegated_task_continue(
+        task_id=task_id,
+        prompt=prompt,
+        max_turns=max_turns,
+        timeout=timeout,
+    )
 
 
 def hermes_delegated_task_cancel(task_id: str) -> str:
@@ -1652,6 +1694,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_env_status,
         hermes_gateway_status,
         hermes_operator_service_restart,
+        hermes_approval_web_service_restart,
         hermes_search_files,
         hermes_workspace_read,
         hermes_workspace_patch,
@@ -1659,10 +1702,12 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_workspace_run_test,
         hermes_workspace_exec,
         hermes_workspace_git_commit,
+        hermes_delegate_task_forecast,
         hermes_delegate_task,
         hermes_delegated_task_status,
         hermes_delegated_task_result,
         hermes_delegated_task_message,
+        hermes_delegated_task_continue,
         hermes_delegated_task_cancel,
         hermes_git_status,
         hermes_git_diff,

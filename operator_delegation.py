@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -28,8 +29,23 @@ MAX_PROMPT_BYTES = 65536
 MAX_OUTPUT_CHARS = 20000
 MAX_TIMEOUT_SECONDS = 3600
 MAX_TURNS = 100
-TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
+AUTHORITY_POLL_SECONDS = 2
+TASK_SCHEMA_VERSION = 2
+ADAPTER_NAME = "hermes-profile-delegation"
+TERMINAL_STATES = frozenset({"completed", "incomplete", "failed", "timed_out", "cancelled", "blocked"})
+RESUMABLE_STATES = frozenset({"incomplete", "failed", "timed_out", "blocked"})
+NON_TERMINAL_STATES = frozenset({"queued", "starting", "running", "checkpointed", "awaiting_continuation", "resuming", "cancel_requested"})
+LEGAL_TRANSITIONS = {
+    "queued": {"starting", "cancel_requested", "cancelled", "blocked"},
+    "starting": {"running", "failed", "blocked", "cancelled"},
+    "running": {"checkpointed", "completed", "incomplete", "failed", "timed_out", "blocked", "cancel_requested", "cancelled"},
+    "checkpointed": {"running", "awaiting_continuation", "completed", "incomplete", "failed", "timed_out", "blocked", "cancel_requested", "cancelled"},
+    "awaiting_continuation": {"resuming", "cancelled", "blocked"},
+    "resuming": {"running", "failed", "blocked", "cancelled"},
+    "cancel_requested": {"cancelled"},
+}
 _TASKS_ROOT = Path(__file__).resolve().parent / "logs" / "delegated_tasks"
+MISSION_CONTROL_DB_ENV = "HERMES_GPT_DELEGATION_MISSION_CONTROL_DB"
 _LOCK = threading.RLock()
 _PROCESSES: dict[str, subprocess.Popen[str]] = {}
 
@@ -49,6 +65,25 @@ def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _transition(task: dict[str, Any], new_status: str, *, reason: str | None = None) -> None:
+    old_status = str(task.get("status") or "")
+    if old_status and old_status != new_status:
+        allowed = LEGAL_TRANSITIONS.get(old_status, set())
+        if old_status in TERMINAL_STATES:
+            raise ValueError(f"Cannot transition terminal delegated task from {old_status!r} to {new_status!r}.")
+        if new_status not in allowed and new_status not in TERMINAL_STATES:
+            raise ValueError(f"Illegal delegated task transition {old_status!r} -> {new_status!r}.")
+    task["status"] = new_status
+    task.setdefault("events", []).append(
+        {
+            "at": _now(),
+            "from": old_status or None,
+            "to": new_status,
+            "reason": reason or "",
+        }
+    )
 
 
 def _load(task_id: str) -> dict[str, Any]:
@@ -112,6 +147,333 @@ def _safe_text(value: str) -> str:
     if len(redacted) <= MAX_OUTPUT_CHARS:
         return redacted
     return redacted[:MAX_OUTPUT_CHARS] + f"\n... [truncated {len(redacted)-MAX_OUTPUT_CHARS} chars]"
+
+
+def _workspace_snapshot(root: Path) -> dict[str, tuple[int, int]]:
+    """Return bounded file metadata used to prove apply-task changes."""
+    snapshot: dict[str, tuple[int, int]] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if rel.parts and rel.parts[0] in {".git", "logs"}:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        snapshot[str(rel)] = (int(stat.st_size), int(stat.st_mtime_ns))
+        if len(snapshot) >= 10000:
+            break
+    return snapshot
+
+
+def _changed_files(before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]]) -> list[str]:
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+
+
+def _git_context(workdir: Path) -> dict[str, str | None]:
+    context = {"root": None, "branch": None, "baseline": None}
+    commands = {
+        "root": ["git", "-C", str(workdir), "rev-parse", "--show-toplevel"],
+        "branch": ["git", "-C", str(workdir), "branch", "--show-current"],
+        "baseline": ["git", "-C", str(workdir), "rev-parse", "HEAD"],
+    }
+    for key, argv in commands.items():
+        try:
+            result = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            continue
+        if result.returncode == 0:
+            value = result.stdout.strip()
+            context[key] = value or None
+    return context
+
+
+def _prompt_fingerprint(prompt: str) -> str:
+    normalized = " ".join(str(prompt).split())
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _logical_work_id(*, prompt: str, profile: str, mode: str, workdir: Path) -> tuple[str, dict[str, Any]]:
+    git = _git_context(workdir)
+    fingerprint = {
+        "profile": profile,
+        "mode": mode,
+        "workdir": str(workdir),
+        "prompt_sha256": _prompt_fingerprint(prompt),
+        "git_root": git.get("root"),
+        "git_branch": git.get("branch"),
+        "git_baseline": git.get("baseline"),
+    }
+    encoded = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
+    return "lw_" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32], fingerprint
+
+
+def _iter_tasks() -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    if not _TASKS_ROOT.exists():
+        return tasks
+    for path in _TASKS_ROOT.glob("dt_*.json"):
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(loaded, dict):
+            tasks.append(loaded)
+    return tasks
+
+
+def _find_existing_logical_work(logical_work_id: str) -> dict[str, Any] | None:
+    matches = [
+        task for task in _iter_tasks()
+        if task.get("logical_work_id") == logical_work_id
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda task: int(task.get("created_at") or 0), reverse=True)[0]
+
+
+def _checkpoint_path(task: dict[str, Any], checkpoint_id: str) -> Path:
+    logical_work_id = str(task.get("logical_work_id") or "unknown")
+    return _TASKS_ROOT / "checkpoints" / logical_work_id / f"{checkpoint_id}.json"
+
+
+def _write_checkpoint(task: dict[str, Any], *, reason: str) -> str:
+    sequence = int(task.get("checkpoint_sequence") or 0) + 1
+    checkpoint_id = "cp_" + hashlib.sha256(
+        f"{task.get('logical_work_id')}:{task.get('task_id')}:{sequence}:{task.get('status')}:{_now()}".encode("utf-8")
+    ).hexdigest()[:20]
+    payload = {
+        "schema_version": TASK_SCHEMA_VERSION,
+        "checkpoint_id": checkpoint_id,
+        "logical_work_id": task.get("logical_work_id"),
+        "task_id": task.get("task_id"),
+        "attempt_id": task.get("attempt_id"),
+        "interaction_id": task.get("interaction_id"),
+        "continuation_sequence": task.get("continuation_sequence", 0),
+        "state": task.get("status"),
+        "reason": reason,
+        "profile": task.get("profile"),
+        "adapter": task.get("adapter"),
+        "model": task.get("model"),
+        "workdir": task.get("workdir"),
+        "git": task.get("git"),
+        "changed_files": task.get("changed_files", []),
+        "returncode": task.get("returncode"),
+        "outcome_reason": task.get("outcome_reason", ""),
+        "failure_category": task.get("failure_category"),
+        "provider_error_category": task.get("provider_error_category"),
+        "retry_count": task.get("retry_count", 0),
+        "created_at": _now(),
+        "updated_at": task.get("updated_at"),
+        "safe_stdout_excerpt": str(task.get("stdout") or "")[-2000:],
+        "safe_stderr_excerpt": str(task.get("stderr") or "")[-2000:],
+        "resume_instructions": (
+            "Use hermes_delegated_task_continue with unchanged scope and active authority. "
+            "Reconcile repository state before continuing; do not replay completed changes."
+        ),
+    }
+    path = _checkpoint_path(task, checkpoint_id)
+    _atomic_write(path, payload)
+    task["checkpoint_sequence"] = sequence
+    task["checkpoint_ref"] = str(path)
+    return str(path)
+
+
+def _mission_control_db_path() -> Path | None:
+    configured = os.environ.get(MISSION_CONTROL_DB_ENV)
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_file() else None
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    path = Path.home() / ".hermes" / "kanban.db"
+    return path if path.is_file() else None
+
+
+def _mission_status(task_status: str) -> str:
+    if task_status == "completed":
+        return "Completed"
+    if task_status == "cancelled":
+        return "Cancelled"
+    if task_status in TERMINAL_STATES:
+        return "On Hold"
+    return "In Progress"
+
+
+def _record_mission_control(task: dict[str, Any], *, event: str) -> None:
+    db_path = _mission_control_db_path()
+    if db_path is None:
+        return
+    try:
+        now = _now()
+        logical_work_id = str(task.get("logical_work_id") or task.get("task_id"))
+        title = f"Delegated Hermes task {logical_work_id}"
+        result = json.dumps(
+            {
+                "task_id": task.get("task_id"),
+                "status": task.get("status"),
+                "profile": task.get("profile"),
+                "checkpoint_ref": task.get("checkpoint_ref"),
+                "outcome_reason": task.get("outcome_reason", ""),
+            },
+            sort_keys=True,
+        )
+        with sqlite3.connect(db_path, timeout=10) as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks(id, title, body, assignee, status, priority, created_by,
+                                  created_at, workspace_kind, workspace_path, result,
+                                  idempotency_key, session_id)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'delegated', ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    assignee=excluded.assignee,
+                    status=excluded.status,
+                    workspace_path=excluded.workspace_path,
+                    result=excluded.result,
+                    idempotency_key=excluded.idempotency_key,
+                    session_id=excluded.session_id
+                """,
+                (
+                    logical_work_id,
+                    title,
+                    "Hermes delegated execution worker record. Prompt content is intentionally not stored.",
+                    task.get("profile"),
+                    _mission_status(str(task.get("status") or "")),
+                    ADAPTER_NAME,
+                    now,
+                    task.get("workdir"),
+                    result,
+                    logical_work_id,
+                    task.get("authority", {}).get("session_id"),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
+                (
+                    logical_work_id,
+                    f"delegated_task.{event}",
+                    json.dumps(
+                        {
+                            "task_id": task.get("task_id"),
+                            "attempt_id": task.get("attempt_id"),
+                            "interaction_id": task.get("interaction_id"),
+                            "status": task.get("status"),
+                            "checkpoint_ref": task.get("checkpoint_ref"),
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+    except Exception:
+        return
+
+
+def _classify_failure(*, rc: int, stdout: str, stderr: str, status: str, reason: str) -> tuple[str | None, str | None]:
+    combined = f"{stdout}\n{stderr}".lower()
+    if status == "timed_out":
+        return "timeout", None
+    if status == "blocked":
+        return "permission", None
+    if "provider resolver returned an empty api key" in combined:
+        return "provider_configuration", "missing_api_key"
+    if "model returned empty content" in combined or "empty-response" in reason:
+        return "model_failure", "empty_response"
+    if "fallback" in combined:
+        return "model_failure", "fallback_response"
+    if rc != 0:
+        return "process_failure", None
+    if status == "incomplete":
+        return "evidence_failure", None
+    return None, None
+
+
+def _assess_outcome(*, task: dict[str, Any], rc: int, stdout: str, stderr: str, changed_files: list[str]) -> tuple[str, str]:
+    """Classify substantive completion instead of trusting process exit alone."""
+    if rc == 124:
+        return "timed_out", "delegated attempt exceeded its bounded execution timeout"
+    if rc != 0:
+        return "failed", f"process exited with return code {rc}"
+    combined = f"{stdout}\n{stderr}".strip()
+    lowered = combined.lower()
+    if not combined:
+        return "incomplete", "process exited cleanly but produced no output"
+    incomplete_markers = (
+        "no reply: the model returned empty content",
+        "model returned empty content",
+        "try `continue`, switch model/provider",
+    )
+    if any(marker in lowered for marker in incomplete_markers):
+        return "incomplete", "model produced an explicit empty-response/fallback failure"
+    if task.get("mode") == "apply" and not changed_files:
+        return "incomplete", "apply task produced no workspace changes"
+    return "completed", "substantive output and required workspace evidence were produced"
+
+
+def _capture_authority_envelope(
+    policy: op.OperatorPolicy,
+    *,
+    profile: str,
+    workdir: Path,
+    mode: str,
+    allow_web: bool,
+    max_turns: int,
+    timeout: int,
+) -> dict[str, Any]:
+    """Capture the immutable, non-secret authority contract for one task."""
+    return {
+        "session_id": policy.session_id,
+        "snapshot_hash": policy.snapshot_hash,
+        "expires_at": policy.expires_at,
+        "level": policy.level,
+        "apply_mode": policy.apply_mode,
+        "readable_roots": [str(path) for path in policy.readable_roots],
+        "writable_roots": [str(path) for path in policy.writable_roots],
+        "verbs": {key: list(value) for key, value in policy.verbs.items()},
+        "allowed_profiles": list(policy.allowed_profiles),
+        "profile": profile,
+        "workdir": str(workdir),
+        "mode": mode,
+        "allow_web": bool(allow_web),
+        "max_turns": int(max_turns),
+        "timeout": int(timeout),
+        "evidence_required": mode == "apply",
+        "evidence": ["changed_files", "substantive_output"] if mode == "apply" else ["substantive_output"],
+    }
+
+
+def _require_task_authority(task: dict[str, Any]) -> None:
+    """Fail closed when current authority no longer matches the task envelope."""
+    authority = task.get("authority") or {}
+    policy = op.OperatorPolicy()
+    policy.require_enabled()
+    if policy.session_id != authority.get("session_id"):
+        raise PermissionError("originating Operator Session is no longer active")
+    if policy.snapshot_hash != authority.get("snapshot_hash"):
+        raise PermissionError("Operator Session authority snapshot changed")
+    expires_at = int(authority.get("expires_at") or 0)
+    if not expires_at or _now() >= expires_at:
+        raise PermissionError("originating Operator Session expired")
+    profile = str(authority.get("profile") or task.get("profile") or "default")
+    workdir = _resolve_workdir(str(authority.get("workdir") or task.get("workdir") or ""))
+    mode = str(authority.get("mode") or task.get("mode") or "read_only")
+    policy.require_profile(profile, Path.home() / ".hermes")
+    policy.require_read_path(workdir)
+    if mode == "apply":
+        policy.require_level("workspace")
+        policy.require_mutation(dry_run=False)
+        policy.require_write_path(workdir)
+        policy.require_verb("filesystem", "edit")
 
 
 def _resolve_workdir(workdir: str) -> Path:
@@ -180,18 +542,25 @@ def _worker(task_id: str) -> None:
     with _LOCK:
         task = _load(task_id)
         if task["status"] == "cancel_requested":
-            task["status"] = "cancelled"
+            _transition(task, "cancelled", reason="cancelled before start")
             task["finished_at"] = _now()
+            _write_checkpoint(task, reason="cancelled before start")
             _save(task)
+            _record_mission_control(task, event="cancelled")
             return
-        task["status"] = "running"
+        _transition(task, "starting", reason="worker thread accepted task")
         task["started_at"] = _now()
+        _write_checkpoint(task, reason="starting delegated attempt")
         _save(task)
+        _record_mission_control(task, event="starting")
 
     env = os.environ.copy()
     env[FILE_READ_SAFE_ROOT_ENV] = task["workdir"]
     runtime_home: Path | None = None
+    before_snapshot = _workspace_snapshot(Path(task["workdir"])) if task.get("mode") == "apply" else {}
+    authority_failure = ""
     try:
+        _require_task_authority(task)
         runtime_home = _prepare_runtime_home(task)
         env["HERMES_HOME"] = str(runtime_home)
         process = subprocess.Popen(
@@ -207,15 +576,32 @@ def _worker(task_id: str) -> None:
         with _LOCK:
             _PROCESSES[task_id] = process
             task = _load(task_id)
+            _transition(task, "running", reason="provider process started")
             task["pid"] = process.pid
+            _write_checkpoint(task, reason="provider process started")
             _save(task)
-        try:
-            stdout, stderr = process.communicate(timeout=int(task["timeout"]))
-            rc = int(process.returncode or 0)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=10)
-            rc = 124
+            _record_mission_control(task, event="running")
+        deadline = time.monotonic() + int(task["timeout"])
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                os.killpg(process.pid, signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=10)
+                rc = 124
+                break
+            try:
+                stdout, stderr = process.communicate(timeout=min(AUTHORITY_POLL_SECONDS, remaining))
+                rc = int(process.returncode or 0)
+                break
+            except subprocess.TimeoutExpired:
+                try:
+                    _require_task_authority(task)
+                except Exception as exc:
+                    authority_failure = str(exc)
+                    os.killpg(process.pid, signal.SIGTERM)
+                    stdout, stderr = process.communicate(timeout=10)
+                    rc = 125
+                    break
         with _LOCK:
             task = _load(task_id)
             cancelled = task["status"] == "cancel_requested"
@@ -224,22 +610,54 @@ def _worker(task_id: str) -> None:
             task["stderr"] = _safe_text(stderr)
             task["finished_at"] = _now()
             task["pid"] = None
+            after_snapshot = _workspace_snapshot(Path(task["workdir"])) if task.get("mode") == "apply" else {}
+            changed_files = _changed_files(before_snapshot, after_snapshot) if task.get("mode") == "apply" else []
+            task["changed_files"] = changed_files
             if cancelled:
-                task["status"] = "cancelled"
-            elif rc == 0:
-                task["status"] = "completed"
+                _transition(task, "cancelled", reason="task cancellation was requested")
+                task["outcome_reason"] = "task cancellation was requested"
+            elif authority_failure:
+                _transition(task, "blocked", reason="task authority was withdrawn")
+                task["outcome_reason"] = f"task authority was withdrawn: {authority_failure}"
             else:
-                task["status"] = "failed"
+                status, reason = _assess_outcome(
+                    task=task,
+                    rc=rc,
+                    stdout=stdout,
+                    stderr=stderr,
+                    changed_files=changed_files,
+                )
+                _transition(task, status, reason=reason)
+                task["outcome_reason"] = reason
+            task["failure_category"], task["provider_error_category"] = _classify_failure(
+                rc=rc,
+                stdout=stdout,
+                stderr=stderr,
+                status=str(task["status"]),
+                reason=str(task.get("outcome_reason") or ""),
+            )
+            _write_checkpoint(task, reason=str(task.get("outcome_reason") or task["status"]))
             _save(task)
-            _audit(task, success=task["status"] == "completed", summary=f"delegated task {task['status']} rc={rc}", error=task["stderr"][:500] if rc else "")
+            _record_mission_control(task, event=str(task["status"]))
+            audit_error = task["stderr"][:500] if task["status"] != "completed" else ""
+            _audit(
+                task,
+                success=task["status"] == "completed",
+                summary=f"delegated task {task['status']} rc={rc}: {task.get('outcome_reason', '')}",
+                error=audit_error,
+            )
     except Exception as exc:
         with _LOCK:
             task = _load(task_id)
-            task["status"] = "failed"
+            if task.get("status") not in TERMINAL_STATES:
+                _transition(task, "failed", reason="delegated task launch failed")
             task["finished_at"] = _now()
             task["pid"] = None
             task["stderr"] = _safe_text(str(exc))
+            task["failure_category"] = "adapter_failure"
+            _write_checkpoint(task, reason="delegated task launch failed")
             _save(task)
+            _record_mission_control(task, event="failed")
             _audit(task, success=False, summary="delegated task launch failed", error=str(exc))
     finally:
         if runtime_home is not None:
@@ -251,6 +669,69 @@ def _worker(task_id: str) -> None:
                 pass
         with _LOCK:
             _PROCESSES.pop(task_id, None)
+
+
+def hermes_delegate_task_forecast(
+    workdir: str,
+    mode: str = "apply",
+    profile: str = "default",
+    max_turns: int = 30,
+    timeout: int = 1800,
+    allow_web: bool = False,
+) -> str:
+    """Return the exact authority contract for a proposed task without queuing it."""
+    required: dict[str, Any] = {
+        "level": "workspace" if str(mode).strip().lower() == "apply" else "read_only",
+        "verbs": {"filesystem": ["edit"]} if str(mode).strip().lower() == "apply" else {},
+        "workdir": workdir,
+        "mode": str(mode).strip().lower(),
+        "profile": profile,
+        "allow_web": bool(allow_web),
+        "max_turns": max_turns,
+        "timeout": timeout,
+        "evidence": ["changed_files", "substantive_output"] if str(mode).strip().lower() == "apply" else ["substantive_output"],
+    }
+    try:
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode not in {"plan", "read_only", "apply"}:
+            raise ValueError("mode must be plan, read_only, or apply.")
+        turns = int(max_turns)
+        seconds = int(timeout)
+        if not 1 <= turns <= MAX_TURNS:
+            raise ValueError(f"max_turns must be between 1 and {MAX_TURNS}.")
+        if not 1 <= seconds <= MAX_TIMEOUT_SECONDS:
+            raise ValueError(f"timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds.")
+        if normalized_mode == "apply" and allow_web:
+            raise PermissionError("allow_web is disabled for apply delegation.")
+        policy = op.OperatorPolicy()
+        policy.require_enabled()
+        canonical_profile = op.validate_profile_name(profile)
+        policy.require_profile(canonical_profile, Path.home() / ".hermes")
+        resolved = _resolve_workdir(workdir)
+        policy.require_read_path(resolved)
+        if normalized_mode == "apply":
+            policy.require_level("workspace")
+            policy.require_mutation(dry_run=False)
+            policy.require_write_path(resolved)
+            policy.require_verb("filesystem", "edit")
+        envelope = _capture_authority_envelope(
+            policy,
+            profile=canonical_profile,
+            workdir=resolved,
+            mode=normalized_mode,
+            allow_web=bool(allow_web),
+            max_turns=turns,
+            timeout=seconds,
+        )
+        return json.dumps({"success": True, "granted": True, "required": required, "authority": envelope}, indent=2)
+    except Exception as exc:
+        error = op.error_from_exception(
+            exc,
+            layer="operator",
+            code="DELEGATE_TASK_FORECAST_DENIED",
+            suggested_action="Request an Operator Session whose roots, profile, verbs, mode, and expiry cover the proposed task.",
+        )
+        return json.dumps({"success": True, "granted": False, "required": required, "denial": error}, indent=2)
 
 
 def hermes_delegate_task(
@@ -293,18 +774,59 @@ def hermes_delegate_task(
             policy.require_write_path(resolved)
             policy.require_verb("filesystem", "edit")
 
+        logical_work_id, work_fingerprint = _logical_work_id(
+            prompt=prompt,
+            profile=canonical_profile,
+            mode=normalized_mode,
+            workdir=resolved,
+        )
+        with _LOCK:
+            existing = _find_existing_logical_work(logical_work_id)
+        if existing is not None:
+            existing_status = str(existing.get("status") or "unknown")
+            duplicate_result = {
+                "success": True,
+                "duplicate": True,
+                "logical_work_id": logical_work_id,
+                "task_id": existing.get("task_id"),
+                "status": existing_status,
+                "mode": existing.get("mode"),
+                "workdir": existing.get("workdir"),
+                "resolution": "existing_task_returned",
+                "resumable": existing_status in RESUMABLE_STATES,
+                "checkpoint_ref": existing.get("checkpoint_ref"),
+            }
+            if existing_status == "completed":
+                duplicate_result["resolution"] = "already_completed"
+            elif existing_status in RESUMABLE_STATES:
+                duplicate_result["resolution"] = "duplicate_rejected_resumable_checkpoint_available"
+            elif existing_status in TERMINAL_STATES:
+                duplicate_result["resolution"] = "duplicate_rejected_terminal_nonresumable"
+            return json.dumps(duplicate_result, indent=2)
+
         task_id = "dt_" + uuid.uuid4().hex
+        attempt_id = "da_" + uuid.uuid4().hex
+        interaction_id = "di_" + uuid.uuid4().hex
         argv = _build_argv(prompt=prompt, mode=normalized_mode, profile=canonical_profile, workdir=resolved, max_turns=turns, allow_web=bool(allow_web))
         task: dict[str, Any] = {
+            "schema_version": TASK_SCHEMA_VERSION,
+            "adapter": ADAPTER_NAME,
+            "worker_kind": "antigravity-profile-worker" if canonical_profile == "antigravity-operator" else "hermes-profile-worker",
+            "logical_work_id": logical_work_id,
             "task_id": task_id,
+            "attempt_id": attempt_id,
+            "interaction_id": interaction_id,
+            "continuation_sequence": 0,
             "status": "queued",
             "mode": normalized_mode,
             "profile": canonical_profile,
             "workdir": str(resolved),
+            "git": work_fingerprint,
             "max_turns": turns,
             "timeout": seconds,
             "allow_web": bool(allow_web),
             "prompt_sha256": hashlib.sha256(encoded).hexdigest(),
+            "work_fingerprint": work_fingerprint,
             "prompt_bytes": len(encoded),
             "argv": argv,
             "created_at": _now(),
@@ -316,20 +838,33 @@ def hermes_delegate_task(
             "stdout": "",
             "stderr": "",
             "messages": [],
-            "authority": {
-                "session_id": policy.session_id,
-                "snapshot_hash": policy.snapshot_hash,
-                "expires_at": policy.expires_at,
-                "level": policy.level,
-                "apply_mode": policy.apply_mode,
-            },
+            "changed_files": [],
+            "outcome_reason": "",
+            "failure_category": None,
+            "provider_error_category": None,
+            "retry_count": 0,
+            "checkpoint_sequence": 0,
+            "checkpoint_ref": None,
+            "events": [],
+            "authority": _capture_authority_envelope(
+                policy,
+                profile=canonical_profile,
+                workdir=resolved,
+                mode=normalized_mode,
+                allow_web=bool(allow_web),
+                max_turns=turns,
+                timeout=seconds,
+            ),
         }
+        _transition(task, "queued", reason="delegated task queued")
         with _LOCK:
+            _write_checkpoint(task, reason="delegated task queued")
             _save(task)
+        _record_mission_control(task, event="queued")
         thread = threading.Thread(target=_worker, args=(task_id,), daemon=True, name=f"hermes-delegate-{task_id[-8:]}")
         thread.start()
         _audit(task, success=True, summary="delegated task queued")
-        return json.dumps({"success": True, "task_id": task_id, "status": "queued", "mode": normalized_mode, "workdir": str(resolved)}, indent=2)
+        return json.dumps({"success": True, "logical_work_id": logical_work_id, "task_id": task_id, "attempt_id": attempt_id, "interaction_id": interaction_id, "status": "queued", "mode": normalized_mode, "workdir": str(resolved)}, indent=2)
     except Exception as exc:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATE_TASK_ERROR", suggested_action="Use an approved workspace, active Operator Session, allowed profile, and bounded task settings."), indent=2)
 
@@ -338,7 +873,15 @@ def hermes_delegated_task_status(task_id: str) -> str:
     try:
         with _LOCK:
             task = _load(task_id)
-        keys = ("task_id", "status", "mode", "profile", "workdir", "created_at", "updated_at", "started_at", "finished_at", "pid", "returncode", "prompt_sha256", "authority")
+        keys = (
+            "schema_version", "adapter", "worker_kind", "logical_work_id",
+            "task_id", "attempt_id", "interaction_id", "continuation_sequence",
+            "status", "mode", "profile", "workdir", "created_at", "updated_at",
+            "started_at", "finished_at", "pid", "returncode", "prompt_sha256",
+            "changed_files", "outcome_reason", "failure_category",
+            "provider_error_category", "retry_count", "checkpoint_ref",
+            "checkpoint_sequence", "authority",
+        )
         return json.dumps({"success": True, **{key: task.get(key) for key in keys}}, indent=2)
     except Exception as exc:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATED_TASK_STATUS_ERROR", suggested_action="Check the delegated task id."), indent=2)
@@ -350,7 +893,27 @@ def hermes_delegated_task_result(task_id: str) -> str:
             task = _load(task_id)
         if task["status"] not in TERMINAL_STATES:
             return json.dumps({"success": True, "task_id": task_id, "status": task["status"], "ready": False}, indent=2)
-        return json.dumps({"success": task["status"] == "completed", "task_id": task_id, "status": task["status"], "ready": True, "returncode": task["returncode"], "stdout": task["stdout"], "stderr": task["stderr"], "messages": task["messages"]}, indent=2)
+        return json.dumps({
+            "success": task["status"] == "completed",
+            "logical_work_id": task.get("logical_work_id"),
+            "task_id": task_id,
+            "attempt_id": task.get("attempt_id"),
+            "interaction_id": task.get("interaction_id"),
+            "continuation_sequence": task.get("continuation_sequence", 0),
+            "status": task["status"],
+            "ready": True,
+            "returncode": task["returncode"],
+            "stdout": task["stdout"],
+            "stderr": task["stderr"],
+            "messages": task["messages"],
+            "changed_files": task.get("changed_files", []),
+            "outcome_reason": task.get("outcome_reason", ""),
+            "failure_category": task.get("failure_category"),
+            "provider_error_category": task.get("provider_error_category"),
+            "checkpoint_ref": task.get("checkpoint_ref"),
+            "resumable": task["status"] in RESUMABLE_STATES,
+            "authority": task.get("authority", {}),
+        }, indent=2)
     except Exception as exc:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATED_TASK_RESULT_ERROR", suggested_action="Check the delegated task id."), indent=2)
 
@@ -371,6 +934,129 @@ def hermes_delegated_task_message(task_id: str, message: str) -> str:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATED_TASK_MESSAGE_ERROR", suggested_action="Check the task id and message size."), indent=2)
 
 
+def hermes_delegated_task_continue(
+    task_id: str,
+    prompt: str,
+    max_turns: int | None = None,
+    timeout: int | None = None,
+) -> str:
+    """Queue an explicit continuation from the latest checkpoint.
+
+    Continuation is deliberately not automatic: authority, scope, and current
+    repository state must still be reconciled by the caller before this is
+    invoked. The new attempt remains linked to the original logical work item.
+    """
+    try:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("continuation prompt is required.")
+        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise ValueError(f"continuation prompt exceeds {MAX_PROMPT_BYTES} bytes.")
+        with _LOCK:
+            previous = _load(task_id)
+        previous_status = str(previous.get("status") or "")
+        if previous_status not in RESUMABLE_STATES:
+            raise PermissionError(f"Task {task_id!r} is not in a resumable state.")
+        _require_task_authority(previous)
+
+        mode = str(previous.get("mode") or "read_only")
+        profile = str(previous.get("profile") or "default")
+        workdir = _resolve_workdir(str(previous.get("workdir") or ""))
+        turns = int(max_turns if max_turns is not None else previous.get("max_turns") or 30)
+        seconds = int(timeout if timeout is not None else previous.get("timeout") or 1800)
+        if not 1 <= turns <= MAX_TURNS:
+            raise ValueError(f"max_turns must be between 1 and {MAX_TURNS}.")
+        if not 1 <= seconds <= MAX_TIMEOUT_SECONDS:
+            raise ValueError(f"timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds.")
+        continuation_sequence = int(previous.get("continuation_sequence") or 0) + 1
+        continuation_id = "dc_" + uuid.uuid4().hex
+        continuation_prompt = (
+            f"Continue delegated task {task_id} from checkpoint {previous.get('checkpoint_ref') or '<none>'}.\n"
+            "First reconcile current repository state against the checkpoint. "
+            "Do not replay completed operations. Continue only remaining work.\n\n"
+            f"Continuation guidance:\n{prompt.strip()}"
+        )
+        encoded = continuation_prompt.encode("utf-8")
+        new_task_id = "dt_" + uuid.uuid4().hex
+        attempt_id = "da_" + uuid.uuid4().hex
+        interaction_id = "di_" + uuid.uuid4().hex
+        argv = _build_argv(
+            prompt=continuation_prompt,
+            mode=mode,
+            profile=profile,
+            workdir=workdir,
+            max_turns=turns,
+            allow_web=bool(previous.get("allow_web", False)),
+        )
+        task: dict[str, Any] = {
+            "schema_version": TASK_SCHEMA_VERSION,
+            "adapter": ADAPTER_NAME,
+            "worker_kind": previous.get("worker_kind") or ("antigravity-profile-worker" if profile == "antigravity-operator" else "hermes-profile-worker"),
+            "logical_work_id": previous.get("logical_work_id") or task_id,
+            "task_id": new_task_id,
+            "attempt_id": attempt_id,
+            "interaction_id": interaction_id,
+            "continuation_id": continuation_id,
+            "continuation_sequence": continuation_sequence,
+            "previous_task_id": task_id,
+            "previous_checkpoint_ref": previous.get("checkpoint_ref"),
+            "status": "queued",
+            "mode": mode,
+            "profile": profile,
+            "workdir": str(workdir),
+            "git": _git_context(workdir),
+            "max_turns": turns,
+            "timeout": seconds,
+            "allow_web": bool(previous.get("allow_web", False)),
+            "prompt_sha256": hashlib.sha256(encoded).hexdigest(),
+            "prompt_bytes": len(encoded),
+            "argv": argv,
+            "created_at": _now(),
+            "updated_at": _now(),
+            "started_at": None,
+            "finished_at": None,
+            "pid": None,
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+            "messages": [],
+            "changed_files": [],
+            "outcome_reason": "",
+            "failure_category": None,
+            "provider_error_category": None,
+            "retry_count": int(previous.get("retry_count") or 0),
+            "checkpoint_sequence": 0,
+            "checkpoint_ref": None,
+            "events": [],
+            "authority": previous.get("authority", {}),
+        }
+        _transition(task, "queued", reason="continuation queued")
+        with _LOCK:
+            _write_checkpoint(task, reason="continuation queued")
+            _save(task)
+        _record_mission_control(task, event="continuation_queued")
+        thread = threading.Thread(target=_worker, args=(new_task_id,), daemon=True, name=f"hermes-delegate-{new_task_id[-8:]}")
+        thread.start()
+        _audit(task, success=True, summary=f"delegated task continuation queued from {task_id}")
+        return json.dumps(
+            {
+                "success": True,
+                "logical_work_id": task.get("logical_work_id"),
+                "task_id": new_task_id,
+                "previous_task_id": task_id,
+                "attempt_id": attempt_id,
+                "interaction_id": interaction_id,
+                "continuation_id": continuation_id,
+                "continuation_sequence": continuation_sequence,
+                "status": "queued",
+                "mode": mode,
+                "workdir": str(workdir),
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATED_TASK_CONTINUE_ERROR", suggested_action="Check task state, checkpoint, active authority, and continuation prompt."), indent=2)
+
+
 def hermes_delegated_task_cancel(task_id: str) -> str:
     try:
         policy = op.OperatorPolicy()
@@ -380,11 +1066,13 @@ def hermes_delegated_task_cancel(task_id: str) -> str:
             task = _load(task_id)
             if task["status"] in TERMINAL_STATES:
                 return json.dumps({"success": True, "task_id": task_id, "status": task["status"], "changed": False}, indent=2)
-            task["status"] = "cancel_requested"
+            _transition(task, "cancel_requested", reason="operator requested cancellation")
+            _write_checkpoint(task, reason="operator requested cancellation")
             _save(task)
             process = _PROCESSES.get(task_id)
             if process is not None and process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
+        _record_mission_control(task, event="cancel_requested")
         return json.dumps({"success": True, "task_id": task_id, "status": "cancel_requested", "changed": True}, indent=2)
     except Exception as exc:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATED_TASK_CANCEL_ERROR", suggested_action="Use an active workspace Operator Session and check the task id."), indent=2)

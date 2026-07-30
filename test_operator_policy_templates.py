@@ -26,6 +26,41 @@ def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
     assert resolved["allowed_branches"] == ["codex/operator-session-chatgpt-20260713"]
     assert policy["service_units"] == ["hermes-gpt-chatgpt-operator.service"]
     assert policy["verbs"]["services"] == ["restart"]
+    assert set(policy["allowed_profiles"]) == {
+        "default",
+        "backend-eng",
+        "hy3-free-test",
+        "nvidia-live-test",
+        "gemini-live-test",
+        "ollama-live-test",
+        "gemini-flash",
+        "planner-glm52",
+        "coder-deepseek-v4-pro",
+        "coder-deepseek-v4-flash",
+        "worker-nemotron-super",
+        "multimodal-kimi-k26",
+        "vision-nemotron-omni",
+    }
+    assert "*" not in policy["allowed_profiles"]
+
+
+def test_antigravity_pilot_profiles_are_narrow_and_explicit():
+    policy = templates.resolve_template("hermes-antigravity-pilot")["policy"]
+    assert policy["allowed_profiles"] == ["default", "backend-eng"]
+    assert "*" not in policy["allowed_profiles"]
+
+
+def test_approval_web_maintenance_is_exact_and_narrow():
+    resolved = templates.resolve_template("hermes-approval-web-maintenance")
+    policy = resolved["policy"]
+    assert policy["service_units"] == ["hermes-gpt-approval-web.service"]
+    assert policy["verbs"]["services"] == ["restart"]
+    assert policy["allowed_profiles"] == ["default"]
+    assert policy["readable_roots"] == [
+        "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"
+    ]
+    assert policy["writable_roots"] == policy["readable_roots"]
+    assert resolved["allowed_branches"] == ["codex/operator-session-chatgpt-20260713"]
 
 
 def test_tax_calculator_resolves_to_exact_scope_and_branch():
@@ -74,7 +109,27 @@ def test_allowed_verbs_are_scoped_not_owner_level():
 def test_maximum_duration_bounded_for_every_active_template():
     for name in templates.active_template_names():
         resolved = templates.resolve_template(name)
-        assert 0 < resolved["max_duration_seconds"] <= 4 * 60 * 60
+        assert 0 < resolved["max_duration_seconds"] <= 12 * 60 * 60
+        if name == "hermes-overnight-maintenance":
+            assert resolved["max_duration_seconds"] == 10 * 60 * 60
+        else:
+            assert resolved["max_duration_seconds"] <= 4 * 60 * 60
+
+
+def test_overnight_maintenance_has_expected_scope_and_denials():
+    resolved = templates.resolve_template("hermes-overnight-maintenance")
+    policy = resolved["policy"]
+    assert resolved["max_duration_seconds"] == 10 * 60 * 60
+    assert "/home/jfroh/.hermes/hermes-agent" in policy["readable_roots"]
+    assert "/home/jfroh/.hermes/hermes-agent" not in policy["writable_roots"]
+    assert "/home/jfroh/.hermes/worktrees" in policy["writable_roots"]
+    assert "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt" in policy["hard_denied_paths"]
+    assert "/home/jfroh/.hermes/worktrees/hermes-operator-telegram-approval" in policy["hard_denied_paths"]
+    assert policy["verbs"] == {
+        "filesystem": ["read", "edit"],
+        "git": ["commit"],
+        "tests": ["run"],
+    }
 
 
 def test_unknown_template_rejected():
@@ -230,3 +285,16 @@ def test_hermes_context_maintenance_template_must_be_requested_by_exact_name():
             assert False, f"Should have rejected: {attempt!r}"
         except templates.UnknownPolicyTemplateError:
             pass
+
+
+def test_governance_inventory_includes_opsbrain_and_remains_strictly_read_only():
+    resolved = templates.resolve_template("hermes-governance-inventory")
+    policy = resolved["policy"]
+    assert "/home/jfroh/.hermes/ops-brain" in policy["readable_roots"]
+    assert policy["writable_roots"] == []
+    assert policy["level"] == "read_only"
+    assert policy["apply_mode"] == "dry_run"
+    assert policy["verbs"] == {"filesystem": ["read"]}
+    assert "services" not in policy["verbs"]
+    assert "git" not in policy["verbs"]
+    assert "tests" not in policy["verbs"]

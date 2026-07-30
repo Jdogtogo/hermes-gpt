@@ -18,13 +18,16 @@ SESSION_ROOT_ENV = "HERMES_GPT_OPERATOR_SESSION_ROOT"
 ACTIVE_SESSION_ID_ENV = "HERMES_GPT_OPERATOR_SESSION_ID"
 DEFAULT_SESSION_ROOT = Path.home() / ".hermes" / "operator-sessions"
 
-# A session's total lifetime (from creation) can never exceed
-# MAX_SESSION_DURATION_SECONDS, regardless of how many extensions are
-# approved. Each extension grants at most EXTENSION_SECONDS and always
-# requires a separate local-only approval step (see approve_extension);
-# a session can never extend itself.
+# A session's total lifetime is bound at creation to the approved policy
+# template's maximum and can never exceed the global absolute ceiling.
+# Existing/legacy sessions without a persisted bound fail closed to four
+# hours. EXTENSION_SECONDS remains the default request when the caller omits
+# a duration; longer requests still require a separate local-only approval.
 DEFAULT_SESSION_DURATION_SECONDS = 2 * 60 * 60
-MAX_SESSION_DURATION_SECONDS = 4 * 60 * 60
+LEGACY_MAX_SESSION_DURATION_SECONDS = 4 * 60 * 60
+GLOBAL_MAX_SESSION_DURATION_SECONDS = 12 * 60 * 60
+# Backward-compatible name for callers/tests that still import the old symbol.
+MAX_SESSION_DURATION_SECONDS = LEGACY_MAX_SESSION_DURATION_SECONDS
 EXTENSION_SECONDS = 30 * 60
 
 # How long a human has to act on a pending session-creation request (via
@@ -310,6 +313,14 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
     allowed_branches = (
         _normalize_list(raw_branches) if isinstance(raw_branches, list) else None
     )
+    # allowed_profiles is part of the canonical, hashed snapshot so a session's
+    # profile allowlist is immutable and tamper-evident. None (or an absent or
+    # malformed value) preserves the legacy environment fallback. An explicit
+    # list, including an empty list, is authoritative for that session.
+    raw_profiles = policy.get("allowed_profiles")
+    allowed_profiles = (
+        _normalize_list(raw_profiles) if isinstance(raw_profiles, list) else None
+    )
     return {
         "version": 1,
         "policy_template": (
@@ -325,6 +336,7 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
         "git_remotes": _normalize_list(policy.get("git_remotes")),
         "service_units": _normalize_list(policy.get("service_units")),
         "allowed_branches": allowed_branches,
+        "allowed_profiles": allowed_profiles,
         "hard_denied_paths": _normalize_list(
             [*DEFAULT_HARD_DENIES, *(policy.get("hard_denied_paths") or [])],
             paths=True,
@@ -353,7 +365,8 @@ def _connect(root: Path | None = None) -> sqlite3.Connection:
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
             revoked_at INTEGER,
-            approval_state TEXT NOT NULL
+            approval_state TEXT NOT NULL,
+            policy_max_duration_seconds INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_operator_sessions_snapshot
             ON operator_sessions(snapshot_hash);
@@ -382,6 +395,17 @@ def _connect(root: Path | None = None) -> sqlite3.Connection:
         );
         """
     )
+    # Idempotent migration for databases created before policy-bound session
+    # maxima were introduced. Legacy NULL rows are handled conservatively by
+    # approve_extension() and can never gain the new overnight maximum.
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(operator_sessions)").fetchall()
+    }
+    if "policy_max_duration_seconds" not in columns:
+        connection.execute(
+            "ALTER TABLE operator_sessions ADD COLUMN policy_max_duration_seconds INTEGER"
+        )
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -389,19 +413,48 @@ def _connect(root: Path | None = None) -> sqlite3.Connection:
     return connection
 
 
+def _bounded_policy_max_duration(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = LEGACY_MAX_SESSION_DURATION_SECONDS
+    return max(60, min(parsed, GLOBAL_MAX_SESSION_DURATION_SECONDS))
+
+
+def resolve_policy_max_duration_seconds(policy_template: str | None) -> int:
+    """Resolve a template's maximum locally, failing closed for legacy or
+    unknown templates. Remote callers can never provide this value directly."""
+    name = str(policy_template or "").strip()
+    if not name:
+        return LEGACY_MAX_SESSION_DURATION_SECONDS
+    try:
+        import operator_policy_templates as policy_templates
+
+        resolved = policy_templates.resolve_template(name)
+        return _bounded_policy_max_duration(resolved.get("max_duration_seconds"))
+    except Exception:
+        return LEGACY_MAX_SESSION_DURATION_SECONDS
+
+
 def create_session(
     policy: dict[str, Any],
     *,
     duration_seconds: int | None = None,
+    policy_max_duration_seconds: int | None = None,
     approval_state: str = "approved",
     root: Path | None = None,
     session_id: str | None = None,
     now: int | None = None,
 ) -> SessionRecord:
     created = int(time.time() if now is None else now)
-    requested = DEFAULT_SESSION_DURATION_SECONDS if duration_seconds is None else int(duration_seconds)
-    ttl = max(60, min(requested, MAX_SESSION_DURATION_SECONDS))
     normalized = normalize_policy(policy)
+    policy_max = _bounded_policy_max_duration(
+        policy_max_duration_seconds
+        if policy_max_duration_seconds is not None
+        else resolve_policy_max_duration_seconds(normalized.get("policy_template"))
+    )
+    requested = DEFAULT_SESSION_DURATION_SECONDS if duration_seconds is None else int(duration_seconds)
+    ttl = max(60, min(requested, policy_max, GLOBAL_MAX_SESSION_DURATION_SECONDS))
     # Hard invariant: an approved session snapshot must always be bound to a
     # named policy template. This is the single chokepoint through which every
     # snapshot is written, so enforcing here means no path -- normal approval,
@@ -428,9 +481,9 @@ def create_session(
             (digest, canonical, created),
         )
         connection.execute(
-            "INSERT INTO operator_sessions(session_id, snapshot_hash, created_at, expires_at, revoked_at, approval_state) "
-            "VALUES (?, ?, ?, ?, NULL, ?)",
-            (sid, digest, created, expires, approval_state),
+            "INSERT INTO operator_sessions(session_id, snapshot_hash, created_at, expires_at, revoked_at, approval_state, policy_max_duration_seconds) "
+            "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+            (sid, digest, created, expires, approval_state, policy_max),
         )
     return SessionRecord(sid, digest, normalized, created, expires, None, approval_state)
 
@@ -509,7 +562,7 @@ def request_extension(
     current = int(time.time() if now is None else now)
     load_session(session_id, root=root, now=current)  # must be active to request
     rid = request_id or f"ext_{secrets.token_urlsafe(16)}"
-    bounded_seconds = max(60, min(int(seconds), EXTENSION_SECONDS))
+    bounded_seconds = max(60, min(int(seconds), GLOBAL_MAX_SESSION_DURATION_SECONDS))
     with _connect(root) as connection:
         connection.execute(
             "INSERT INTO session_extension_requests"
@@ -549,8 +602,8 @@ def approve_extension(
             raise PermissionError(f"Extension request already {row['status']}.")
         session_id = str(row["session_id"])
         session_row = connection.execute(
-            "SELECT created_at, expires_at, revoked_at, approval_state FROM operator_sessions "
-            "WHERE session_id = ?",
+            "SELECT created_at, expires_at, revoked_at, approval_state, policy_max_duration_seconds "
+            "FROM operator_sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         if session_row is None:
@@ -561,7 +614,12 @@ def approve_extension(
             raise PermissionError("Cannot extend a session that was never approved.")
         if int(session_row["expires_at"]) < current:
             raise PermissionError("Cannot extend an already-expired session.")
-        max_expiry = int(session_row["created_at"]) + MAX_SESSION_DURATION_SECONDS
+        policy_max = _bounded_policy_max_duration(
+            session_row["policy_max_duration_seconds"]
+            if session_row["policy_max_duration_seconds"] is not None
+            else LEGACY_MAX_SESSION_DURATION_SECONDS
+        )
+        max_expiry = int(session_row["created_at"]) + min(policy_max, GLOBAL_MAX_SESSION_DURATION_SECONDS)
         new_expiry = min(int(session_row["expires_at"]) + int(row["requested_seconds"]), max_expiry)
         connection.execute(
             "UPDATE operator_sessions SET expires_at = ? WHERE session_id = ?",

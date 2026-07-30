@@ -151,3 +151,20 @@ def test_audit_records_include_snapshot_hash(session_env, tmp_path, monkeypatch)
     assert written["snapshot_hash"] == record.snapshot_hash
     line = json.loads(log.read_text(encoding="utf-8").strip())
     assert line["snapshot_hash"] == record.snapshot_hash
+
+
+def test_allowed_profiles_are_immutable_in_session_snapshot(session_env, tmp_path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    profiles = ["default", "backend-eng"]
+    policy = sample_policy(root, root)
+    policy["allowed_profiles"] = profiles
+
+    record = sessions.create_session(policy, duration_seconds=600, session_id="ops-profiles")
+    profiles.append("unexpected-profile")
+    policy["allowed_profiles"].append("another-profile")
+
+    loaded = sessions.load_session(record.session_id)
+    assert loaded.policy["allowed_profiles"] == ["backend-eng", "default"]
+    assert "unexpected-profile" not in loaded.policy["allowed_profiles"]
+    assert "another-profile" not in loaded.policy["allowed_profiles"]

@@ -491,18 +491,33 @@ def _check_operator_policy(profile: str, hermes_root: Path | None) -> dict[str, 
         op.validate_profile_name(profile)
         profile_exists = op.profile_exists(profile, hermes_root)
         allowed = op.profile_is_allowed(profile, policy.allowed_profiles)
+        status = STATUS_PASS if profile_exists and allowed else STATUS_FAIL
+        code = "POLICY_OK" if status == STATUS_PASS else "PROFILE_NOT_EFFECTIVELY_ALLOWED"
+        message = (
+            "Operator policy parses and profile is allowed."
+            if status == STATUS_PASS
+            else "Operator policy parses, but this profile is not effectively usable."
+        )
         return _check_result(
-            status=STATUS_PASS,
+            status=status,
             layer="policy",
-            code="POLICY_OK",
-            message="Operator policy parses and profile is allowed.",
-            suggested_action="No action needed.",
+            code=code,
+            message=message,
+            suggested_action=(
+                "No action needed."
+                if status == STATUS_PASS
+                else "Compare session_allowed_profiles and process_allowed_profiles, then request a correctly scoped session or update the documented process allow-list."
+            ),
             extra={
                 "enabled": policy.enabled,
                 "level": policy.level,
                 "apply_mode": policy.apply_mode,
                 "profile_exists": profile_exists,
                 "profile_allowed": allowed,
+                "profile_allowlist_source": getattr(policy, "profile_allowlist_source", "unknown"),
+                "session_allowed_profiles": getattr(policy, "session_allowed_profiles", None),
+                "process_allowed_profiles": getattr(policy, "process_allowed_profiles", []),
+                "path_authority_source": getattr(policy, "path_authority_source", "unknown"),
             },
         )
     except Exception as exc:

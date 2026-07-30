@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import operator_delegation as delegation
@@ -13,6 +14,10 @@ class FakePolicy:
     session_id = "ops_test"
     snapshot_hash = "snapshot"
     expires_at = 9999999999
+    readable_roots = []
+    writable_roots = []
+    verbs = {"filesystem": ["edit"]}
+    allowed_profiles = ["default"]
 
     def require_enabled(self):
         return None
@@ -59,6 +64,17 @@ def test_apply_delegation_is_durable_and_excludes_terminal_web_and_skills(monkey
     assert "web" not in tool_arg
     assert "skills" not in tool_arg
     assert task["authority"]["session_id"] == "ops_test"
+    assert task["authority"]["snapshot_hash"] == "snapshot"
+    assert task["authority"]["workdir"] == str(tmp_path)
+    assert task["authority"]["mode"] == "apply"
+    assert task["authority"]["evidence_required"] is True
+    assert task["authority"]["evidence"] == ["changed_files", "substantive_output"]
+    assert task["schema_version"] == delegation.TASK_SCHEMA_VERSION
+    assert task["adapter"] == delegation.ADAPTER_NAME
+    assert task["logical_work_id"].startswith("lw_")
+    assert task["attempt_id"].startswith("da_")
+    assert task["interaction_id"].startswith("di_")
+    assert task["checkpoint_ref"]
     assert task["prompt_sha256"]
     assert task["prompt_bytes"] == len("Edit the requested file.".encode("utf-8"))
 
@@ -93,6 +109,39 @@ def test_prepare_runtime_home_is_writable_and_profile_minimal(monkeypatch, tmp_p
     assert (runtime_home / "logs").parent == runtime_home
     (runtime_home / "logs").mkdir()
     (runtime_home / "logs" / "agent.log").write_text("ok\n", encoding="utf-8")
+
+
+def test_delegate_task_forecast_reports_granted_authority(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+
+    result = json.loads(
+        delegation.hermes_delegate_task_forecast(
+            workdir=str(tmp_path),
+            mode="apply",
+            timeout=120,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["granted"] is True
+    assert result["required"]["verbs"] == {"filesystem": ["edit"]}
+    assert result["authority"]["session_id"] == "ops_test"
+    assert result["authority"]["evidence_required"] is True
+
+
+def test_delegate_task_forecast_reports_denial_without_queuing(monkeypatch, tmp_path):
+    result = json.loads(
+        delegation.hermes_delegate_task_forecast(
+            workdir=str(tmp_path),
+            mode="apply",
+            allow_web=True,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["granted"] is False
+    assert result["denial"]["code"] == "DELEGATE_TASK_FORECAST_DENIED"
 
 
 def test_apply_delegation_rejects_web_before_launch(monkeypatch, tmp_path):
@@ -131,6 +180,7 @@ def test_status_result_message_and_cancel_lifecycle(monkeypatch, tmp_path):
         "stderr": "",
         "messages": [],
         "authority": {"session_id": "ops_test", "level": "workspace", "apply_mode": "direct"},
+        "events": [],
     }
     delegation._save(task)
 
@@ -145,6 +195,283 @@ def test_status_result_message_and_cancel_lifecycle(monkeypatch, tmp_path):
     cancelled = json.loads(delegation.hermes_delegated_task_cancel(task_id))
     assert cancelled["changed"] is True
     assert delegation._load(task_id)["status"] == "cancel_requested"
+
+
+def test_assess_outcome_marks_empty_model_response_incomplete(tmp_path):
+    task = {"mode": "apply"}
+    status, reason = delegation._assess_outcome(
+        task=task,
+        rc=0,
+        stdout="No reply: the model returned empty content after retries.",
+        stderr="",
+        changed_files=["changed.txt"],
+    )
+    assert status == "incomplete"
+    assert "empty-response" in reason
+
+
+def test_assess_outcome_marks_timeout_distinct_from_failure(tmp_path):
+    status, reason = delegation._assess_outcome(
+        task={"mode": "apply"},
+        rc=124,
+        stdout="partial",
+        stderr="",
+        changed_files=[],
+    )
+    assert status == "timed_out"
+    assert "timeout" in reason
+
+
+def test_assess_outcome_requires_apply_change_evidence(tmp_path):
+    task = {"mode": "apply"}
+    status, reason = delegation._assess_outcome(
+        task=task,
+        rc=0,
+        stdout="I inspected the workspace.",
+        stderr="",
+        changed_files=[],
+    )
+    assert status == "incomplete"
+    assert "no workspace changes" in reason
+
+
+def test_assess_outcome_completes_with_output_and_change_evidence(tmp_path):
+    task = {"mode": "apply"}
+    status, reason = delegation._assess_outcome(
+        task=task,
+        rc=0,
+        stdout="Updated the requested project record.",
+        stderr="",
+        changed_files=["project.md"],
+    )
+    assert status == "completed"
+    assert "substantive output" in reason
+
+
+def test_duplicate_logical_work_returns_existing_task(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(delegation.threading.Thread, "start", lambda self: None)
+
+    first = json.loads(
+        delegation.hermes_delegate_task(
+            prompt="Edit the requested file.",
+            workdir=str(tmp_path),
+            mode="apply",
+            timeout=120,
+        )
+    )
+    second = json.loads(
+        delegation.hermes_delegate_task(
+            prompt="Edit   the requested file.",
+            workdir=str(tmp_path),
+            mode="apply",
+            timeout=120,
+        )
+    )
+
+    assert first["success"] is True
+    assert second["duplicate"] is True
+    assert second["task_id"] == first["task_id"]
+    assert second["logical_work_id"] == first["logical_work_id"]
+    assert second["resolution"] == "existing_task_returned"
+
+
+def test_checkpoint_written_for_resumable_task(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    task = {
+        "schema_version": delegation.TASK_SCHEMA_VERSION,
+        "logical_work_id": "lw_test",
+        "task_id": "dt_" + "d" * 32,
+        "attempt_id": "da_" + "a" * 32,
+        "interaction_id": "di_" + "i" * 32,
+        "continuation_sequence": 0,
+        "status": "incomplete",
+        "profile": "default",
+        "adapter": delegation.ADAPTER_NAME,
+        "workdir": str(tmp_path),
+        "changed_files": [],
+        "returncode": 0,
+        "outcome_reason": "model produced an explicit empty-response/fallback failure",
+        "stdout": "No reply: the model returned empty content after retries.",
+        "stderr": "",
+        "retry_count": 0,
+        "updated_at": 1,
+    }
+
+    path = Path(delegation._write_checkpoint(task, reason="empty response"))
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+
+    assert loaded["logical_work_id"] == "lw_test"
+    assert loaded["state"] == "incomplete"
+    assert loaded["checkpoint_id"].startswith("cp_")
+    assert "resume_instructions" in loaded
+    assert task["checkpoint_ref"] == str(path)
+
+
+def test_continuation_links_to_previous_checkpoint(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(delegation.threading.Thread, "start", lambda self: None)
+    previous_id = "dt_" + "e" * 32
+    previous = {
+        "schema_version": delegation.TASK_SCHEMA_VERSION,
+        "adapter": delegation.ADAPTER_NAME,
+        "worker_kind": "hermes-profile-worker",
+        "logical_work_id": "lw_resume",
+        "task_id": previous_id,
+        "attempt_id": "da_old",
+        "interaction_id": "di_old",
+        "continuation_sequence": 0,
+        "status": "incomplete",
+        "mode": "apply",
+        "profile": "default",
+        "workdir": str(tmp_path),
+        "max_turns": 2,
+        "timeout": 60,
+        "allow_web": False,
+        "created_at": 1,
+        "updated_at": 1,
+        "messages": [],
+        "checkpoint_ref": str(tmp_path / "checkpoint.json"),
+        "authority": {
+            "session_id": "ops_test",
+            "snapshot_hash": "snapshot",
+            "expires_at": 9999999999,
+            "profile": "default",
+            "workdir": str(tmp_path),
+            "mode": "apply",
+        },
+    }
+    delegation._save(previous)
+
+    result = json.loads(
+        delegation.hermes_delegated_task_continue(
+            previous_id,
+            "Continue only the remaining work.",
+        )
+    )
+    new_task = delegation._load(result["task_id"])
+
+    assert result["success"] is True
+    assert result["previous_task_id"] == previous_id
+    assert result["logical_work_id"] == "lw_resume"
+    assert new_task["previous_checkpoint_ref"] == previous["checkpoint_ref"]
+    assert new_task["continuation_sequence"] == 1
+    assert new_task["interaction_id"] != previous["interaction_id"]
+
+
+def test_mission_control_upsert_is_idempotent(monkeypatch, tmp_path):
+    db = tmp_path / "kanban.db"
+    with sqlite3.connect(db) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT,
+                assignee TEXT,
+                status TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                created_by TEXT,
+                created_at INTEGER NOT NULL,
+                workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+                workspace_path TEXT,
+                result TEXT,
+                idempotency_key TEXT,
+                session_id TEXT
+            );
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                run_id INTEGER,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL
+            );
+            """
+        )
+    monkeypatch.setenv(delegation.MISSION_CONTROL_DB_ENV, str(db))
+    task = {
+        "logical_work_id": "lw_mc",
+        "task_id": "dt_mc",
+        "attempt_id": "da_mc",
+        "interaction_id": "di_mc",
+        "status": "running",
+        "profile": "antigravity-operator",
+        "workdir": str(tmp_path),
+        "checkpoint_ref": None,
+        "outcome_reason": "",
+        "authority": {"session_id": "ops_test"},
+    }
+
+    delegation._record_mission_control(task, event="running")
+    task["status"] = "completed"
+    task["checkpoint_ref"] = "checkpoint"
+    delegation._record_mission_control(task, event="completed")
+
+    with sqlite3.connect(db) as connection:
+        task_count = connection.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        event_count = connection.execute("SELECT count(*) FROM task_events").fetchone()[0]
+        status = connection.execute("SELECT status FROM tasks WHERE id='lw_mc'").fetchone()[0]
+
+    assert task_count == 1
+    assert event_count == 2
+    assert status == "Completed"
+
+
+def test_require_task_authority_rejects_snapshot_replacement(monkeypatch, tmp_path):
+    class ReplacedPolicy(FakePolicy):
+        snapshot_hash = "replacement"
+
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", ReplacedPolicy)
+    task = {
+        "profile": "default",
+        "workdir": str(tmp_path),
+        "mode": "apply",
+        "authority": {
+            "session_id": "ops_test",
+            "snapshot_hash": "snapshot",
+            "expires_at": 9999999999,
+            "profile": "default",
+            "workdir": str(tmp_path),
+            "mode": "apply",
+        },
+    }
+
+    try:
+        delegation._require_task_authority(task)
+    except PermissionError as exc:
+        assert "snapshot changed" in str(exc)
+    else:
+        raise AssertionError("snapshot replacement should invalidate delegated authority")
+
+
+def test_require_task_authority_rejects_expired_envelope(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation, "_now", lambda: 100)
+    task = {
+        "profile": "default",
+        "workdir": str(tmp_path),
+        "mode": "apply",
+        "authority": {
+            "session_id": "ops_test",
+            "snapshot_hash": "snapshot",
+            "expires_at": 99,
+            "profile": "default",
+            "workdir": str(tmp_path),
+            "mode": "apply",
+        },
+    }
+
+    try:
+        delegation._require_task_authority(task)
+    except PermissionError as exc:
+        assert "expired" in str(exc)
+    else:
+        raise AssertionError("expired delegated authority should be rejected")
 
 
 def test_result_redacts_and_returns_terminal_output(monkeypatch, tmp_path):

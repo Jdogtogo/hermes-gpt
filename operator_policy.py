@@ -62,6 +62,21 @@ OPERATOR_ALLOWED_PATHS_ENV = "HERMES_GPT_OPERATOR_ALLOWED_PATHS"
 OPERATOR_DENIED_PATHS_ENV = "HERMES_GPT_OPERATOR_DENIED_PATHS"
 OWNER_ACK_ENV = "HERMES_GPT_OWNER_ACK"
 
+# Permanent, non-mutating Mission Control visibility for the session-governed
+# ChatGPT operator. These roots are used only when no approved Operator Session
+# is active. Elevated sessions continue to use their immutable approved
+# snapshots. The standing baseline deliberately excludes config, profiles,
+# logs, auth/session databases, secrets, and executable worktrees.
+STANDING_READ_ONLY_ROOTS: tuple[Path, ...] = (
+    Path("/home/jfroh/.hermes/SOUL.md"),
+    Path("/home/jfroh/.hermes/memories"),
+    Path("/home/jfroh/.hermes/skills"),
+    Path("/home/jfroh/.hermes/kanban.db"),
+    Path("/home/jfroh/.hermes/kanban/boards"),
+    Path("/home/jfroh/.hermes/cron"),
+    Path("/home/jfroh/.hermes/ops-brain"),
+)
+
 OWNER_ACK_REQUIRED_VALUE = "I_UNDERSTAND_THIS_CAN_MUTATE_MY_MACHINE"
 
 # Default audit log locations (tried in order; first writable wins).
@@ -602,6 +617,10 @@ class OperatorPolicy:
         "level",
         "apply_mode",
         "allowed_profiles",
+        "profile_allowlist_source",
+        "session_allowed_profiles",
+        "process_allowed_profiles",
+        "path_authority_source",
         "allowed_paths",
         "readable_roots",
         "writable_roots",
@@ -642,11 +661,38 @@ class OperatorPolicy:
             self.level = raw_level if raw_level in LEVELS else "workspace"
             raw_mode = str(snapshot.get("apply_mode") or "direct").strip().lower()
             self.apply_mode = raw_mode if raw_mode in {"dry_run", "direct"} else "direct"
-            self.allowed_profiles = parse_allowed_profiles(
+            # A session snapshot may carry its own immutable profile allowlist.
+            # When present, that list is authoritative, including an explicit
+            # empty list (deny all). Legacy snapshots retain the environment
+            # fallback used before allowed_profiles became snapshot-bound.
+            snapshot_allowed_profiles = snapshot.get("allowed_profiles")
+            if isinstance(snapshot_allowed_profiles, list):
+                normalized_profiles: list[str] = []
+                if "*" in snapshot_allowed_profiles:
+                    normalized_profiles = ["*"]
+                else:
+                    for item in snapshot_allowed_profiles:
+                        try:
+                            canonical = validate_profile_name(str(item))
+                        except ValueError:
+                            continue
+                        if canonical not in normalized_profiles:
+                            normalized_profiles.append(canonical)
+                self.allowed_profiles = normalized_profiles
+                self.profile_allowlist_source = "session_snapshot"
+                self.session_allowed_profiles = list(normalized_profiles)
+            else:
+                self.allowed_profiles = parse_allowed_profiles(
+                    os.environ.get(OPERATOR_ALLOWED_PROFILES_ENV)
+                )
+                self.profile_allowlist_source = "process_env_legacy_session"
+                self.session_allowed_profiles = None
+            self.process_allowed_profiles = parse_allowed_profiles(
                 os.environ.get(OPERATOR_ALLOWED_PROFILES_ENV)
             )
             self.readable_roots = [Path(p) for p in snapshot.get("readable_roots", [])]
             self.writable_roots = [Path(p) for p in snapshot.get("writable_roots", [])]
+            self.path_authority_source = "session_snapshot"
             self.allowed_paths = sorted(
                 {*self.readable_roots, *self.writable_roots},
                 key=lambda p: str(p),
@@ -685,33 +731,41 @@ class OperatorPolicy:
             raw_mode = "dry_run"
         self.apply_mode = raw_mode
 
-        # Fail-closed override: in an EXPLICITLY session-governed deployment
-        # (session root / session id set in the environment, as the operator
-        # sidecar units do), a session that is expired, revoked, missing, not
-        # approved, or malformed must not be replaceable by env-granted
-        # authority -- stale environment variables cannot outrank the
-        # authoritative session record. Env-authority deployments that never
-        # configured sessions (e.g. the local owner sidecar) are unaffected.
-        if (
-            operator_sessions.session_deployment_configured()
-            and self.session_status != "none_configured"
-        ):
+        # Fail-closed standing baseline: in an EXPLICITLY session-governed
+        # deployment, reaching this branch means there is no active approved
+        # session. Environment variables must never re-grant elevated or broad
+        # filesystem authority. Instead, retain permanent visibility only over
+        # the fixed non-secret Mission Control roots below, with zero writable
+        # roots and no execution/service/git authority. Env-authority
+        # deployments that never configured sessions remain unaffected.
+        session_governed = operator_sessions.session_deployment_configured()
+        if session_governed:
             self.level = "read_only"
             self.apply_mode = "dry_run"
 
         self.allowed_profiles = parse_allowed_profiles(
             os.environ.get(OPERATOR_ALLOWED_PROFILES_ENV)
         )
-        self.allowed_paths = parse_path_list(
-            os.environ.get(OPERATOR_ALLOWED_PATHS_ENV)
-        )
-        self.readable_roots = list(self.allowed_paths)
-        self.writable_roots = list(self.allowed_paths)
+        self.process_allowed_profiles = list(self.allowed_profiles)
+        self.session_allowed_profiles = None
+        self.profile_allowlist_source = "process_env"
+        if session_governed:
+            self.readable_roots = list(STANDING_READ_ONLY_ROOTS)
+            self.writable_roots = []
+            self.allowed_paths = list(self.readable_roots)
+            self.path_authority_source = "standing_read_only_baseline"
+        else:
+            self.allowed_paths = parse_path_list(
+                os.environ.get(OPERATOR_ALLOWED_PATHS_ENV)
+            )
+            self.readable_roots = list(self.allowed_paths)
+            self.writable_roots = list(self.allowed_paths)
+            self.path_authority_source = "process_env"
         self.egress_hosts = []
         self.git_remotes = []
         self.service_units = []
         self.allowed_branches = None
-        self.verbs = {}
+        self.verbs = {"filesystem": ["read"]} if session_governed else {}
         # Denied paths env adds to the built-in defaults; it cannot remove
         # the defaults. We don't store the env list as paths here because
         # ``is_denied_path`` already covers the built-in conservative set.
@@ -912,6 +966,12 @@ class OperatorPolicy:
             "level": self.level,
             "apply_mode": self.apply_mode,
             "allowed_profiles": list(self.allowed_profiles),
+            "profile_allowlist_source": self.profile_allowlist_source,
+            "session_allowed_profiles": self.session_allowed_profiles,
+            "process_allowed_profiles": list(self.process_allowed_profiles),
+            "path_authority_source": self.path_authority_source,
+            "readable_roots": [str(p) for p in self.readable_roots],
+            "writable_roots": [str(p) for p in self.writable_roots],
             "allowed_paths_count": len(self.allowed_paths),
             "allowed_paths_summary": [
                 str(p) for p in self.allowed_paths[:8]

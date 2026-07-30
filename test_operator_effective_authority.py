@@ -196,6 +196,29 @@ def test_missing_session_stays_read_only(session_env, tmp_path):
     assert op.OperatorPolicy().level == "read_only"
 
 
+def test_session_governed_fallback_is_permanent_fixed_read_only_baseline(
+    session_env, monkeypatch
+):
+    # Even aggressively permissive stale environment values cannot broaden
+    # authority when the deployment is session-governed and no approved
+    # session is active.
+    monkeypatch.setenv(op.OPERATOR_ENABLED_ENV, "1")
+    monkeypatch.setenv(op.OPERATOR_LEVEL_ENV, "owner")
+    monkeypatch.setenv(op.OPERATOR_APPLY_MODE_ENV, "direct")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PATHS_ENV, "/etc,/home/jfroh/.hermes/config.yaml")
+
+    policy = op.OperatorPolicy()
+
+    assert policy.level == "read_only"
+    assert policy.apply_mode == "dry_run"
+    assert policy.writable_roots == []
+    assert policy.mutation_allowed is False
+    assert policy.verbs == {"filesystem": ["read"]}
+    assert Path("/home/jfroh/.hermes/ops-brain") in policy.readable_roots
+    assert Path("/etc") not in policy.allowed_paths
+    assert Path("/home/jfroh/.hermes/config.yaml") not in policy.allowed_paths
+
+
 # 6. Malformed session state ----------------------------------------------------
 
 def test_malformed_snapshot_fails_closed(session_env, tmp_path):
@@ -322,3 +345,46 @@ def test_valid_session_does_not_override_explicit_security_failure(session_env, 
     # restore so tmp cleanup isn't affected
     os.chmod(sessions.db_path(session_env), 0o600)
     assert record.session_id  # silence unused warning
+
+
+# 10. Session-bound profile allowlists -----------------------------------------
+
+def test_active_session_profile_snapshot_overrides_stale_env(session_env, tmp_path, monkeypatch):
+    read_root = tmp_path / "read"
+    write_root = tmp_path / "ws"
+    read_root.mkdir(parents=True)
+    write_root.mkdir(parents=True)
+    policy_data = sample_policy(read_root, write_root)
+    policy_data["allowed_profiles"] = ["default", "backend-eng"]
+    record = sessions.create_session(policy_data, root=session_env)
+    sessions._write_active_pointer(record.session_id, root=session_env)
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PROFILES_ENV, "default")
+
+    policy = op.OperatorPolicy()
+    assert set(policy.allowed_profiles) == {"default", "backend-eng"}
+    assert op.profile_is_allowed("backend-eng", policy.allowed_profiles) is True
+
+
+def test_legacy_session_without_profile_snapshot_uses_env_fallback(session_env, tmp_path, monkeypatch):
+    _approved_session(session_env, tmp_path / "read", tmp_path / "ws")
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PROFILES_ENV, "default,gemini-flash")
+
+    policy = op.OperatorPolicy()
+    assert policy.allowed_profiles == ["default", "gemini-flash"]
+
+
+def test_explicit_empty_session_profile_snapshot_denies_all(session_env, tmp_path, monkeypatch):
+    read_root = tmp_path / "read"
+    write_root = tmp_path / "ws"
+    read_root.mkdir(parents=True)
+    write_root.mkdir(parents=True)
+    policy_data = sample_policy(read_root, write_root)
+    policy_data["allowed_profiles"] = []
+    record = sessions.create_session(policy_data, root=session_env)
+    sessions._write_active_pointer(record.session_id, root=session_env)
+    monkeypatch.setenv(op.OPERATOR_ALLOWED_PROFILES_ENV, "*")
+
+    policy = op.OperatorPolicy()
+    assert policy.allowed_profiles == []
+    assert op.profile_is_allowed("default", policy.allowed_profiles) is False
+    assert op.profile_is_allowed("backend-eng", policy.allowed_profiles) is False

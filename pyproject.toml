@@ -79,3 +79,4 @@ py-modules = [
 testpaths = ["."]
 python_files = ["test_*.py"]
 addopts = "-q"
+norecursedirs = [".git", ".venv", "logs", "prototypes", "skill-estate"]
