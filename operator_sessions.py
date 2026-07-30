@@ -538,6 +538,36 @@ def _audit_decision(*, request_id: str, request_type: str, decision: str, decide
         pass
 
 
+def _audit_extension_request(
+    *,
+    request_id: str,
+    session_id: str,
+    requested_seconds: int,
+    current_expires_at: int,
+) -> None:
+    """Best-effort audit for extension requests before human approval."""
+    try:
+        import operator_policy as op_policy
+        op_policy.audit_record(
+            tool="session_extension_request",
+            level="session",
+            apply_mode="request",
+            dry_run=False,
+            success=True,
+            changed=True,
+            summary="session extension requested",
+            extra={
+                "request_id": request_id,
+                "request_type": "extension",
+                "session_id": session_id,
+                "requested_seconds": requested_seconds,
+                "current_expires_at": current_expires_at,
+            },
+        )
+    except Exception:
+        pass
+
+
 def revoke_session(session_id: str, *, root: Path | None = None, now: int | None = None) -> bool:
     current = int(time.time() if now is None else now)
     with _connect(root) as connection:
@@ -560,7 +590,7 @@ def request_extension(
     itself — a separate, local-only ``approve_extension`` call is required.
     A session can never approve its own extension."""
     current = int(time.time() if now is None else now)
-    load_session(session_id, root=root, now=current)  # must be active to request
+    record = load_session(session_id, root=root, now=current)  # must be active to request
     rid = request_id or f"ext_{secrets.token_urlsafe(16)}"
     bounded_seconds = max(60, min(int(seconds), GLOBAL_MAX_SESSION_DURATION_SECONDS))
     with _connect(root) as connection:
@@ -570,6 +600,12 @@ def request_extension(
             "VALUES (?, ?, ?, ?, 'pending', NULL)",
             (rid, session_id, current, bounded_seconds),
         )
+    _audit_extension_request(
+        request_id=rid,
+        session_id=session_id,
+        requested_seconds=bounded_seconds,
+        current_expires_at=record.expires_at,
+    )
     return rid
 
 
@@ -601,6 +637,8 @@ def approve_extension(
         if row["status"] != "pending":
             raise PermissionError(f"Extension request already {row['status']}.")
         session_id = str(row["session_id"])
+        if str(decided_by) == session_id:
+            raise PermissionError("An Operator Session cannot approve its own extension.")
         session_row = connection.execute(
             "SELECT created_at, expires_at, revoked_at, approval_state, policy_max_duration_seconds "
             "FROM operator_sessions WHERE session_id = ?",
@@ -632,7 +670,11 @@ def approve_extension(
     record = load_session(session_id, root=root, now=current)
     _audit_decision(
         request_id=request_id, request_type="extension", decision="approved", decided_by=decided_by,
-        extra={"session_id": session_id, "resulting_expires_at": record.expires_at},
+        extra={
+            "session_id": session_id,
+            "requested_seconds": int(row["requested_seconds"]),
+            "resulting_expires_at": record.expires_at,
+        },
     )
     return record
 

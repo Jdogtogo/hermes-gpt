@@ -1,5 +1,9 @@
 from pathlib import Path
 
+import pytest
+
+import operator_policy as op
+import operator_sessions as sessions
 import operator_policy_templates as templates
 
 
@@ -41,3 +45,33 @@ def test_operator_service_drop_in_covers_all_active_policy_writable_roots():
                 missing.append((name, root))
 
     assert not missing, f"active policy writable roots missing from systemd sandbox: {missing}"
+
+
+def test_operator_service_policy_keeps_hard_denies_inside_systemd_boundary(tmp_path, monkeypatch):
+    allowed = _read_write_paths()
+    sensitive_path = "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"
+    assert _is_covered(sensitive_path, allowed)
+
+    resolved = templates.resolve_template("hermes-overnight-maintenance")
+    policy = {
+        **resolved["policy"],
+        "policy_template": "hermes-overnight-maintenance",
+    }
+    assert sensitive_path in policy["hard_denied_paths"]
+
+    session_root = tmp_path / "sessions"
+    monkeypatch.setenv(sessions.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.delenv(op.OPERATOR_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(op.OPERATOR_LEVEL_ENV, raising=False)
+    monkeypatch.delenv(op.OPERATOR_APPLY_MODE_ENV, raising=False)
+    monkeypatch.delenv(op.OPERATOR_ALLOWED_PATHS_ENV, raising=False)
+    record = sessions.create_session(
+        policy,
+        duration_seconds=60 * 60,
+        root=session_root,
+    )
+    sessions._write_active_pointer(record.session_id, root=session_root)
+
+    active_policy = op.OperatorPolicy()
+    with pytest.raises(PermissionError, match="hard-denied"):
+        active_policy.require_write_path(sensitive_path)

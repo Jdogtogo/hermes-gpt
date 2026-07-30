@@ -145,20 +145,48 @@ def test_extension_requires_separate_approval_and_cannot_self_approve(session_en
     pending = sessions.list_pending_extensions(root=session_env)
     assert len(pending) == 1
     assert pending[0]["request_id"] == request_id
+    with pytest.raises(PermissionError, match="cannot approve its own extension"):
+        sessions.approve_extension(
+            request_id,
+            decided_by=record.session_id,
+            root=session_env,
+        )
+    still_unchanged = sessions.load_session(record.session_id, root=session_env)
+    assert still_unchanged.expires_at == record.expires_at
+    assert sessions.list_pending_extensions(root=session_env)[0]["request_id"] == request_id
 
 
 def test_extension_approval_is_audited_with_source(session_env, audit_override):
     resolved = templates.resolve_template("sandbox")
     policy = {**resolved["policy"], "policy_template": "sandbox"}
-    record = sessions.create_session(policy, duration_seconds=3600, root=session_env)
-    request_id = sessions.request_extension(record.session_id, root=session_env)
-    sessions.approve_extension(request_id, decided_by="telegram:12345", root=session_env)
+    record = sessions.create_session(policy, duration_seconds=3600, root=session_env, now=20_000)
+    request_id = sessions.request_extension(
+        record.session_id,
+        seconds=45 * 60,
+        root=session_env,
+        now=20_100,
+    )
+    updated = sessions.approve_extension(
+        request_id,
+        decided_by="telegram:12345",
+        root=session_env,
+        now=20_100,
+    )
 
     audit = op.audit_tail(limit=10)
+    requests = [r for r in audit if r.get("tool") == "session_extension_request"]
+    assert requests
+    assert requests[-1]["request_id"] == request_id
+    assert requests[-1]["session_id"] == record.session_id
+    assert requests[-1]["requested_seconds"] == 45 * 60
+    assert requests[-1]["current_expires_at"] == record.expires_at
+
     approvals = [r for r in audit if r.get("tool") == "session_approval" and r.get("request_type") == "extension"]
     assert approvals
     assert approvals[-1]["approval_source"] == "telegram:12345"
     assert approvals[-1]["session_id"] == record.session_id
+    assert approvals[-1]["requested_seconds"] == 45 * 60
+    assert approvals[-1]["resulting_expires_at"] == updated.expires_at
 
 
 def test_policy_bound_session_durations(session_env):
