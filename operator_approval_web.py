@@ -25,6 +25,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from starlette.routing import Route
 
+import operator_approval_notify as approval_notify
 import operator_auth as op_auth
 import operator_policy as op_policy
 import operator_sessions as op_sessions
@@ -135,14 +136,17 @@ def _render_page() -> str:
     if not extension_pending:
         sections.append("<p><em>None.</em></p>")
     for item in extension_pending:
+        requested_label = approval_notify.format_requested_duration(
+            item.get("requested_seconds")
+        )
         sections.append(f"""
 <div class="card">
   <p><b>Session:</b> {esc(item.get('session_id'))}<br>
-     <b>Requested extension:</b> {esc(item.get('requested_seconds'))}s</p>
+     <b>Requested extension:</b> {esc(requested_label)}</p>
   <form method="post" action="/approvals/extension/approve" style="display:inline">
     <input type="hidden" name="csrf_token" value="{esc(csrf)}">
     <input type="hidden" name="request_id" value="{esc(item.get('request_id'))}">
-    <button type="submit">Approve 30 minutes</button>
+    <button type="submit">Approve {esc(requested_label)}</button>
   </form>
   <form method="post" action="/approvals/extension/deny" style="display:inline">
     <input type="hidden" name="csrf_token" value="{esc(csrf)}">
@@ -314,8 +318,6 @@ async def notify(request: Request):
     details = body.get("details") or {}
     if not request_type or not request_id or not isinstance(details, dict):
         return JSONResponse({"success": False}, status_code=400)
-    import operator_approval_notify as approval_notify
-
     sent = approval_notify.notify_pending_request(request_type, request_id, details)
     return JSONResponse({"success": bool(sent)})
 

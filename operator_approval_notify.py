@@ -119,12 +119,47 @@ def _format_oauth_summary(details: dict[str, Any]) -> str:
     )
 
 
+# Shown when a requested duration is missing or malformed. Approval surfaces
+# must never invent a plausible-looking number: an approver who is shown a
+# concrete duration will reasonably assume it is the real one, and would then
+# approve a request whose true size nobody displayed. Rendering the gap
+# explicitly fails closed by making it visible.
+UNKNOWN_DURATION = "an unknown duration"
+
+
+def format_requested_duration(seconds: Any) -> str:
+    """Render a requested extension duration for a human approver.
+
+    Shared by the Telegram notification and the localhost approval page so an
+    approver is shown identical information on whichever surface they use.
+
+    Fail-closed: None, booleans, non-numeric values, and non-positive values
+    all render as ``UNKNOWN_DURATION`` rather than falling back to a default
+    that would misstate what is actually being approved. ``details`` arrives
+    over the loopback /notify JSON boundary, so this must tolerate any type.
+    """
+    # bool is an int subclass; True would otherwise render as "1 second".
+    if seconds is None or isinstance(seconds, bool):
+        return UNKNOWN_DURATION
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        return UNKNOWN_DURATION
+    if value <= 0:
+        return UNKNOWN_DURATION
+    if value % 60 == 0:
+        minutes = value // 60
+        return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+    return f"{value} second" if value == 1 else f"{value} seconds"
+
+
 def _format_extension_summary(details: dict[str, Any]) -> str:
+    requested = format_requested_duration(details.get("requested_seconds"))
     return (
         "Hermes Operator extension request\n\n"
         f"Session: {str(details.get('session_id'))[:16]}\n"
         f"Current expiry: {details.get('current_expiry')}\n"
-        f"Requested extension: 30 minutes"
+        f"Requested extension: {requested}"
     )
 
 
@@ -141,7 +176,8 @@ def notify_pending_request(request_type: str, request_id: str, details: dict[str
             rows = [[("Approve once", f"hop:approve:{request_id}"), ("Deny", f"hop:deny:{request_id}")]]
         elif request_type == "extension":
             text = _format_extension_summary(details)
-            rows = [[("Approve 30 minutes", f"hop:approve:{request_id}"), ("Deny", f"hop:deny:{request_id}")]]
+            requested = format_requested_duration(details.get("requested_seconds"))
+            rows = [[(f"Approve {requested}", f"hop:approve:{request_id}"), ("Deny", f"hop:deny:{request_id}")]]
         else:
             return False
         return _send_message(text, rows)

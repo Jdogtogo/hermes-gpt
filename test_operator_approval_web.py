@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from starlette.testclient import TestClient
 
+import operator_approval_notify as approval_notify
 import operator_auth as op_auth
 import operator_policy as op_policy
 import operator_sessions as op_sessions
@@ -199,6 +200,46 @@ def test_telegram_resolve_infers_extension_type(env, audit_override):
         assert resp.status_code == 200
     updated = op_sessions.load_session(record.session_id, root=env["session_root"])
     assert updated.expires_at > record.expires_at
+
+
+def test_extension_page_shows_actual_requested_duration(env, audit_override):
+    """The approval page must show the duration actually stored for the
+    request, and must agree with what Telegram shows for the same request --
+    an approver who checks either surface has to see the same number."""
+    record = op_sessions.create_session(
+        {**op_templates.resolve_template("sandbox")["policy"], "policy_template": "sandbox"},
+        duration_seconds=3600, root=env["session_root"],
+    )
+    op_sessions.request_extension(
+        record.session_id, seconds=4 * 60 * 60, root=env["session_root"]
+    )
+    with TestClient(web.app) as client:
+        resp = client.get("/approvals")
+        assert resp.status_code == 200
+    assert "240 minutes" in resp.text
+    assert "Approve 240 minutes" in resp.text
+    # Same request, same rendering on the Telegram surface.
+    pending = op_sessions.list_pending_extensions(root=env["session_root"])[0]
+    assert approval_notify.format_requested_duration(
+        pending["requested_seconds"]
+    ) == "240 minutes"
+
+
+def test_extension_page_fails_closed_on_malformed_duration(env, audit_override, monkeypatch):
+    """A malformed stored duration must render the explicit unknown sentinel
+    rather than raising (which would 500 the whole approval page and block
+    every pending approval, not just this one)."""
+    monkeypatch.setattr(
+        op_sessions,
+        "list_pending_extensions",
+        lambda *a, **k: [
+            {"request_id": "ext_bad", "session_id": "ops_x", "requested_seconds": "not-a-number"}
+        ],
+    )
+    with TestClient(web.app) as client:
+        resp = client.get("/approvals")
+        assert resp.status_code == 200
+    assert approval_notify.UNKNOWN_DURATION in resp.text
 
 
 def test_rendered_page_never_contains_secrets(env, audit_override):
