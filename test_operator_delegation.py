@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 import operator_delegation as delegation
 
 
@@ -535,3 +537,381 @@ def test_result_redacts_and_returns_terminal_output(monkeypatch, tmp_path):
     assert result["success"] is True
     assert result["ready"] is True
     assert result["stdout"] == "done"
+
+
+ALL_LONG_HORIZON_STOPS = sorted(delegation.LONG_HORIZON_STOP_CONDITIONS)
+
+
+def _long_horizon_task(tmp_path: Path, *, status: str = "timed_out") -> dict:
+    task_id = "dt_" + "h" * 32
+    return {
+        "schema_version": delegation.TASK_SCHEMA_VERSION,
+        "adapter": delegation.ADAPTER_NAME,
+        "worker_kind": "hermes-profile-worker",
+        "logical_work_id": "lw_long_horizon",
+        "root_task_id": task_id,
+        "task_id": task_id,
+        "attempt_id": "da_long",
+        "interaction_id": "di_long",
+        "continuation_sequence": 0,
+        "status": status,
+        "mode": "apply",
+        "profile": "default",
+        "workdir": str(tmp_path),
+        "max_turns": 30,
+        "timeout": 3600,
+        "allow_web": False,
+        "created_at": 1,
+        "updated_at": 1,
+        "started_at": 1,
+        "finished_at": 2,
+        "pid": None,
+        "returncode": 124 if status == "timed_out" else 1,
+        "stdout": "partial progress" if status == "timed_out" else "",
+        "stderr": "",
+        "messages": [],
+        "changed_files": [],
+        "outcome_reason": "delegated attempt exceeded its bounded execution timeout" if status == "timed_out" else "process failed",
+        "failure_category": "timeout" if status == "timed_out" else "process_failure",
+        "provider_error_category": None,
+        "retry_count": 0,
+        "checkpoint_sequence": 1,
+        "checkpoint_ref": str(tmp_path / "checkpoint.json"),
+        "events": [],
+        "chain_cancelled": False,
+        "long_horizon": {
+            "enabled": True,
+            "total_task_window": 28800,
+            "worker_slice_timeout": 3600,
+            "maximum_continuations": 8,
+            "resume_from_checkpoint": True,
+            "stop_on": ALL_LONG_HORIZON_STOPS,
+            "envelope_started_at": 1,
+            "envelope_deadline": 9999999999,
+            "root_task_id": task_id,
+            "continuation_count": 0,
+            "consecutive_failure_count": 0,
+            "previous_failure_signature": None,
+            "latest_task_id": task_id,
+            "final_stop_reason": None,
+        },
+        "authority": {
+            "session_id": "ops_test",
+            "snapshot_hash": "snapshot",
+            "expires_at": 9999999999,
+            "profile": "default",
+            "workdir": str(tmp_path),
+            "mode": "apply",
+        },
+    }
+
+
+def test_long_horizon_accepts_eight_hour_envelope(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(delegation, "_now", lambda: 100)
+
+    result = json.loads(
+        delegation.hermes_delegate_task_forecast(
+            workdir=str(tmp_path),
+            mode="apply",
+            timeout=1800,
+            worker_slice_timeout=3600,
+            total_task_window=28800,
+            maximum_continuations=8,
+            resume_from_checkpoint=True,
+            stop_on=ALL_LONG_HORIZON_STOPS,
+        )
+    )
+
+    assert result["granted"] is True
+    assert result["required"]["total_task_window"] == 28800
+    assert result["required"]["worker_slice_timeout"] == 3600
+    assert result["required"]["maximum_continuations"] == 8
+    assert result["authority"]["long_horizon"]["envelope_deadline"] == 28900
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"worker_slice_timeout": 3601}, "worker_slice_timeout"),
+        ({"total_task_window": 28801}, "total_task_window"),
+        ({"maximum_continuations": 9}, "maximum_continuations"),
+        ({"timeout": 120, "worker_slice_timeout": 60}, "conflicts"),
+        (
+            {
+                "total_task_window": 7200,
+                "worker_slice_timeout": 3600,
+                "maximum_continuations": 1,
+                "resume_from_checkpoint": True,
+                "stop_on": ALL_LONG_HORIZON_STOPS[:-1],
+            },
+            "requires all governed",
+        ),
+        (
+            {
+                "total_task_window": 7200,
+                "worker_slice_timeout": 3600,
+                "maximum_continuations": 1,
+                "resume_from_checkpoint": True,
+                "stop_on": ALL_LONG_HORIZON_STOPS + ["forever"],
+            },
+            "Unknown stop_on",
+        ),
+    ],
+)
+def test_long_horizon_rejects_invalid_bounds(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        delegation._normalize_long_horizon(
+            timeout=kwargs.pop("timeout", 1800),
+            worker_slice_timeout=kwargs.pop("worker_slice_timeout", None),
+            total_task_window=kwargs.pop("total_task_window", None),
+            maximum_continuations=kwargs.pop("maximum_continuations", 0),
+            resume_from_checkpoint=kwargs.pop("resume_from_checkpoint", False),
+            stop_on=kwargs.pop("stop_on", None),
+            authority_expires_at=9999999999,
+            now=100,
+        )
+
+
+def test_long_horizon_rejects_window_beyond_authority_expiry():
+    with pytest.raises(PermissionError, match="authority expiry"):
+        delegation._normalize_long_horizon(
+            timeout=1800,
+            worker_slice_timeout=3600,
+            total_task_window=28800,
+            maximum_continuations=8,
+            resume_from_checkpoint=True,
+            stop_on=ALL_LONG_HORIZON_STOPS,
+            authority_expires_at=200,
+            now=100,
+        )
+
+
+@pytest.mark.parametrize(
+    ("marker", "expected_status", "expected_stop"),
+    [
+        ("COMPLETE", "completed", None),
+        ("CONTINUE", "incomplete", None),
+        ("BLOCKED_MATERIAL_SCOPE_CHANGE", "blocked", "material_scope_change"),
+        ("BLOCKED_UNSAFE_ACTION", "blocked", "unsafe_action"),
+        ("FAILED", "failed", None),
+    ],
+)
+def test_long_horizon_slice_control_protocol(marker, expected_status, expected_stop):
+    task = {"mode": "apply", "long_horizon": {"enabled": True, "final_stop_reason": None}}
+    status, _ = delegation._assess_outcome(
+        task=task,
+        rc=0,
+        stdout=f"work summary\nHERMES_SLICE_STATUS: {marker}",
+        stderr="",
+        changed_files=["changed.txt"],
+    )
+    assert status == expected_status
+    assert task["long_horizon"].get("final_stop_reason") == expected_stop
+
+
+def test_timeout_remains_resumable_even_if_output_contains_complete_marker():
+    task = {"mode": "apply", "long_horizon": {"enabled": True}}
+    status, _ = delegation._assess_outcome(
+        task=task,
+        rc=124,
+        stdout="HERMES_SLICE_STATUS: COMPLETE",
+        stderr="",
+        changed_files=["changed.txt"],
+    )
+    assert status == "timed_out"
+
+
+def test_scheduler_auto_continues_timeout(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    task = _long_horizon_task(tmp_path, status="timed_out")
+    delegation._save(task)
+    calls = []
+
+    def fake_continue(task_id, prompt, max_turns=None, timeout=None, _automatic=False):
+        calls.append((task_id, prompt, timeout, _automatic))
+        return json.dumps({"success": True, "task_id": "dt_child"})
+
+    monkeypatch.setattr(delegation, "hermes_delegated_task_continue", fake_continue)
+    delegation._schedule_automatic_continuation(task["task_id"])
+
+    assert len(calls) == 1
+    assert calls[0][0] == task["task_id"]
+    assert calls[0][2] == 3600
+    assert calls[0][3] is True
+
+
+def test_scheduler_auto_continues_explicit_continue(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    task = _long_horizon_task(tmp_path, status="incomplete")
+    task["outcome_reason"] = "long-horizon worker requested continuation from checkpoint"
+    task["failure_category"] = "evidence_failure"
+    delegation._save(task)
+    calls = []
+    monkeypatch.setattr(
+        delegation,
+        "hermes_delegated_task_continue",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or json.dumps({"success": True}),
+    )
+
+    delegation._schedule_automatic_continuation(task["task_id"])
+
+    assert calls
+    assert calls[0][1]["_automatic"] is True
+
+
+def test_scheduler_stops_on_completion(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    task = _long_horizon_task(tmp_path, status="completed")
+    task["returncode"] = 0
+    delegation._save(task)
+    monkeypatch.setattr(
+        delegation,
+        "hermes_delegated_task_continue",
+        lambda *args, **kwargs: pytest.fail("completion must not continue"),
+    )
+
+    delegation._schedule_automatic_continuation(task["task_id"])
+
+    assert delegation._load(task["task_id"])["long_horizon"]["final_stop_reason"] == "completion"
+
+
+def test_scheduler_stops_on_repeated_identical_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    task = _long_horizon_task(tmp_path, status="failed")
+    signature = delegation._failure_signature(task)
+    task["long_horizon"]["previous_failure_signature"] = signature
+    task["long_horizon"]["consecutive_failure_count"] = 1
+    delegation._save(task)
+    monkeypatch.setattr(
+        delegation,
+        "hermes_delegated_task_continue",
+        lambda *args, **kwargs: pytest.fail("repeated failure must stop"),
+    )
+
+    delegation._schedule_automatic_continuation(task["task_id"])
+
+    assert delegation._load(task["task_id"])["long_horizon"]["final_stop_reason"] == "repeated_failure"
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected_reason"),
+    [
+        (lambda task: task["long_horizon"].update({"envelope_deadline": 100}), "envelope_deadline"),
+        (lambda task: task["long_horizon"].update({"continuation_count": 8}), "continuation_limit"),
+        (lambda task: task.update({"chain_cancelled": True}), "cancelled"),
+    ],
+)
+def test_scheduler_stops_on_hard_envelope_conditions(monkeypatch, tmp_path, mutator, expected_reason):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation, "_now", lambda: 100)
+    task = _long_horizon_task(tmp_path, status="timed_out")
+    mutator(task)
+    delegation._save(task)
+    monkeypatch.setattr(
+        delegation,
+        "hermes_delegated_task_continue",
+        lambda *args, **kwargs: pytest.fail("hard stop must not continue"),
+    )
+
+    delegation._schedule_automatic_continuation(task["task_id"])
+
+    assert delegation._load(task["task_id"])["long_horizon"]["final_stop_reason"] == expected_reason
+
+
+def test_scheduler_stops_when_authority_is_withdrawn(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    task = _long_horizon_task(tmp_path, status="timed_out")
+    delegation._save(task)
+    monkeypatch.setattr(
+        delegation,
+        "_require_task_authority",
+        lambda task: (_ for _ in ()).throw(PermissionError("expired")),
+    )
+
+    delegation._schedule_automatic_continuation(task["task_id"])
+
+    assert delegation._load(task["task_id"])["long_horizon"]["final_stop_reason"] == "authority_expiry"
+
+
+def test_automatic_continuation_preserves_root_and_checkpoint(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.threading.Thread, "start", lambda self: None)
+    previous = _long_horizon_task(tmp_path, status="timed_out")
+    delegation._save(previous)
+
+    result = json.loads(
+        delegation.hermes_delegated_task_continue(
+            previous["task_id"],
+            "Continue remaining work.",
+            timeout=60,
+            _automatic=True,
+        )
+    )
+    child = delegation._load(result["task_id"])
+
+    assert result["success"] is True
+    assert result["automatic"] is True
+    assert child["root_task_id"] == previous["task_id"]
+    assert child["previous_task_id"] == previous["task_id"]
+    assert child["previous_checkpoint_ref"] == previous["checkpoint_ref"]
+    assert child["long_horizon"]["continuation_count"] == 1
+    assert child["long_horizon"]["latest_task_id"] == child["task_id"]
+    assert "HERMES_SLICE_STATUS" in child["argv"][-1]
+
+
+def test_root_status_and_result_resolve_latest_child(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    root = _long_horizon_task(tmp_path, status="timed_out")
+    child_id = "dt_" + "c" * 32
+    child = dict(root)
+    child.update(
+        {
+            "task_id": child_id,
+            "attempt_id": "da_child",
+            "interaction_id": "di_child",
+            "continuation_sequence": 1,
+            "status": "completed",
+            "returncode": 0,
+            "stdout": "final result",
+            "outcome_reason": "complete",
+            "created_at": 2,
+            "updated_at": 2,
+        }
+    )
+    child["long_horizon"] = dict(root["long_horizon"])
+    child["long_horizon"].update(
+        {"continuation_count": 1, "latest_task_id": child_id, "final_stop_reason": "completion"}
+    )
+    delegation._save(root)
+    delegation._save(child)
+
+    status = json.loads(delegation.hermes_delegated_task_status(root["task_id"]))
+    result = json.loads(delegation.hermes_delegated_task_result(root["task_id"]))
+
+    assert status["requested_task_id"] == root["task_id"]
+    assert status["latest_task_id"] == child_id
+    assert status["status"] == "completed"
+    assert result["result_task_id"] == child_id
+    assert result["stdout"] == "final result"
+    assert result["continuation_count"] == 1
+    assert result["final_stop_reason"] == "completion"
+
+
+def test_chain_cancel_handles_awaiting_continuation_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    task = _long_horizon_task(tmp_path, status="awaiting_continuation")
+    delegation._save(task)
+
+    result = json.loads(delegation.hermes_delegated_task_cancel(task["task_id"]))
+
+    assert result["success"] is True
+    assert result["chain_cancelled"] is True
+    assert delegation._load(task["task_id"])["status"] == "cancelled"

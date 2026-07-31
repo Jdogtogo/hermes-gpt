@@ -29,9 +29,19 @@ FILE_READ_SAFE_ROOT_ENV = "HERMES_FILE_READ_SAFE_ROOT"
 MAX_PROMPT_BYTES = 65536
 MAX_OUTPUT_CHARS = 20000
 MAX_TIMEOUT_SECONDS = 3600
+MAX_TOTAL_TASK_WINDOW_SECONDS = 28800
+MAX_CONTINUATIONS = 8
 MAX_TURNS = 100
 AUTHORITY_POLL_SECONDS = 2
-TASK_SCHEMA_VERSION = 2
+TASK_SCHEMA_VERSION = 3
+LONG_HORIZON_STOP_CONDITIONS = frozenset({
+    "completion",
+    "material_scope_change",
+    "unsafe_action",
+    "repeated_failure",
+    "authority_expiry",
+})
+SLICE_STATUS_PREFIX = "HERMES_SLICE_STATUS:"
 ADAPTER_NAME = "hermes-profile-delegation"
 TERMINAL_STATES = frozenset({"completed", "incomplete", "failed", "timed_out", "cancelled", "blocked"})
 RESUMABLE_STATES = frozenset({"incomplete", "failed", "timed_out", "blocked"})
@@ -212,6 +222,133 @@ def _prompt_fingerprint(prompt: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _normalize_long_horizon(
+    *,
+    timeout: int | None,
+    worker_slice_timeout: int | None,
+    total_task_window: int | None,
+    maximum_continuations: int,
+    resume_from_checkpoint: bool,
+    stop_on: list[str] | None,
+    authority_expires_at: int | None = None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Validate and materialise the bounded parent task envelope."""
+    alias_seconds = int(1800 if timeout is None else timeout)
+    if worker_slice_timeout is None:
+        slice_seconds = alias_seconds
+    else:
+        slice_seconds = int(worker_slice_timeout)
+        if timeout not in (None, 1800, slice_seconds):
+            raise ValueError("timeout conflicts with worker_slice_timeout.")
+    if not 1 <= slice_seconds <= MAX_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"worker_slice_timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds."
+        )
+
+    total_seconds = slice_seconds if total_task_window is None else int(total_task_window)
+    if not 1 <= total_seconds <= MAX_TOTAL_TASK_WINDOW_SECONDS:
+        raise ValueError(
+            f"total_task_window must be between 1 and {MAX_TOTAL_TASK_WINDOW_SECONDS} seconds."
+        )
+    if total_seconds < slice_seconds:
+        raise ValueError("total_task_window cannot be shorter than worker_slice_timeout.")
+
+    continuations = int(maximum_continuations)
+    if not 0 <= continuations <= MAX_CONTINUATIONS:
+        raise ValueError(f"maximum_continuations must be between 0 and {MAX_CONTINUATIONS}.")
+    if not isinstance(resume_from_checkpoint, bool):
+        raise ValueError("resume_from_checkpoint must be a boolean.")
+
+    supplied_stop = [] if stop_on is None else [str(value).strip() for value in stop_on]
+    stop_set = {value for value in supplied_stop if value}
+    unknown = stop_set - LONG_HORIZON_STOP_CONDITIONS
+    if unknown:
+        raise ValueError(f"Unknown stop_on condition(s): {', '.join(sorted(unknown))}.")
+
+    automatic = bool(resume_from_checkpoint or continuations or total_seconds > slice_seconds)
+    if automatic:
+        if not resume_from_checkpoint:
+            raise ValueError("resume_from_checkpoint must be true for automatic long-horizon delegation.")
+        if continuations < 1:
+            raise ValueError("maximum_continuations must be at least 1 for automatic long-horizon delegation.")
+        if stop_set != LONG_HORIZON_STOP_CONDITIONS:
+            missing = LONG_HORIZON_STOP_CONDITIONS - stop_set
+            raise ValueError(
+                "Automatic long-horizon delegation requires all governed stop_on conditions"
+                + (f": {', '.join(sorted(missing))}." if missing else ".")
+            )
+
+    started_at = int(_now() if now is None else now)
+    deadline = started_at + total_seconds
+    if authority_expires_at is not None and deadline > int(authority_expires_at):
+        raise PermissionError("total_task_window exceeds the active Operator Session authority expiry.")
+
+    return {
+        "enabled": automatic,
+        "total_task_window": total_seconds,
+        "worker_slice_timeout": slice_seconds,
+        "maximum_continuations": continuations,
+        "resume_from_checkpoint": resume_from_checkpoint,
+        "stop_on": sorted(stop_set),
+        "envelope_started_at": started_at,
+        "envelope_deadline": deadline,
+        "root_task_id": None,
+        "continuation_count": 0,
+        "consecutive_failure_count": 0,
+        "previous_failure_signature": None,
+        "latest_task_id": None,
+        "final_stop_reason": None,
+    }
+
+
+def _slice_control_status(stdout: str, stderr: str = "") -> str | None:
+    for line in reversed(f"{stdout}\n{stderr}".splitlines()):
+        stripped = line.strip()
+        if stripped.upper().startswith(SLICE_STATUS_PREFIX):
+            return stripped.split(":", 1)[1].strip().upper()
+    return None
+
+
+def _latest_task_for(task: dict[str, Any]) -> dict[str, Any]:
+    logical_work_id = task.get("logical_work_id")
+    if not logical_work_id:
+        return task
+    matches = [candidate for candidate in _iter_tasks() if candidate.get("logical_work_id") == logical_work_id]
+    if not matches:
+        return task
+    return max(
+        matches,
+        key=lambda candidate: (
+            int(candidate.get("continuation_sequence") or 0),
+            int(candidate.get("created_at") or 0),
+        ),
+    )
+
+
+def _chain_cancelled(task: dict[str, Any]) -> bool:
+    logical_work_id = task.get("logical_work_id")
+    if not logical_work_id:
+        return bool(task.get("chain_cancelled"))
+    return any(
+        bool(candidate.get("chain_cancelled"))
+        for candidate in _iter_tasks()
+        if candidate.get("logical_work_id") == logical_work_id
+    )
+
+
+def _failure_signature(task: dict[str, Any]) -> str:
+    payload = {
+        "status": task.get("status"),
+        "failure_category": task.get("failure_category"),
+        "provider_error_category": task.get("provider_error_category"),
+        "outcome_reason": task.get("outcome_reason"),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _is_fixed_antigravity_review_request(
     *,
     profile: str,
@@ -225,7 +362,14 @@ def _is_fixed_antigravity_review_request(
     return any(marker in prompt for marker in ANTIGRAVITY_REVIEW_MARKERS)
 
 
-def _logical_work_id(*, prompt: str, profile: str, mode: str, workdir: Path) -> tuple[str, dict[str, Any]]:
+def _logical_work_id(
+    *,
+    prompt: str,
+    profile: str,
+    mode: str,
+    workdir: Path,
+    execution_contract: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
     git = _git_context(workdir)
     fingerprint = {
         "profile": profile,
@@ -235,6 +379,7 @@ def _logical_work_id(*, prompt: str, profile: str, mode: str, workdir: Path) -> 
         "git_root": git.get("root"),
         "git_branch": git.get("branch"),
         "git_baseline": git.get("baseline"),
+        "execution_contract": execution_contract or {},
     }
     encoded = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
     return "lw_" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32], fingerprint
@@ -282,6 +427,8 @@ def _write_checkpoint(task: dict[str, Any], *, reason: str) -> str:
         "attempt_id": task.get("attempt_id"),
         "interaction_id": task.get("interaction_id"),
         "continuation_sequence": task.get("continuation_sequence", 0),
+        "root_task_id": task.get("root_task_id") or task.get("task_id"),
+        "long_horizon": task.get("long_horizon", {}),
         "state": task.get("status"),
         "reason": reason,
         "profile": task.get("profile"),
@@ -424,6 +571,25 @@ def _assess_outcome(*, task: dict[str, Any], rc: int, stdout: str, stderr: str, 
     """Classify substantive completion instead of trusting process exit alone."""
     if rc == 124:
         return "timed_out", "delegated attempt exceeded its bounded execution timeout"
+    long_horizon = task.get("long_horizon") or {}
+    if long_horizon.get("enabled"):
+        control = _slice_control_status(stdout, stderr)
+        if control == "COMPLETE":
+            return "completed", "long-horizon worker declared the logical task complete"
+        if control == "CONTINUE":
+            return "incomplete", "long-horizon worker requested continuation from checkpoint"
+        if control == "BLOCKED_MATERIAL_SCOPE_CHANGE":
+            long_horizon["final_stop_reason"] = "material_scope_change"
+            task["long_horizon"] = long_horizon
+            return "blocked", "worker detected a material scope change requiring renewed approval"
+        if control == "BLOCKED_UNSAFE_ACTION":
+            long_horizon["final_stop_reason"] = "unsafe_action"
+            task["long_horizon"] = long_horizon
+            return "blocked", "worker detected an unsafe action and stopped"
+        if control == "FAILED":
+            return "failed", "long-horizon worker declared the slice failed"
+        if control is not None:
+            return "failed", f"unrecognised long-horizon slice control status: {control}"
     if rc != 0:
         return "failed", f"process exited with return code {rc}"
     combined = f"{stdout}\n{stderr}".strip()
@@ -508,7 +674,16 @@ def _resolve_workdir(workdir: str) -> Path:
     return resolved
 
 
-def _build_argv(*, prompt: str, mode: str, profile: str, workdir: Path, max_turns: int, allow_web: bool) -> list[str]:
+def _build_argv(
+    *,
+    prompt: str,
+    mode: str,
+    profile: str,
+    workdir: Path,
+    max_turns: int,
+    allow_web: bool,
+    long_horizon: dict[str, Any] | None = None,
+) -> list[str]:
     # The selected profile is materialised into a task-specific HERMES_HOME by
     # _prepare_runtime_home(). Passing --profile here would make Hermes append a
     # second profiles/<name> layer beneath that isolated runtime directory.
@@ -531,6 +706,14 @@ def _build_argv(*, prompt: str, mode: str, profile: str, workdir: Path, max_turn
         )
         if allow_web:
             toolsets.append("web")
+    if long_horizon and long_horizon.get("enabled"):
+        prefix += (
+            "\nThis is one bounded slice of a durable long-horizon task. Reconcile the latest "
+            "checkpoint and current repository state before acting. Never replay completed work "
+            "or expand the approved scope. End the response with exactly one control line: "
+            "HERMES_SLICE_STATUS: COMPLETE, CONTINUE, BLOCKED_MATERIAL_SCOPE_CHANGE, "
+            "BLOCKED_UNSAFE_ACTION, or FAILED. Use CONTINUE only when useful in-scope work remains."
+        )
     argv.extend(["-t", ",".join(toolsets)])
     effective = f"{prefix}\n\nAllowed working directory: {workdir}\n\nTask:\n{prompt}"
     argv.extend(["-q", effective])
@@ -558,6 +741,108 @@ def _audit(task: dict[str, Any], *, success: bool, summary: str, error: str = ""
             "prompt_sha256": task.get("prompt_sha256"),
         },
     )
+
+
+def _record_long_horizon_stop(task: dict[str, Any], reason: str) -> None:
+    long_horizon = dict(task.get("long_horizon") or {})
+    if not long_horizon.get("enabled"):
+        return
+    long_horizon["final_stop_reason"] = reason
+    long_horizon["latest_task_id"] = task.get("task_id")
+    task["long_horizon"] = long_horizon
+    _save(task)
+    _record_mission_control(task, event="final_stop")
+
+
+def _schedule_automatic_continuation(task_id: str) -> None:
+    """Continue one logical task without exceeding its authority or hard envelope."""
+    with _LOCK:
+        task = _load(task_id)
+        long_horizon = dict(task.get("long_horizon") or {})
+        if not long_horizon.get("enabled") or not long_horizon.get("resume_from_checkpoint"):
+            return
+        long_horizon["latest_task_id"] = task_id
+        task["long_horizon"] = long_horizon
+
+        if _chain_cancelled(task) or task.get("status") == "cancelled":
+            _record_long_horizon_stop(task, "cancelled")
+            return
+        if long_horizon.get("final_stop_reason"):
+            _record_long_horizon_stop(task, str(long_horizon["final_stop_reason"]))
+            return
+        if task.get("status") == "completed":
+            _record_long_horizon_stop(task, "completion")
+            return
+        if task.get("status") == "blocked":
+            reason = "authority_expiry" if task.get("failure_category") == "permission" else "blocked"
+            _record_long_horizon_stop(task, reason)
+            return
+
+        now = _now()
+        deadline = int(long_horizon.get("envelope_deadline") or 0)
+        if not deadline or now >= deadline:
+            _record_long_horizon_stop(task, "envelope_deadline")
+            return
+        continuation_count = int(long_horizon.get("continuation_count") or 0)
+        maximum = int(long_horizon.get("maximum_continuations") or 0)
+        if continuation_count >= maximum:
+            _record_long_horizon_stop(task, "continuation_limit")
+            return
+        if task.get("status") not in RESUMABLE_STATES:
+            _record_long_horizon_stop(task, "terminal_failure")
+            return
+
+        explicit_continue = "requested continuation from checkpoint" in str(task.get("outcome_reason") or "")
+        progress_made = bool(task.get("changed_files")) or explicit_continue or (
+            task.get("status") == "timed_out" and bool(str(task.get("stdout") or "").strip())
+        )
+        if task.get("status") in {"failed", "incomplete"} and not progress_made:
+            signature = _failure_signature(task)
+            previous_signature = long_horizon.get("previous_failure_signature")
+            count = int(long_horizon.get("consecutive_failure_count") or 0)
+            count = count + 1 if previous_signature == signature else 1
+            long_horizon["previous_failure_signature"] = signature
+            long_horizon["consecutive_failure_count"] = count
+            task["long_horizon"] = long_horizon
+            if count >= 2:
+                _record_long_horizon_stop(task, "repeated_failure")
+                return
+        else:
+            long_horizon["previous_failure_signature"] = None
+            long_horizon["consecutive_failure_count"] = 0
+            task["long_horizon"] = long_horizon
+
+        try:
+            _require_task_authority(task)
+        except Exception:
+            _record_long_horizon_stop(task, "authority_expiry")
+            return
+
+        authority_expires_at = int((task.get("authority") or {}).get("expires_at") or 0)
+        remaining = min(deadline - now, authority_expires_at - now)
+        if remaining <= 0:
+            _record_long_horizon_stop(task, "authority_expiry")
+            return
+        next_timeout = min(int(long_horizon.get("worker_slice_timeout") or MAX_TIMEOUT_SECONDS), remaining)
+        _save(task)
+
+    guidance = (
+        "Automatically resume the same approved logical task from the latest durable checkpoint. "
+        "Reconcile current repository state first, preserve the exact approved scope, do not replay "
+        "completed operations, and continue only the remaining work."
+    )
+    result = json.loads(
+        hermes_delegated_task_continue(
+            task_id,
+            guidance,
+            timeout=next_timeout,
+            _automatic=True,
+        )
+    )
+    if not result.get("success"):
+        with _LOCK:
+            current = _load(task_id)
+            _record_long_horizon_stop(current, "continuation_queue_failed")
 
 
 def _worker(task_id: str) -> None:
@@ -691,6 +976,17 @@ def _worker(task_id: str) -> None:
                 pass
         with _LOCK:
             _PROCESSES.pop(task_id, None)
+    try:
+        _schedule_automatic_continuation(task_id)
+    except Exception as exc:
+        with _LOCK:
+            try:
+                task = _load(task_id)
+                if (task.get("long_horizon") or {}).get("enabled"):
+                    task["stderr"] = _safe_text(f"{task.get('stderr', '')}\nautomatic continuation error: {exc}")
+                    _record_long_horizon_stop(task, "continuation_scheduler_failure")
+            except Exception:
+                pass
 
 
 def hermes_delegate_task_forecast(
@@ -698,8 +994,13 @@ def hermes_delegate_task_forecast(
     mode: str = "apply",
     profile: str = "default",
     max_turns: int = 30,
-    timeout: int = 1800,
+    timeout: int | None = 1800,
     allow_web: bool = False,
+    total_task_window: int | None = None,
+    worker_slice_timeout: int | None = None,
+    maximum_continuations: int = 0,
+    resume_from_checkpoint: bool = False,
+    stop_on: list[str] | None = None,
 ) -> str:
     """Return the exact authority contract for a proposed task without queuing it."""
     required: dict[str, Any] = {
@@ -711,6 +1012,11 @@ def hermes_delegate_task_forecast(
         "allow_web": bool(allow_web),
         "max_turns": max_turns,
         "timeout": timeout,
+        "total_task_window": total_task_window,
+        "worker_slice_timeout": worker_slice_timeout,
+        "maximum_continuations": maximum_continuations,
+        "resume_from_checkpoint": resume_from_checkpoint,
+        "stop_on": stop_on,
         "evidence": ["changed_files", "substantive_output"] if str(mode).strip().lower() == "apply" else ["substantive_output"],
     }
     try:
@@ -718,15 +1024,37 @@ def hermes_delegate_task_forecast(
         if normalized_mode not in {"plan", "read_only", "apply"}:
             raise ValueError("mode must be plan, read_only, or apply.")
         turns = int(max_turns)
-        seconds = int(timeout)
         if not 1 <= turns <= MAX_TURNS:
             raise ValueError(f"max_turns must be between 1 and {MAX_TURNS}.")
-        if not 1 <= seconds <= MAX_TIMEOUT_SECONDS:
-            raise ValueError(f"timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds.")
         if normalized_mode == "apply" and allow_web:
             raise PermissionError("allow_web is disabled for apply delegation.")
+
         policy = op.OperatorPolicy()
         policy.require_enabled()
+        long_horizon = _normalize_long_horizon(
+            timeout=timeout,
+            worker_slice_timeout=worker_slice_timeout,
+            total_task_window=total_task_window,
+            maximum_continuations=maximum_continuations,
+            resume_from_checkpoint=resume_from_checkpoint,
+            stop_on=stop_on,
+            authority_expires_at=policy.expires_at,
+        )
+        if long_horizon["enabled"] and not policy.session_id:
+            raise PermissionError("Automatic long-horizon delegation requires an approved Operator Session.")
+        seconds = int(long_horizon["worker_slice_timeout"])
+        required.update(
+            {
+                "timeout": seconds,
+                "worker_slice_timeout": seconds,
+                "total_task_window": long_horizon["total_task_window"],
+                "maximum_continuations": long_horizon["maximum_continuations"],
+                "resume_from_checkpoint": long_horizon["resume_from_checkpoint"],
+                "stop_on": long_horizon["stop_on"],
+                "envelope_deadline": long_horizon["envelope_deadline"],
+            }
+        )
+
         canonical_profile = op.validate_profile_name(profile)
         resolved = _resolve_workdir(workdir)
         if _is_fixed_antigravity_review_request(
@@ -734,6 +1062,8 @@ def hermes_delegate_task_forecast(
             workdir=resolved,
             prompt=" ".join(ANTIGRAVITY_REVIEW_MARKERS),
         ):
+            if long_horizon["enabled"]:
+                raise PermissionError("The fixed supervised Antigravity review runner does not support generic long-horizon envelopes.")
             required["runner"] = "supervised-host-agy"
             return json.dumps(
                 {
@@ -764,7 +1094,11 @@ def hermes_delegate_task_forecast(
             max_turns=turns,
             timeout=seconds,
         )
-        return json.dumps({"success": True, "granted": True, "required": required, "authority": envelope}, indent=2)
+        envelope["long_horizon"] = long_horizon
+        return json.dumps(
+            {"success": True, "granted": True, "required": required, "authority": envelope},
+            indent=2,
+        )
     except Exception as exc:
         error = op.error_from_exception(
             exc,
@@ -781,8 +1115,13 @@ def hermes_delegate_task(
     mode: str = "apply",
     profile: str = "default",
     max_turns: int = 30,
-    timeout: int = 1800,
+    timeout: int | None = 1800,
     allow_web: bool = False,
+    total_task_window: int | None = None,
+    worker_slice_timeout: int | None = None,
+    maximum_continuations: int = 0,
+    resume_from_checkpoint: bool = False,
+    stop_on: list[str] | None = None,
 ) -> str:
     """Queue a durable Hermes task and return immediately with its task id."""
     try:
@@ -795,16 +1134,26 @@ def hermes_delegate_task(
         if normalized_mode not in {"plan", "read_only", "apply"}:
             raise ValueError("mode must be plan, read_only, or apply.")
         turns = int(max_turns)
-        seconds = int(timeout)
         if not 1 <= turns <= MAX_TURNS:
             raise ValueError(f"max_turns must be between 1 and {MAX_TURNS}.")
-        if not 1 <= seconds <= MAX_TIMEOUT_SECONDS:
-            raise ValueError(f"timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds.")
         if normalized_mode == "apply" and allow_web:
             raise PermissionError("allow_web is disabled for apply delegation.")
 
         policy = op.OperatorPolicy()
         policy.require_enabled()
+        long_horizon = _normalize_long_horizon(
+            timeout=timeout,
+            worker_slice_timeout=worker_slice_timeout,
+            total_task_window=total_task_window,
+            maximum_continuations=maximum_continuations,
+            resume_from_checkpoint=resume_from_checkpoint,
+            stop_on=stop_on,
+            authority_expires_at=policy.expires_at,
+        )
+        if long_horizon["enabled"] and not policy.session_id:
+            raise PermissionError("Automatic long-horizon delegation requires an approved Operator Session.")
+        seconds = int(long_horizon["worker_slice_timeout"])
+
         canonical_profile = op.validate_profile_name(profile)
         resolved = _resolve_workdir(workdir)
         if _is_fixed_antigravity_review_request(
@@ -812,9 +1161,9 @@ def hermes_delegate_task(
             workdir=resolved,
             prompt=prompt,
         ):
-            started = json.loads(
-                op_antigravity.hermes_antigravity_review_start(dry_run=False)
-            )
+            if long_horizon["enabled"]:
+                raise PermissionError("The fixed supervised Antigravity review runner does not support generic long-horizon envelopes.")
+            started = json.loads(op_antigravity.hermes_antigravity_review_start(dry_run=False))
             started.update(
                 {
                     "routed_from": "hermes_delegate_task",
@@ -838,22 +1187,35 @@ def hermes_delegate_task(
             profile=canonical_profile,
             mode=normalized_mode,
             workdir=resolved,
+            execution_contract={
+                "total_task_window": long_horizon["total_task_window"],
+                "worker_slice_timeout": long_horizon["worker_slice_timeout"],
+                "maximum_continuations": long_horizon["maximum_continuations"],
+                "resume_from_checkpoint": long_horizon["resume_from_checkpoint"],
+                "stop_on": long_horizon["stop_on"],
+            },
         )
         with _LOCK:
             existing = _find_existing_logical_work(logical_work_id)
         if existing is not None:
+            existing = _latest_task_for(existing)
             existing_status = str(existing.get("status") or "unknown")
+            existing_long_horizon = existing.get("long_horizon") or {}
             duplicate_result = {
                 "success": True,
                 "duplicate": True,
                 "logical_work_id": logical_work_id,
                 "task_id": existing.get("task_id"),
+                "root_task_id": existing.get("root_task_id") or existing.get("task_id"),
+                "latest_task_id": existing.get("task_id"),
                 "status": existing_status,
                 "mode": existing.get("mode"),
                 "workdir": existing.get("workdir"),
                 "resolution": "existing_task_returned",
                 "resumable": existing_status in RESUMABLE_STATES,
                 "checkpoint_ref": existing.get("checkpoint_ref"),
+                "continuation_count": existing_long_horizon.get("continuation_count", 0),
+                "final_stop_reason": existing_long_horizon.get("final_stop_reason"),
             }
             if existing_status == "completed":
                 duplicate_result["resolution"] = "already_completed"
@@ -866,12 +1228,33 @@ def hermes_delegate_task(
         task_id = "dt_" + uuid.uuid4().hex
         attempt_id = "da_" + uuid.uuid4().hex
         interaction_id = "di_" + uuid.uuid4().hex
-        argv = _build_argv(prompt=prompt, mode=normalized_mode, profile=canonical_profile, workdir=resolved, max_turns=turns, allow_web=bool(allow_web))
+        long_horizon["root_task_id"] = task_id
+        long_horizon["latest_task_id"] = task_id
+        argv = _build_argv(
+            prompt=prompt,
+            mode=normalized_mode,
+            profile=canonical_profile,
+            workdir=resolved,
+            max_turns=turns,
+            allow_web=bool(allow_web),
+            long_horizon=long_horizon,
+        )
+        authority = _capture_authority_envelope(
+            policy,
+            profile=canonical_profile,
+            workdir=resolved,
+            mode=normalized_mode,
+            allow_web=bool(allow_web),
+            max_turns=turns,
+            timeout=seconds,
+        )
+        authority["long_horizon"] = long_horizon
         task: dict[str, Any] = {
             "schema_version": TASK_SCHEMA_VERSION,
             "adapter": ADAPTER_NAME,
             "worker_kind": "antigravity-profile-worker" if canonical_profile == "antigravity-operator" else "hermes-profile-worker",
             "logical_work_id": logical_work_id,
+            "root_task_id": task_id,
             "task_id": task_id,
             "attempt_id": attempt_id,
             "interaction_id": interaction_id,
@@ -905,15 +1288,9 @@ def hermes_delegate_task(
             "checkpoint_sequence": 0,
             "checkpoint_ref": None,
             "events": [],
-            "authority": _capture_authority_envelope(
-                policy,
-                profile=canonical_profile,
-                workdir=resolved,
-                mode=normalized_mode,
-                allow_web=bool(allow_web),
-                max_turns=turns,
-                timeout=seconds,
-            ),
+            "chain_cancelled": False,
+            "long_horizon": long_horizon,
+            "authority": authority,
         }
         _transition(task, "queued", reason="delegated task queued")
         with _LOCK:
@@ -923,7 +1300,24 @@ def hermes_delegate_task(
         thread = threading.Thread(target=_worker, args=(task_id,), daemon=True, name=f"hermes-delegate-{task_id[-8:]}")
         thread.start()
         _audit(task, success=True, summary="delegated task queued")
-        return json.dumps({"success": True, "logical_work_id": logical_work_id, "task_id": task_id, "attempt_id": attempt_id, "interaction_id": interaction_id, "status": "queued", "mode": normalized_mode, "workdir": str(resolved)}, indent=2)
+        return json.dumps(
+            {
+                "success": True,
+                "logical_work_id": logical_work_id,
+                "root_task_id": task_id,
+                "task_id": task_id,
+                "latest_task_id": task_id,
+                "attempt_id": attempt_id,
+                "interaction_id": interaction_id,
+                "status": "queued",
+                "mode": normalized_mode,
+                "workdir": str(resolved),
+                "continuation_count": 0,
+                "maximum_continuations": long_horizon["maximum_continuations"],
+                "envelope_deadline": long_horizon["envelope_deadline"],
+            },
+            indent=2,
+        )
     except Exception as exc:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATE_TASK_ERROR", suggested_action="Use an approved workspace, active Operator Session, allowed profile, and bounded task settings."), indent=2)
 
@@ -931,7 +1325,9 @@ def hermes_delegate_task(
 def hermes_delegated_task_status(task_id: str) -> str:
     try:
         with _LOCK:
-            task = _load(task_id)
+            requested = _load(task_id)
+            task = _latest_task_for(requested)
+        long_horizon = task.get("long_horizon") or {}
         keys = (
             "schema_version", "adapter", "worker_kind", "logical_work_id",
             "task_id", "attempt_id", "interaction_id", "continuation_sequence",
@@ -941,7 +1337,21 @@ def hermes_delegated_task_status(task_id: str) -> str:
             "provider_error_category", "retry_count", "checkpoint_ref",
             "checkpoint_sequence", "authority",
         )
-        return json.dumps({"success": True, **{key: task.get(key) for key in keys}}, indent=2)
+        payload = {"success": True, **{key: task.get(key) for key in keys}}
+        payload.update(
+            {
+                "requested_task_id": task_id,
+                "root_task_id": task.get("root_task_id") or requested.get("root_task_id") or requested.get("task_id"),
+                "latest_task_id": task.get("task_id"),
+                "latest_status": task.get("status"),
+                "continuation_count": long_horizon.get("continuation_count", task.get("continuation_sequence", 0)),
+                "maximum_continuations": long_horizon.get("maximum_continuations", 0),
+                "envelope_deadline": long_horizon.get("envelope_deadline"),
+                "final_stop_reason": long_horizon.get("final_stop_reason"),
+                "long_horizon": long_horizon,
+            }
+        )
+        return json.dumps(payload, indent=2)
     except Exception as exc:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATED_TASK_STATUS_ERROR", suggested_action="Check the delegated task id."), indent=2)
 
@@ -949,29 +1359,58 @@ def hermes_delegated_task_status(task_id: str) -> str:
 def hermes_delegated_task_result(task_id: str) -> str:
     try:
         with _LOCK:
-            task = _load(task_id)
+            requested = _load(task_id)
+            task = _latest_task_for(requested)
+        long_horizon = task.get("long_horizon") or {}
         if task["status"] not in TERMINAL_STATES:
-            return json.dumps({"success": True, "task_id": task_id, "status": task["status"], "ready": False}, indent=2)
+            if not long_horizon:
+                return json.dumps(
+                    {"success": True, "task_id": task_id, "status": task["status"], "ready": False},
+                    indent=2,
+                )
+            return json.dumps(
+                {
+                    "success": True,
+                    "task_id": task_id,
+                    "root_task_id": task.get("root_task_id") or requested.get("root_task_id") or requested.get("task_id"),
+                    "latest_task_id": task.get("task_id"),
+                    "status": task["status"],
+                    "ready": False,
+                    "continuation_count": long_horizon.get("continuation_count", task.get("continuation_sequence", 0)),
+                    "maximum_continuations": long_horizon.get("maximum_continuations", 0),
+                    "envelope_deadline": long_horizon.get("envelope_deadline"),
+                    "final_stop_reason": long_horizon.get("final_stop_reason"),
+                },
+                indent=2,
+            )
         return json.dumps({
             "success": task["status"] == "completed",
             "logical_work_id": task.get("logical_work_id"),
             "task_id": task_id,
+            "result_task_id": task.get("task_id"),
+            "root_task_id": task.get("root_task_id") or requested.get("root_task_id") or requested.get("task_id"),
+            "latest_task_id": task.get("task_id"),
             "attempt_id": task.get("attempt_id"),
             "interaction_id": task.get("interaction_id"),
             "continuation_sequence": task.get("continuation_sequence", 0),
+            "continuation_count": long_horizon.get("continuation_count", task.get("continuation_sequence", 0)),
+            "maximum_continuations": long_horizon.get("maximum_continuations", 0),
+            "envelope_deadline": long_horizon.get("envelope_deadline"),
+            "final_stop_reason": long_horizon.get("final_stop_reason"),
             "status": task["status"],
             "ready": True,
-            "returncode": task["returncode"],
-            "stdout": task["stdout"],
-            "stderr": task["stderr"],
-            "messages": task["messages"],
+            "returncode": task.get("returncode"),
+            "stdout": task.get("stdout", ""),
+            "stderr": task.get("stderr", ""),
+            "messages": task.get("messages", []),
             "changed_files": task.get("changed_files", []),
             "outcome_reason": task.get("outcome_reason", ""),
             "failure_category": task.get("failure_category"),
             "provider_error_category": task.get("provider_error_category"),
             "checkpoint_ref": task.get("checkpoint_ref"),
-            "resumable": task["status"] in RESUMABLE_STATES,
+            "resumable": task["status"] in RESUMABLE_STATES and not bool(long_horizon.get("final_stop_reason")),
             "authority": task.get("authority", {}),
+            "long_horizon": long_horizon,
         }, indent=2)
     except Exception as exc:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATED_TASK_RESULT_ERROR", suggested_action="Check the delegated task id."), indent=2)
@@ -998,24 +1437,33 @@ def hermes_delegated_task_continue(
     prompt: str,
     max_turns: int | None = None,
     timeout: int | None = None,
+    _automatic: bool = False,
 ) -> str:
-    """Queue an explicit continuation from the latest checkpoint.
-
-    Continuation is deliberately not automatic: authority, scope, and current
-    repository state must still be reconciled by the caller before this is
-    invoked. The new attempt remains linked to the original logical work item.
-    """
+    """Queue a continuation from the latest durable checkpoint."""
     try:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("continuation prompt is required.")
         if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
             raise ValueError(f"continuation prompt exceeds {MAX_PROMPT_BYTES} bytes.")
         with _LOCK:
-            previous = _load(task_id)
+            requested = _load(task_id)
+            previous = _latest_task_for(requested)
+        previous_id = str(previous.get("task_id") or task_id)
         previous_status = str(previous.get("status") or "")
         if previous_status not in RESUMABLE_STATES:
-            raise PermissionError(f"Task {task_id!r} is not in a resumable state.")
+            raise PermissionError(f"Task {previous_id!r} is not in a resumable state.")
+        if _chain_cancelled(previous):
+            raise PermissionError("The delegated task chain has been cancelled.")
         _require_task_authority(previous)
+
+        long_horizon = dict(previous.get("long_horizon") or {})
+        if _automatic:
+            if not long_horizon.get("enabled") or not long_horizon.get("resume_from_checkpoint"):
+                raise PermissionError("Automatic continuation is not enabled for this task.")
+            if long_horizon.get("final_stop_reason"):
+                raise PermissionError("The long-horizon envelope has already reached a governed stop condition.")
+            if int(long_horizon.get("continuation_count") or 0) >= int(long_horizon.get("maximum_continuations") or 0):
+                raise PermissionError("The long-horizon continuation limit has been reached.")
 
         mode = str(previous.get("mode") or "read_only")
         profile = str(previous.get("profile") or "default")
@@ -1029,8 +1477,8 @@ def hermes_delegated_task_continue(
         continuation_sequence = int(previous.get("continuation_sequence") or 0) + 1
         continuation_id = "dc_" + uuid.uuid4().hex
         continuation_prompt = (
-            f"Continue delegated task {task_id} from checkpoint {previous.get('checkpoint_ref') or '<none>'}.\n"
-            "First reconcile current repository state against the checkpoint. "
+            f"Continue delegated task {previous_id} from checkpoint {previous.get('checkpoint_ref') or '<none>'}.\n"
+            "First reconcile current repository state against the checkpoint and preserve the exact approved scope. "
             "Do not replay completed operations. Continue only remaining work.\n\n"
             f"Continuation guidance:\n{prompt.strip()}"
         )
@@ -1038,6 +1486,12 @@ def hermes_delegated_task_continue(
         new_task_id = "dt_" + uuid.uuid4().hex
         attempt_id = "da_" + uuid.uuid4().hex
         interaction_id = "di_" + uuid.uuid4().hex
+        root_task_id = str(previous.get("root_task_id") or previous_id)
+        if long_horizon:
+            long_horizon["root_task_id"] = root_task_id
+            long_horizon["continuation_count"] = int(long_horizon.get("continuation_count") or 0) + 1
+            long_horizon["latest_task_id"] = new_task_id
+            long_horizon["final_stop_reason"] = None
         argv = _build_argv(
             prompt=continuation_prompt,
             mode=mode,
@@ -1045,18 +1499,24 @@ def hermes_delegated_task_continue(
             workdir=workdir,
             max_turns=turns,
             allow_web=bool(previous.get("allow_web", False)),
+            long_horizon=long_horizon,
         )
+        authority = json.loads(json.dumps(previous.get("authority", {})))
+        authority["timeout"] = seconds
+        if long_horizon:
+            authority["long_horizon"] = long_horizon
         task: dict[str, Any] = {
             "schema_version": TASK_SCHEMA_VERSION,
             "adapter": ADAPTER_NAME,
             "worker_kind": previous.get("worker_kind") or ("antigravity-profile-worker" if profile == "antigravity-operator" else "hermes-profile-worker"),
             "logical_work_id": previous.get("logical_work_id") or task_id,
+            "root_task_id": root_task_id,
             "task_id": new_task_id,
             "attempt_id": attempt_id,
             "interaction_id": interaction_id,
             "continuation_id": continuation_id,
             "continuation_sequence": continuation_sequence,
-            "previous_task_id": task_id,
+            "previous_task_id": previous_id,
             "previous_checkpoint_ref": previous.get("checkpoint_ref"),
             "status": "queued",
             "mode": mode,
@@ -1086,26 +1546,32 @@ def hermes_delegated_task_continue(
             "checkpoint_sequence": 0,
             "checkpoint_ref": None,
             "events": [],
-            "authority": previous.get("authority", {}),
+            "chain_cancelled": False,
+            "long_horizon": long_horizon,
+            "authority": authority,
         }
-        _transition(task, "queued", reason="continuation queued")
+        _transition(task, "queued", reason="automatic continuation queued" if _automatic else "continuation queued")
         with _LOCK:
-            _write_checkpoint(task, reason="continuation queued")
+            _write_checkpoint(task, reason="automatic continuation queued" if _automatic else "continuation queued")
             _save(task)
-        _record_mission_control(task, event="continuation_queued")
+        _record_mission_control(task, event="automatic_continuation_queued" if _automatic else "continuation_queued")
         thread = threading.Thread(target=_worker, args=(new_task_id,), daemon=True, name=f"hermes-delegate-{new_task_id[-8:]}")
         thread.start()
-        _audit(task, success=True, summary=f"delegated task continuation queued from {task_id}")
+        _audit(task, success=True, summary=f"delegated task continuation queued from {previous_id}")
         return json.dumps(
             {
                 "success": True,
                 "logical_work_id": task.get("logical_work_id"),
+                "root_task_id": root_task_id,
                 "task_id": new_task_id,
-                "previous_task_id": task_id,
+                "latest_task_id": new_task_id,
+                "previous_task_id": previous_id,
                 "attempt_id": attempt_id,
                 "interaction_id": interaction_id,
                 "continuation_id": continuation_id,
                 "continuation_sequence": continuation_sequence,
+                "continuation_count": long_horizon.get("continuation_count", continuation_sequence),
+                "automatic": _automatic,
                 "status": "queued",
                 "mode": mode,
                 "workdir": str(workdir),
@@ -1121,17 +1587,51 @@ def hermes_delegated_task_cancel(task_id: str) -> str:
         policy = op.OperatorPolicy()
         policy.require_level("workspace")
         policy.require_mutation(dry_run=False)
+        changed = False
+        affected: list[dict[str, Any]] = []
         with _LOCK:
-            task = _load(task_id)
-            if task["status"] in TERMINAL_STATES:
-                return json.dumps({"success": True, "task_id": task_id, "status": task["status"], "changed": False}, indent=2)
-            _transition(task, "cancel_requested", reason="operator requested cancellation")
-            _write_checkpoint(task, reason="operator requested cancellation")
-            _save(task)
-            process = _PROCESSES.get(task_id)
-            if process is not None and process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-        _record_mission_control(task, event="cancel_requested")
-        return json.dumps({"success": True, "task_id": task_id, "status": "cancel_requested", "changed": True}, indent=2)
+            requested = _load(task_id)
+            logical_work_id = requested.get("logical_work_id")
+            chain = [
+                candidate
+                for candidate in _iter_tasks()
+                if logical_work_id and candidate.get("logical_work_id") == logical_work_id
+            ] or [requested]
+            for task in chain:
+                if not task.get("chain_cancelled"):
+                    changed = True
+                task["chain_cancelled"] = True
+                long_horizon = dict(task.get("long_horizon") or {})
+                if long_horizon.get("enabled"):
+                    long_horizon["final_stop_reason"] = "cancelled"
+                    task["long_horizon"] = long_horizon
+                status = str(task.get("status") or "")
+                if status not in TERMINAL_STATES and status != "cancel_requested":
+                    allowed = LEGAL_TRANSITIONS.get(status, set())
+                    target = "cancel_requested" if "cancel_requested" in allowed else "cancelled"
+                    _transition(task, target, reason="operator requested chain cancellation")
+                    changed = True
+                _write_checkpoint(task, reason="operator requested chain cancellation")
+                _save(task)
+                process = _PROCESSES.get(str(task.get("task_id")))
+                if process is not None and process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    changed = True
+                affected.append(task)
+        for task in affected:
+            _record_mission_control(task, event="cancel_requested")
+        latest = _latest_task_for(requested)
+        return json.dumps(
+            {
+                "success": True,
+                "task_id": task_id,
+                "root_task_id": latest.get("root_task_id") or requested.get("root_task_id") or requested.get("task_id"),
+                "latest_task_id": latest.get("task_id"),
+                "status": latest.get("status"),
+                "changed": changed,
+                "chain_cancelled": True,
+            },
+            indent=2,
+        )
     except Exception as exc:
         return json.dumps(op.error_from_exception(exc, layer="operator", code="DELEGATED_TASK_CANCEL_ERROR", suggested_action="Use an active workspace Operator Session and check the task id."), indent=2)

@@ -638,3 +638,81 @@ def test_http_initialize_smoke(monkeypatch):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+
+def test_delegate_task_wrapper_passes_long_horizon_fields(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_delegate(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr(server.op_delegation, "hermes_delegate_task", fake_delegate)
+    result = json.loads(
+        server.hermes_delegate_task(
+            prompt="Review the repository.",
+            workdir=str(tmp_path),
+            mode="read_only",
+            profile="default",
+            max_turns=50,
+            timeout=1800,
+            allow_web=False,
+            total_task_window=28800,
+            worker_slice_timeout=3600,
+            maximum_continuations=8,
+            resume_from_checkpoint=True,
+            stop_on=[
+                "completion",
+                "material_scope_change",
+                "unsafe_action",
+                "repeated_failure",
+                "authority_expiry",
+            ],
+        )
+    )
+
+    assert result["success"] is True
+    assert captured["total_task_window"] == 28800
+    assert captured["worker_slice_timeout"] == 3600
+    assert captured["maximum_continuations"] == 8
+    assert captured["resume_from_checkpoint"] is True
+    assert set(captured["stop_on"]) == {
+        "completion",
+        "material_scope_change",
+        "unsafe_action",
+        "repeated_failure",
+        "authority_expiry",
+    }
+
+
+def test_delegate_forecast_wrapper_passes_long_horizon_fields(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_forecast(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True, "granted": True})
+
+    monkeypatch.setattr(server.op_delegation, "hermes_delegate_task_forecast", fake_forecast)
+    result = json.loads(
+        server.hermes_delegate_task_forecast(
+            workdir=str(tmp_path),
+            mode="read_only",
+            total_task_window=28800,
+            worker_slice_timeout=3600,
+            maximum_continuations=8,
+            resume_from_checkpoint=True,
+            stop_on=[
+                "completion",
+                "material_scope_change",
+                "unsafe_action",
+                "repeated_failure",
+                "authority_expiry",
+            ],
+        )
+    )
+
+    assert result["granted"] is True
+    assert captured["total_task_window"] == 28800
+    assert captured["worker_slice_timeout"] == 3600
+    assert captured["maximum_continuations"] == 8
+    assert captured["resume_from_checkpoint"] is True

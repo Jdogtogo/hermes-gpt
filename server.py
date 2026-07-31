@@ -1296,8 +1296,13 @@ def hermes_delegate_task_forecast(
     mode: str = "apply",
     profile: str = "default",
     max_turns: int = 30,
-    timeout: int = 1800,
+    timeout: int | None = 1800,
     allow_web: bool = False,
+    total_task_window: int | None = None,
+    worker_slice_timeout: int | None = None,
+    maximum_continuations: int = 0,
+    resume_from_checkpoint: bool = False,
+    stop_on: list[str] | None = None,
 ) -> str:
     """Forecast the authority required for a delegated task without queuing it."""
     return op_delegation.hermes_delegate_task_forecast(
@@ -1307,6 +1312,11 @@ def hermes_delegate_task_forecast(
         max_turns=max_turns,
         timeout=timeout,
         allow_web=allow_web,
+        total_task_window=total_task_window,
+        worker_slice_timeout=worker_slice_timeout,
+        maximum_continuations=maximum_continuations,
+        resume_from_checkpoint=resume_from_checkpoint,
+        stop_on=stop_on,
     )
 
 
@@ -1316,8 +1326,13 @@ def hermes_delegate_task(
     mode: str = "apply",
     profile: str = "default",
     max_turns: int = 30,
-    timeout: int = 1800,
+    timeout: int | None = 1800,
     allow_web: bool = False,
+    total_task_window: int | None = None,
+    worker_slice_timeout: int | None = None,
+    maximum_continuations: int = 0,
+    resume_from_checkpoint: bool = False,
+    stop_on: list[str] | None = None,
 ) -> str:
     """Queue a durable, workspace-confined Hermes task."""
     return op_delegation.hermes_delegate_task(
@@ -1328,6 +1343,11 @@ def hermes_delegate_task(
         max_turns=max_turns,
         timeout=timeout,
         allow_web=allow_web,
+        total_task_window=total_task_window,
+        worker_slice_timeout=worker_slice_timeout,
+        maximum_continuations=maximum_continuations,
+        resume_from_checkpoint=resume_from_checkpoint,
+        stop_on=stop_on,
     )
 
 
