@@ -523,6 +523,168 @@ def hermes_operator_service_restart(
 
 
 # ---------------------------------------------------------------------------
+# Narrow approval-web service restart
+# ---------------------------------------------------------------------------
+
+
+_APPROVAL_WEB_SERVICE_UNIT = "hermes-gpt-approval-web.service"
+_APPROVAL_WEB_RESTART_TEMPLATE = "hermes-approval-web-maintenance"
+_APPROVAL_WEB_RESTART_DELAY_SECONDS = 3
+
+
+def _approval_web_service_restart_argv(
+    *,
+    systemd_run_binary: str,
+    systemctl_binary: str,
+    schedule_unit: str,
+) -> list[str]:
+    return [
+        systemd_run_binary,
+        "--user",
+        f"--unit={schedule_unit}",
+        f"--on-active={_APPROVAL_WEB_RESTART_DELAY_SECONDS}s",
+        "--collect",
+        systemctl_binary,
+        "--user",
+        "restart",
+        _APPROVAL_WEB_SERVICE_UNIT,
+    ]
+
+
+def hermes_approval_web_service_restart(
+    dry_run: bool = True,
+    runner=None,
+    systemd_run_binary: str | None = None,
+    systemctl_binary: str | None = None,
+) -> str:
+    """Queue an exact, delayed restart of the localhost approval web service."""
+
+    try:
+        # Single authoritative policy-resolution path: OperatorPolicy() derives
+        # its entire session authority (level, apply_mode, verbs, service_units,
+        # AND policy_template) from one resolve_effective_authority() snapshot.
+        # Every gate condition below reads that same object; the tool never
+        # performs a second, independently resolved lookup that could disagree
+        # with the authority actually being enforced.
+        policy = op.OperatorPolicy()
+        policy.require_level("workspace")
+        if policy.session_status != "active" or policy.session_id is None:
+            state = policy.session_status or "unknown"
+            raise PermissionError(
+                "Approval web service restart requires an active, approved Operator "
+                f"Session (current session state: {state!r})."
+            )
+        if policy.policy_template != _APPROVAL_WEB_RESTART_TEMPLATE:
+            raise PermissionError(
+                "Approval web service restart requires the "
+                f"{_APPROVAL_WEB_RESTART_TEMPLATE!r} policy template "
+                f"(active session template: {policy.policy_template!r})."
+            )
+        policy.require_verb("services", "restart")
+        if _APPROVAL_WEB_SERVICE_UNIT not in set(policy.service_units):
+            raise PermissionError(
+                f"Service unit {_APPROVAL_WEB_SERVICE_UNIT!r} is not granted by this Operator Session."
+            )
+
+        schedule_unit = (
+            f"hermes-gpt-approval-web-restart-{os.getpid()}-{time.time_ns()}"
+        )
+        selected_systemd_run = (
+            systemd_run_binary or shutil.which("systemd-run") or "systemd-run"
+        )
+        selected_systemctl = (
+            systemctl_binary or shutil.which("systemctl") or "systemctl"
+        )
+        argv = _approval_web_service_restart_argv(
+            systemd_run_binary=selected_systemd_run,
+            systemctl_binary=selected_systemctl,
+            schedule_unit=schedule_unit,
+        )
+
+        if policy.effective_dry_run(dry_run):
+            plan = {
+                "would_schedule_restart": True,
+                "service_unit": _APPROVAL_WEB_SERVICE_UNIT,
+                "delay_seconds": _APPROVAL_WEB_RESTART_DELAY_SECONDS,
+                "argv": argv,
+                "shell": False,
+            }
+            op.audit_record(
+                tool="hermes_approval_web_service_restart",
+                level=policy.level,
+                apply_mode=policy.apply_mode,
+                dry_run=True,
+                success=True,
+                changed=False,
+                summary="dry-run approval web service restart plan",
+                extra={
+                    "service_unit": _APPROVAL_WEB_SERVICE_UNIT,
+                    "delay_seconds": _APPROVAL_WEB_RESTART_DELAY_SECONDS,
+                },
+            )
+            return json.dumps({"success": True, "dry_run": True, "plan": plan}, indent=2)
+
+        policy.require_mutation(dry_run)
+        if systemd_run_binary is None and shutil.which("systemd-run") is None:
+            raise RuntimeError("systemd-run is required to schedule the approval web service restart.")
+        if systemctl_binary is None and shutil.which("systemctl") is None:
+            raise RuntimeError("systemctl is required to restart the approval web service.")
+
+        run_fn = runner or op.run_argv
+        rc, stdout, stderr = run_fn(argv, timeout=30, workdir=None)
+        result = {
+            "success": rc == 0,
+            "dry_run": False,
+            "scheduled": rc == 0,
+            "service_unit": _APPROVAL_WEB_SERVICE_UNIT,
+            "delay_seconds": _APPROVAL_WEB_RESTART_DELAY_SECONDS,
+            "returncode": rc,
+            "stdout": op.redact_output(stdout),
+            "stderr": op.redact_output(stderr),
+            "note": "The localhost approval service will briefly restart; pending approvals remain stored.",
+        }
+        op.audit_record(
+            tool="hermes_approval_web_service_restart",
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=rc == 0,
+            changed=rc == 0,
+            summary=f"scheduled approval web service restart rc={rc}",
+            error=op.redact_output(stderr) if rc != 0 else "",
+            extra={
+                "service_unit": _APPROVAL_WEB_SERVICE_UNIT,
+                "delay_seconds": _APPROVAL_WEB_RESTART_DELAY_SECONDS,
+                "schedule_unit": schedule_unit,
+            },
+        )
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        op.audit_record(
+            tool="hermes_approval_web_service_restart",
+            level="unknown",
+            apply_mode="unknown",
+            dry_run=dry_run,
+            success=False,
+            changed=False,
+            error=str(exc),
+            extra={"service_unit": _APPROVAL_WEB_SERVICE_UNIT},
+        )
+        return json.dumps(
+            op.error_from_exception(
+                exc,
+                layer="operator",
+                code="APPROVAL_WEB_SERVICE_RESTART_ERROR",
+                suggested_action=(
+                    "Use an active hermes-approval-web-maintenance session whose immutable "
+                    "policy grants services:restart for the exact approval web unit."
+                ),
+            ),
+            indent=2,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Workspace read / patch / write_file / run_test
 # ---------------------------------------------------------------------------
 

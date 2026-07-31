@@ -32,6 +32,8 @@ import operator_workspace as ows
 
 MAINTENANCE = "hermes-gpt-operator-maintenance"
 OPERATOR_UNIT = "hermes-gpt-chatgpt-operator.service"
+APPROVAL_WEB_MAINTENANCE = "hermes-approval-web-maintenance"
+APPROVAL_WEB_UNIT = "hermes-gpt-approval-web.service"
 
 
 @pytest.fixture
@@ -243,3 +245,49 @@ def test_non_maintenance_policy_restart_denied(session_root):
     parsed = json.loads(out)
     assert parsed["success"] is False
     assert "policy template" in parsed["error"].lower()
+
+
+# 7. Approval-web bootstrap restart -------------------------------------------
+
+def test_approval_web_maintenance_schedules_exact_unit(session_root):
+    _request_and_approve(
+        session_root,
+        APPROVAL_WEB_MAINTENANCE,
+        decided_by="telegram:8595123783",
+    )
+    captured = {}
+
+    def fake_runner(argv, timeout=120, workdir=None):
+        captured["argv"] = argv
+        captured["timeout"] = timeout
+        return (0, "Running timer as unit", "")
+
+    out = ows.hermes_approval_web_service_restart(
+        dry_run=False,
+        runner=fake_runner,
+        systemd_run_binary="/usr/bin/systemd-run",
+        systemctl_binary="/usr/bin/systemctl",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["scheduled"] is True
+    assert captured["timeout"] == 30
+    assert captured["argv"][-4:] == [
+        "/usr/bin/systemctl",
+        "--user",
+        "restart",
+        APPROVAL_WEB_UNIT,
+    ]
+
+
+def test_operator_maintenance_cannot_restart_approval_web(session_root):
+    _request_and_approve(session_root, MAINTENANCE, decided_by="telegram:8595123783")
+    out = ows.hermes_approval_web_service_restart(
+        dry_run=False,
+        runner=_fail_runner,
+        systemd_run_binary="/usr/bin/systemd-run",
+        systemctl_binary="/usr/bin/systemctl",
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert APPROVAL_WEB_MAINTENANCE in parsed["error"]
