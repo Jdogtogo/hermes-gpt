@@ -23,6 +23,7 @@ import yaml
 
 import operator_policy as op
 import operator_antigravity as op_antigravity
+import operator_antigravity_tax as op_antigravity_tax
 
 HERMES_BIN = str(Path.home() / ".local" / "bin" / "hermes")
 FILE_READ_SAFE_ROOT_ENV = "HERMES_FILE_READ_SAFE_ROOT"
@@ -66,6 +67,12 @@ ANTIGRAVITY_REVIEW_MARKERS = (
     "supervised-host-agy",
     op_antigravity.TARGET_COMMIT,
     str(op_antigravity.PACKET_PATH),
+)
+ANTIGRAVITY_TAX_REVIEW_MARKERS = (
+    "Independent Projections Calculator completion review",
+    "Projections Calculator",
+    "Tax Calculator",
+    *op_antigravity_tax.TARGET_COMMITS,
 )
 
 
@@ -349,17 +356,36 @@ def _failure_signature(task: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _antigravity_route(
+    *,
+    profile: str,
+    workdir: Path,
+    prompt: str,
+) -> str | None:
+    if profile != ANTIGRAVITY_REVIEW_PROFILE:
+        return None
+    resolved = workdir.resolve(strict=False)
+    if (
+        resolved == op_antigravity.CANONICAL_WORKTREE
+        and any(marker in prompt for marker in ANTIGRAVITY_REVIEW_MARKERS)
+    ):
+        return "operator_regression"
+    if (
+        resolved == op_antigravity_tax.TAX_CALCULATOR_ROOT
+        and all(commit in prompt for commit in op_antigravity_tax.TARGET_COMMITS)
+        and any(marker in prompt for marker in ANTIGRAVITY_TAX_REVIEW_MARKERS[:3])
+    ):
+        return "tax_calculator"
+    return None
+
+
 def _is_fixed_antigravity_review_request(
     *,
     profile: str,
     workdir: Path,
     prompt: str,
 ) -> bool:
-    if profile != ANTIGRAVITY_REVIEW_PROFILE:
-        return False
-    if workdir.resolve(strict=False) != op_antigravity.CANONICAL_WORKTREE:
-        return False
-    return any(marker in prompt for marker in ANTIGRAVITY_REVIEW_MARKERS)
+    return _antigravity_route(profile=profile, workdir=workdir, prompt=prompt) == "operator_regression"
 
 
 def _logical_work_id(
@@ -1057,11 +1083,17 @@ def hermes_delegate_task_forecast(
 
         canonical_profile = op.validate_profile_name(profile)
         resolved = _resolve_workdir(workdir)
-        if _is_fixed_antigravity_review_request(
+        route = _antigravity_route(
             profile=canonical_profile,
             workdir=resolved,
-            prompt=" ".join(ANTIGRAVITY_REVIEW_MARKERS),
-        ):
+            prompt=(
+                " ".join(ANTIGRAVITY_REVIEW_MARKERS)
+                if resolved == op_antigravity.CANONICAL_WORKTREE
+                else "Independent Projections Calculator completion review "
+                + " ".join(op_antigravity_tax.TARGET_COMMITS)
+            ),
+        )
+        if route == "operator_regression":
             if long_horizon["enabled"]:
                 raise PermissionError("The fixed supervised Antigravity review runner does not support generic long-horizon envelopes.")
             required["runner"] = "supervised-host-agy"
@@ -1075,6 +1107,44 @@ def hermes_delegate_task_forecast(
                     "target_commit": op_antigravity.TARGET_COMMIT,
                     "workdir": str(op_antigravity.CANONICAL_WORKTREE),
                     "packet": str(op_antigravity.PACKET_PATH),
+                },
+                indent=2,
+            )
+        if route == "tax_calculator":
+            if normalized_mode not in {"plan", "read_only"}:
+                raise PermissionError("The fixed Tax Calculator Antigravity review is read-only.")
+            preview = json.loads(op_antigravity_tax.start(dry_run=True))
+            if not preview.get("success"):
+                raise PermissionError(str(preview.get("error") or "Tax Calculator Antigravity preflight denied."))
+            required.update(
+                {
+                    "level": "workspace",
+                    "runner": "supervised-host-agy-tax-review",
+                    "policy_template": op_antigravity_tax.REQUIRED_TEMPLATE,
+                    "total_task_window": op_antigravity_tax.OUTER_TIMEOUT_SECONDS,
+                    "worker_slice_timeout": 3600,
+                    "maximum_continuations": 8,
+                    "resume_from_checkpoint": True,
+                    "stop_on": [
+                        "completion",
+                        "material_scope_change",
+                        "unsafe_action",
+                        "repeated_failure",
+                        "authority_expiry",
+                    ],
+                }
+            )
+            return json.dumps(
+                {
+                    "success": True,
+                    "granted": True,
+                    "required": required,
+                    "route": "supervised-host-agy-tax-review",
+                    "tool": "hermes_delegate_task",
+                    "target_commits": list(op_antigravity_tax.TARGET_COMMITS),
+                    "workdir": str(op_antigravity_tax.TAX_CALCULATOR_ROOT),
+                    "report": str(op_antigravity_tax.REPORT_PATH),
+                    "envelope": str(op_antigravity_tax.ENVELOPE_PATH),
                 },
                 indent=2,
             )
@@ -1156,11 +1226,12 @@ def hermes_delegate_task(
 
         canonical_profile = op.validate_profile_name(profile)
         resolved = _resolve_workdir(workdir)
-        if _is_fixed_antigravity_review_request(
+        route = _antigravity_route(
             profile=canonical_profile,
             workdir=resolved,
             prompt=prompt,
-        ):
+        )
+        if route == "operator_regression":
             if long_horizon["enabled"]:
                 raise PermissionError("The fixed supervised Antigravity review runner does not support generic long-horizon envelopes.")
             started = json.loads(op_antigravity.hermes_antigravity_review_start(dry_run=False))
@@ -1171,6 +1242,33 @@ def hermes_delegate_task(
                     "worker_kind": "official-antigravity-host-runner",
                     "profile": canonical_profile,
                     "workdir": str(resolved),
+                }
+            )
+            return json.dumps(started, indent=2, sort_keys=True)
+        if route == "tax_calculator":
+            if normalized_mode not in {"plan", "read_only"}:
+                raise PermissionError("The fixed Tax Calculator Antigravity review is read-only.")
+            if allow_web:
+                raise PermissionError("allow_web is not accepted for the fixed Tax Calculator Antigravity review.")
+            started = json.loads(op_antigravity_tax.start(dry_run=False))
+            started.update(
+                {
+                    "routed_from": "hermes_delegate_task",
+                    "route": "supervised-host-agy-tax-review",
+                    "worker_kind": "official-antigravity-host-runner",
+                    "profile": canonical_profile,
+                    "workdir": str(resolved),
+                    "total_task_window": op_antigravity_tax.OUTER_TIMEOUT_SECONDS,
+                    "worker_slice_timeout": 3600,
+                    "maximum_continuations": 8,
+                    "resume_from_checkpoint": True,
+                    "stop_on": [
+                        "completion",
+                        "material_scope_change",
+                        "unsafe_action",
+                        "repeated_failure",
+                        "authority_expiry",
+                    ],
                 }
             )
             return json.dumps(started, indent=2, sort_keys=True)
@@ -1324,6 +1422,8 @@ def hermes_delegate_task(
 
 def hermes_delegated_task_status(task_id: str) -> str:
     try:
+        if str(task_id).startswith(op_antigravity_tax.TASK_ID_PREFIX):
+            return op_antigravity_tax.status(task_id)
         with _LOCK:
             requested = _load(task_id)
             task = _latest_task_for(requested)
@@ -1358,6 +1458,8 @@ def hermes_delegated_task_status(task_id: str) -> str:
 
 def hermes_delegated_task_result(task_id: str) -> str:
     try:
+        if str(task_id).startswith(op_antigravity_tax.TASK_ID_PREFIX):
+            return op_antigravity_tax.result(task_id)
         with _LOCK:
             requested = _load(task_id)
             task = _latest_task_for(requested)
@@ -1419,6 +1521,8 @@ def hermes_delegated_task_result(task_id: str) -> str:
 def hermes_delegated_task_message(task_id: str, message: str) -> str:
     """Attach durable operator guidance for review or a later continuation."""
     try:
+        if str(task_id).startswith(op_antigravity_tax.TASK_ID_PREFIX):
+            raise PermissionError("The fixed Tax Calculator Antigravity review does not accept mid-run messages.")
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message is required.")
         if len(message.encode("utf-8")) > 8192:
@@ -1441,6 +1545,8 @@ def hermes_delegated_task_continue(
 ) -> str:
     """Queue a continuation from the latest durable checkpoint."""
     try:
+        if str(task_id).startswith(op_antigravity_tax.TASK_ID_PREFIX):
+            raise PermissionError("The fixed Tax Calculator Antigravity review owns its bounded host execution and cannot be manually continued.")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("continuation prompt is required.")
         if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
@@ -1584,6 +1690,8 @@ def hermes_delegated_task_continue(
 
 def hermes_delegated_task_cancel(task_id: str) -> str:
     try:
+        if str(task_id).startswith(op_antigravity_tax.TASK_ID_PREFIX):
+            return op_antigravity_tax.cancel(task_id, dry_run=False)
         policy = op.OperatorPolicy()
         policy.require_level("workspace")
         policy.require_mutation(dry_run=False)

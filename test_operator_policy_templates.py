@@ -110,7 +110,7 @@ def test_maximum_duration_bounded_for_every_active_template():
     for name in templates.active_template_names():
         resolved = templates.resolve_template(name)
         assert 0 < resolved["max_duration_seconds"] <= 12 * 60 * 60
-        if name == "hermes-overnight-maintenance":
+        if name in {"hermes-overnight-maintenance", "tax-calculator-antigravity-review"}:
             assert resolved["max_duration_seconds"] == 10 * 60 * 60
         else:
             assert resolved["max_duration_seconds"] <= 4 * 60 * 60
@@ -130,6 +130,26 @@ def test_overnight_maintenance_has_expected_scope_and_denials():
         "git": ["commit"],
         "tests": ["run"],
     }
+
+
+def test_tax_calculator_antigravity_review_is_fixed_read_only_source_scope():
+    resolved = templates.resolve_template("tax-calculator-antigravity-review")
+    policy = resolved["policy"]
+    assert resolved["max_duration_seconds"] == 10 * 60 * 60
+    assert policy["allowed_profiles"] == ["antigravity-operator"]
+    assert "/mnt/c/Dev/Tax Calculator" in policy["readable_roots"]
+    assert "/mnt/c/Dev/Tax Calculator" not in policy["writable_roots"]
+    assert policy["verbs"] == {
+        "filesystem": ["read", "edit"],
+        "tests": ["run"],
+    }
+    assert "git" not in policy["verbs"]
+    assert "services" not in policy["verbs"]
+    assert "/mnt/c/Dev/Tax Calculator/**/.git/config" in policy["hard_denied_paths"]
+    assert all(
+        root.startswith("/home/jfroh/.hermes/") or root == "/home/jfroh/.gemini/antigravity-cli/settings.json"
+        for root in policy["writable_roots"]
+    )
 
 
 def test_unknown_template_rejected():

@@ -64,6 +64,53 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
         "baseline_required": False,
     },
+    "tax-calculator-antigravity-review": {
+        "active": True,
+        "description": (
+            "Fixed, read-only Antigravity review of the approved Projections Calculator commits. "
+            "Allows test execution and fixed Hermes evidence output, but no Tax Calculator source edits, Git writes, or service changes."
+        ),
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["antigravity-operator"],
+            "readable_roots": [
+                "/mnt/c/Dev/Tax Calculator",
+                "/home/jfroh/.hermes/ops-brain/evidence/runtime/projections-calculator-antigravity-review",
+                "/home/jfroh/.hermes/ops-brain/evidence/projections-calculator-independent-review-2026-07-31.md",
+                "/home/jfroh/.hermes/ops-brain/evidence/projections-calculator-independent-review-2026-07-31.yaml",
+                "/home/jfroh/.gemini/antigravity-cli/settings.json",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/ops-brain/evidence/runtime/projections-calculator-antigravity-review",
+                "/home/jfroh/.hermes/ops-brain/evidence/projections-calculator-independent-review-2026-07-31.md",
+                "/home/jfroh/.hermes/ops-brain/evidence/projections-calculator-independent-review-2026-07-31.yaml",
+                "/home/jfroh/.gemini/antigravity-cli/settings.json",
+            ],
+            "hard_denied_paths": [
+                "/mnt/c/Dev/Tax Calculator/.env",
+                "/mnt/c/Dev/Tax Calculator/.env.*",
+                "/mnt/c/Dev/Tax Calculator/**/credentials",
+                "/mnt/c/Dev/Tax Calculator/**/API keys",
+                "/mnt/c/Dev/Tax Calculator/**/OAuth tokens",
+                "/mnt/c/Dev/Tax Calculator/**/authentication databases",
+                "/mnt/c/Dev/Tax Calculator/**/secret stores",
+                "/mnt/c/Dev/Tax Calculator/**/private keys",
+                "/mnt/c/Dev/Tax Calculator/**/SSH material",
+                "/mnt/c/Dev/Tax Calculator/**/.git/config",
+                "/mnt/c/Dev/Tax Calculator/**/runtime session databases",
+                "/mnt/c/Dev/Tax Calculator/**/operator approval databases",
+                "/mnt/c/Dev/Tax Calculator/**/operator policy/session state",
+            ],
+            "verbs": {
+                "filesystem": ["read", "edit"],
+                "tests": ["run"],
+            },
+        },
+        "max_duration_seconds": _TEN_HOURS,
+        "allowed_branches": None,
+        "baseline_required": False,
+    },
     "hermes-approval-web-maintenance": {
         "active": True,
         "description": "Bootstrap maintenance access for the localhost approval web service only.",

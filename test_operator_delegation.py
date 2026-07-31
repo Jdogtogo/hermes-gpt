@@ -178,6 +178,89 @@ def test_antigravity_review_delegation_routes_to_host_runner(monkeypatch):
     assert result["dry_run"] is False
 
 
+def test_tax_calculator_antigravity_forecast_selects_fixed_host_runner(monkeypatch):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_workdir",
+        lambda _value: delegation.op_antigravity_tax.TAX_CALCULATOR_ROOT,
+    )
+    monkeypatch.setattr(
+        delegation.op_antigravity_tax,
+        "start",
+        lambda dry_run: json.dumps({"success": True, "dry_run": dry_run}),
+    )
+
+    result = json.loads(
+        delegation.hermes_delegate_task_forecast(
+            workdir=str(delegation.op_antigravity_tax.TAX_CALCULATOR_ROOT),
+            mode="read_only",
+            profile="antigravity-operator",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["granted"] is True
+    assert result["route"] == "supervised-host-agy-tax-review"
+    assert result["required"]["policy_template"] == delegation.op_antigravity_tax.REQUIRED_TEMPLATE
+    assert result["required"]["total_task_window"] == 8 * 60 * 60
+    assert result["required"]["worker_slice_timeout"] == 60 * 60
+    assert result["required"]["maximum_continuations"] == 8
+    assert result["target_commits"] == list(delegation.op_antigravity_tax.TARGET_COMMITS)
+
+
+def test_tax_calculator_antigravity_delegation_and_lifecycle_route_to_fixed_runner(monkeypatch):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_workdir",
+        lambda _value: delegation.op_antigravity_tax.TAX_CALCULATOR_ROOT,
+    )
+    task_id = delegation.op_antigravity_tax.TASK_ID_PREFIX + "a" * 20
+    monkeypatch.setattr(
+        delegation.op_antigravity_tax,
+        "start",
+        lambda dry_run: json.dumps({"success": True, "dry_run": dry_run, "task_id": task_id, "status": "queued"}),
+    )
+    monkeypatch.setattr(
+        delegation.op_antigravity_tax,
+        "status",
+        lambda value: json.dumps({"success": True, "task_id": value, "status": "running"}),
+    )
+    monkeypatch.setattr(
+        delegation.op_antigravity_tax,
+        "result",
+        lambda value: json.dumps({"success": True, "task_id": value, "status": "completed", "ready": True}),
+    )
+    monkeypatch.setattr(
+        delegation.op_antigravity_tax,
+        "cancel",
+        lambda value, dry_run: json.dumps({"success": True, "task_id": value, "dry_run": dry_run, "status": "cancel_requested"}),
+    )
+
+    result = json.loads(
+        delegation.hermes_delegate_task(
+            prompt=(
+                "Independent Projections Calculator completion review for commits "
+                + " ".join(delegation.op_antigravity_tax.TARGET_COMMITS)
+            ),
+            workdir=str(delegation.op_antigravity_tax.TAX_CALCULATOR_ROOT),
+            mode="read_only",
+            profile="antigravity-operator",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["route"] == "supervised-host-agy-tax-review"
+    assert result["worker_kind"] == "official-antigravity-host-runner"
+    assert result["total_task_window"] == 8 * 60 * 60
+    assert json.loads(delegation.hermes_delegated_task_status(task_id))["status"] == "running"
+    assert json.loads(delegation.hermes_delegated_task_result(task_id))["ready"] is True
+    assert json.loads(delegation.hermes_delegated_task_cancel(task_id))["status"] == "cancel_requested"
+
+
 def test_delegate_task_forecast_reports_denial_without_queuing(monkeypatch, tmp_path):
     result = json.loads(
         delegation.hermes_delegate_task_forecast(
