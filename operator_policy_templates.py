@@ -52,7 +52,10 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             ],
             "readable_roots": ["/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"],
             "writable_roots": ["/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"],
-            "service_units": ["hermes-gpt-chatgpt-operator.service"],
+            "service_units": [
+                "hermes-gpt-chatgpt-operator.service",
+                "hermes-gpt-approval-web.service",
+            ],
             "verbs": {
                 "filesystem": ["read", "edit"],
                 "git": ["commit"],

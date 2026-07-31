@@ -177,6 +177,25 @@ def _run(argv: list[str], *, cwd: Path, timeout: int) -> tuple[int, str, str]:
     return proc.returncode, op.redact_output(proc.stdout), op.redact_output(proc.stderr)
 
 
+def _output_path_is_writable(target: Path) -> bool:
+    """Return whether the fixed output can be safely created or replaced.
+
+    Existing regular files need write permission, not execute permission. Their
+    parent directory still needs execute permission so an atomic replacement can
+    traverse it. Directories and the nearest existing ancestor for a missing
+    path require both write and execute permission.
+    """
+    if target.exists():
+        if target.is_dir():
+            return os.access(target, os.W_OK | os.X_OK)
+        return os.access(target, os.W_OK) and os.access(target.parent, os.X_OK)
+
+    probe = target.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return os.access(probe, os.W_OK | os.X_OK)
+
+
 def _preflight() -> dict[str, str]:
     if pwd.getpwuid(os.getuid()).pw_name != HOST_USER:
         raise RuntimeError(f"Runner must execute as Linux user {HOST_USER!r}.")
@@ -189,10 +208,7 @@ def _preflight() -> dict[str, str]:
         raise PermissionError(f"Tax Calculator repository is not readable: {TAX_CALCULATOR_ROOT}")
 
     for target in (STATE_DIR, REPORT_PATH, ENVELOPE_PATH, SETTINGS_PATH):
-        probe = target if target.exists() else target.parent
-        while not probe.exists() and probe != probe.parent:
-            probe = probe.parent
-        if not os.access(probe, os.W_OK | os.X_OK):
+        if not _output_path_is_writable(target):
             raise PermissionError(f"Runtime sandbox does not permit the fixed review output path: {target}")
     resolved: dict[str, str] = {}
     for commit in TARGET_COMMITS:

@@ -217,6 +217,16 @@ def test_settings_permissions_are_scoped_and_restored(monkeypatch, tmp_path: Pat
     assert stat.S_IMODE(settings.stat().st_mode) == 0o640
 
 
+def test_existing_non_executable_output_file_is_writable(tmp_path: Path) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}\n", encoding="utf-8")
+    os.chmod(settings, 0o600)
+
+    assert not os.access(settings, os.X_OK)
+    assert ag._output_path_is_writable(settings) is True
+    assert ag._output_path_is_writable(tmp_path / "new" / "review.yaml") is True
+
+
 def test_prompt_and_control_status_support_checkpoints(tmp_path: Path) -> None:
     checkpoint = tmp_path / "slice-01.txt"
     prompt = ag._build_prompt(1, [checkpoint], tmp_path / "inputs")

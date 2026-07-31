@@ -24,7 +24,10 @@ def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
         "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"
     ]
     assert resolved["allowed_branches"] == ["codex/operator-session-chatgpt-20260713"]
-    assert policy["service_units"] == ["hermes-gpt-chatgpt-operator.service"]
+    assert policy["service_units"] == [
+        "hermes-gpt-chatgpt-operator.service",
+        "hermes-gpt-approval-web.service",
+    ]
     assert policy["verbs"]["services"] == ["restart"]
     assert set(policy["allowed_profiles"]) == {
         "default",
@@ -92,7 +95,8 @@ def test_allowed_verbs_are_scoped_not_owner_level():
         if name == "hermes-gpt-operator-maintenance":
             assert verbs["services"] == ["restart"]
             assert resolved["policy"]["service_units"] == [
-                "hermes-gpt-chatgpt-operator.service"
+                "hermes-gpt-chatgpt-operator.service",
+                "hermes-gpt-approval-web.service",
             ]
         else:
             assert "services" not in verbs
