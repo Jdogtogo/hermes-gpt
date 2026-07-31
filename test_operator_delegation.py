@@ -130,6 +130,52 @@ def test_delegate_task_forecast_reports_granted_authority(monkeypatch, tmp_path)
     assert result["authority"]["evidence_required"] is True
 
 
+def test_antigravity_review_forecast_selects_host_runner(monkeypatch):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+
+    result = json.loads(
+        delegation.hermes_delegate_task_forecast(
+            workdir=str(delegation.op_antigravity.CANONICAL_WORKTREE),
+            mode="read_only",
+            profile="antigravity-operator",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["route"] == "supervised-host-agy"
+    assert result["tool"] == "hermes_antigravity_review_start"
+    assert result["target_commit"] == delegation.op_antigravity.TARGET_COMMIT
+
+
+def test_antigravity_review_delegation_routes_to_host_runner(monkeypatch):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(
+        delegation.op_antigravity,
+        "hermes_antigravity_review_start",
+        lambda dry_run: json.dumps({"success": True, "dry_run": dry_run, "job_id": "agr_test"}),
+    )
+
+    result = json.loads(
+        delegation.hermes_delegate_task(
+            prompt=(
+                "Run operator-regression-independent-review with supervised-host-agy "
+                f"for {delegation.op_antigravity.TARGET_COMMIT}."
+            ),
+            workdir=str(delegation.op_antigravity.CANONICAL_WORKTREE),
+            mode="read_only",
+            profile="antigravity-operator",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["route"] == "supervised-host-agy"
+    assert result["worker_kind"] == "official-antigravity-host-runner"
+    assert result["routed_from"] == "hermes_delegate_task"
+    assert result["dry_run"] is False
+
+
 def test_delegate_task_forecast_reports_denial_without_queuing(monkeypatch, tmp_path):
     result = json.loads(
         delegation.hermes_delegate_task_forecast(

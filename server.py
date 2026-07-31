@@ -22,6 +22,7 @@ import operator_auth as op_auth
 import operator_sessions as op_sessions
 import operator_policy_templates as op_templates
 import operator_delegation as op_delegation
+import operator_antigravity as op_antigravity
 import dcr_compat
 
 try:
@@ -1249,6 +1250,21 @@ def hermes_workspace_exec(
     )
 
 
+def hermes_antigravity_review_start(dry_run: bool = True) -> str:
+    """Start the one fixed supervised Antigravity operator-regression review."""
+    return op_antigravity.hermes_antigravity_review_start(dry_run=dry_run)
+
+
+def hermes_antigravity_review_status() -> str:
+    """Return current state for the fixed supervised Antigravity review."""
+    return op_antigravity.hermes_antigravity_review_status()
+
+
+def hermes_antigravity_review_cancel(dry_run: bool = True) -> str:
+    """Cancel the fixed supervised Antigravity review process group."""
+    return op_antigravity.hermes_antigravity_review_cancel(dry_run=dry_run)
+
+
 def hermes_git_status(workdir: str) -> str:
     return op_workspace.hermes_git_status(workdir=workdir)
 
@@ -1702,6 +1718,9 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_workspace_run_test,
         hermes_workspace_exec,
         hermes_workspace_git_commit,
+        hermes_antigravity_review_start,
+        hermes_antigravity_review_status,
+        hermes_antigravity_review_cancel,
         hermes_delegate_task_forecast,
         hermes_delegate_task,
         hermes_delegated_task_status,

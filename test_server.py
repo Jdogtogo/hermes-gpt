@@ -409,7 +409,7 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     # Self-report matches the actual live tool surface, exactly.
     assert sorted(status["registered_operator_tools"]) == live_names
     assert status["registered_tool_count"] == len(live_names)
-    assert len(live_names) == 31
+    assert len(live_names) == 34
 
     # The session and narrowly gated maintenance tools must be reported...
     for required in [
@@ -419,6 +419,9 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
         "hermes_operator_session_revoke",
         "hermes_operator_service_restart",
         "hermes_approval_web_service_restart",
+        "hermes_antigravity_review_start",
+        "hermes_antigravity_review_status",
+        "hermes_antigravity_review_cancel",
     ]:
         assert required in status["registered_operator_tools"]
     # ...and the deliberately-excluded tools must not be.

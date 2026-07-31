@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 
 import operator_policy as op
+import operator_antigravity as op_antigravity
 
 HERMES_BIN = str(Path.home() / ".local" / "bin" / "hermes")
 FILE_READ_SAFE_ROOT_ENV = "HERMES_FILE_READ_SAFE_ROOT"
@@ -48,6 +49,14 @@ _TASKS_ROOT = Path(__file__).resolve().parent / "logs" / "delegated_tasks"
 MISSION_CONTROL_DB_ENV = "HERMES_GPT_DELEGATION_MISSION_CONTROL_DB"
 _LOCK = threading.RLock()
 _PROCESSES: dict[str, subprocess.Popen[str]] = {}
+
+ANTIGRAVITY_REVIEW_PROFILE = "antigravity-operator"
+ANTIGRAVITY_REVIEW_MARKERS = (
+    "operator-regression-independent-review",
+    "supervised-host-agy",
+    op_antigravity.TARGET_COMMIT,
+    str(op_antigravity.PACKET_PATH),
+)
 
 
 def _now() -> int:
@@ -201,6 +210,19 @@ def _git_context(workdir: Path) -> dict[str, str | None]:
 def _prompt_fingerprint(prompt: str) -> str:
     normalized = " ".join(str(prompt).split())
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _is_fixed_antigravity_review_request(
+    *,
+    profile: str,
+    workdir: Path,
+    prompt: str,
+) -> bool:
+    if profile != ANTIGRAVITY_REVIEW_PROFILE:
+        return False
+    if workdir.resolve(strict=False) != op_antigravity.CANONICAL_WORKTREE:
+        return False
+    return any(marker in prompt for marker in ANTIGRAVITY_REVIEW_MARKERS)
 
 
 def _logical_work_id(*, prompt: str, profile: str, mode: str, workdir: Path) -> tuple[str, dict[str, Any]]:
@@ -706,8 +728,27 @@ def hermes_delegate_task_forecast(
         policy = op.OperatorPolicy()
         policy.require_enabled()
         canonical_profile = op.validate_profile_name(profile)
-        policy.require_profile(canonical_profile, Path.home() / ".hermes")
         resolved = _resolve_workdir(workdir)
+        if _is_fixed_antigravity_review_request(
+            profile=canonical_profile,
+            workdir=resolved,
+            prompt=" ".join(ANTIGRAVITY_REVIEW_MARKERS),
+        ):
+            required["runner"] = "supervised-host-agy"
+            return json.dumps(
+                {
+                    "success": True,
+                    "granted": True,
+                    "required": required,
+                    "route": "supervised-host-agy",
+                    "tool": "hermes_antigravity_review_start",
+                    "target_commit": op_antigravity.TARGET_COMMIT,
+                    "workdir": str(op_antigravity.CANONICAL_WORKTREE),
+                    "packet": str(op_antigravity.PACKET_PATH),
+                },
+                indent=2,
+            )
+        policy.require_profile(canonical_profile, Path.home() / ".hermes")
         policy.require_read_path(resolved)
         if normalized_mode == "apply":
             policy.require_level("workspace")
@@ -765,8 +806,26 @@ def hermes_delegate_task(
         policy = op.OperatorPolicy()
         policy.require_enabled()
         canonical_profile = op.validate_profile_name(profile)
-        policy.require_profile(canonical_profile, Path.home() / ".hermes")
         resolved = _resolve_workdir(workdir)
+        if _is_fixed_antigravity_review_request(
+            profile=canonical_profile,
+            workdir=resolved,
+            prompt=prompt,
+        ):
+            started = json.loads(
+                op_antigravity.hermes_antigravity_review_start(dry_run=False)
+            )
+            started.update(
+                {
+                    "routed_from": "hermes_delegate_task",
+                    "route": "supervised-host-agy",
+                    "worker_kind": "official-antigravity-host-runner",
+                    "profile": canonical_profile,
+                    "workdir": str(resolved),
+                }
+            )
+            return json.dumps(started, indent=2, sort_keys=True)
+        policy.require_profile(canonical_profile, Path.home() / ".hermes")
         policy.require_read_path(resolved)
         if normalized_mode == "apply":
             policy.require_level("workspace")
