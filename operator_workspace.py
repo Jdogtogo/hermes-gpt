@@ -528,7 +528,9 @@ def hermes_operator_service_restart(
 
 
 _APPROVAL_WEB_SERVICE_UNIT = "hermes-gpt-approval-web.service"
-_APPROVAL_WEB_RESTART_TEMPLATE = "hermes-approval-web-maintenance"
+_APPROVAL_WEB_RESTART_TEMPLATES = frozenset(
+    {"hermes-approval-web-maintenance", "hermes-gpt-operator-maintenance"}
+)
 _APPROVAL_WEB_RESTART_DELAY_SECONDS = 3
 
 
@@ -574,11 +576,11 @@ def hermes_approval_web_service_restart(
                 "Approval web service restart requires an active, approved Operator "
                 f"Session (current session state: {state!r})."
             )
-        if policy.policy_template != _APPROVAL_WEB_RESTART_TEMPLATE:
+        if policy.policy_template not in _APPROVAL_WEB_RESTART_TEMPLATES:
+            allowed = ", ".join(sorted(_APPROVAL_WEB_RESTART_TEMPLATES))
             raise PermissionError(
-                "Approval web service restart requires the "
-                f"{_APPROVAL_WEB_RESTART_TEMPLATE!r} policy template "
-                f"(active session template: {policy.policy_template!r})."
+                "Approval web service restart requires one of the approved policy "
+                f"templates: {allowed} (active session template: {policy.policy_template!r})."
             )
         policy.require_verb("services", "restart")
         if _APPROVAL_WEB_SERVICE_UNIT not in set(policy.service_units):

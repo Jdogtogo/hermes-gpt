@@ -280,14 +280,27 @@ def test_approval_web_maintenance_schedules_exact_unit(session_root):
     ]
 
 
-def test_operator_maintenance_cannot_restart_approval_web(session_root):
+def test_operator_maintenance_can_restart_approval_web_when_unit_is_granted(session_root):
     _request_and_approve(session_root, MAINTENANCE, decided_by="telegram:8595123783")
+    captured = {}
+
+    def fake_runner(argv, timeout=120, workdir=None):
+        captured["argv"] = argv
+        captured["timeout"] = timeout
+        return (0, "Running timer as unit", "")
+
     out = ows.hermes_approval_web_service_restart(
         dry_run=False,
-        runner=_fail_runner,
+        runner=fake_runner,
         systemd_run_binary="/usr/bin/systemd-run",
         systemctl_binary="/usr/bin/systemctl",
     )
     parsed = json.loads(out)
-    assert parsed["success"] is False
-    assert APPROVAL_WEB_MAINTENANCE in parsed["error"]
+    assert parsed["success"] is True
+    assert parsed["scheduled"] is True
+    assert captured["argv"][-4:] == [
+        "/usr/bin/systemctl",
+        "--user",
+        "restart",
+        APPROVAL_WEB_UNIT,
+    ]
