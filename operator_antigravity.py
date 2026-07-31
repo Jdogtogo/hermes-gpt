@@ -47,7 +47,9 @@ SETTINGS_PATH = HOST_HOME / ".gemini/antigravity-cli/settings.json"
 STATE_DIR = CANONICAL_WORKTREE / "logs" / "antigravity-review"
 STATE_PATH = STATE_DIR / "state.json"
 LAUNCH_LOG_PATH = STATE_DIR / "launcher.log"
-REVIEW_ROOT = Path("/home/jfroh/.hermes/worktrees")
+# Temporary detached review worktrees must remain beneath the fixed canonical
+# worktree, which is the maintenance session's approved writable root.
+REVIEW_ROOT = STATE_DIR / "worktrees"
 REVIEW_PREFIX = "antigravity-operator-review-d377-"
 REQUIRED_TEMPLATE = "hermes-gpt-operator-maintenance"
 MODEL = "gemini-3.6-flash-low"
@@ -358,6 +360,7 @@ def _create_detached_worktree(job_id: str) -> Path:
     review_dir = REVIEW_ROOT / f"{REVIEW_PREFIX}{job_id}"
     if review_dir.exists():
         raise RuntimeError(f"Review worktree already exists: {review_dir}")
+    REVIEW_ROOT.mkdir(parents=True, exist_ok=True)
     rc, _stdout, stderr = _run(
         ["git", "worktree", "add", "--detach", str(review_dir), TARGET_COMMIT],
         cwd=CANONICAL_WORKTREE,
@@ -447,13 +450,33 @@ def _load_settings() -> tuple[bytes | None, int | None, dict[str, Any]]:
     return original, mode, data
 
 
+def _is_read_file_rule(value: object) -> bool:
+    return isinstance(value, str) and value.strip().startswith("read_file(")
+
+
 def _install_read_permission(review_dir: Path, data: dict[str, Any], mode: int | None) -> None:
     permissions = data.setdefault("permissions", {})
     if not isinstance(permissions, dict):
         raise RuntimeError("Antigravity settings permissions field is not an object.")
     allow = permissions.setdefault("allow", [])
+    ask = permissions.setdefault("ask", [])
+    deny = permissions.setdefault("deny", [])
     if not isinstance(allow, list):
         raise RuntimeError("Antigravity settings permissions.allow field is not a list.")
+    if not isinstance(ask, list):
+        raise RuntimeError("Antigravity settings permissions.ask field is not a list.")
+    if not isinstance(deny, list):
+        raise RuntimeError("Antigravity settings permissions.deny field is not a list.")
+    if any(_is_read_file_rule(entry) for entry in deny):
+        raise RuntimeError(
+            "Antigravity settings contain a read_file deny rule; refusing to weaken it for the review."
+        )
+
+    # In headless mode an ask rule takes precedence over a narrower allow rule and
+    # is auto-denied. Temporarily suspend only read_file ask rules; all other ask
+    # and deny rules remain intact, and the original settings bytes are restored
+    # unconditionally after the bounded review.
+    permissions["ask"] = [entry for entry in ask if not _is_read_file_rule(entry)]
     rule = f"read_file({review_dir})"
     if rule not in allow:
         allow.append(rule)
@@ -551,7 +574,20 @@ def _extract_artifacts(stdout: str) -> tuple[str, str, str | None]:
         joined,
         flags=re.DOTALL,
     )
-    if not md_match or not yaml_match:
+    markdown_text: str | None = md_match.group(1) if md_match else None
+    if markdown_text is None and yaml_match:
+        # Some models emit the complete YAML artifact immediately after the
+        # Markdown body but omit only the Markdown end marker. The YAML start
+        # marker is an unambiguous boundary, so accept that bounded form while
+        # still requiring a complete YAML artifact and all downstream checks.
+        fallback_match = re.search(
+            re.escape(_MARKDOWN_START) + r"\s*(.*?)\s*" + re.escape(_YAML_START),
+            joined,
+            flags=re.DOTALL,
+        )
+        if fallback_match:
+            markdown_text = fallback_match.group(1)
+    if markdown_text is None or not yaml_match:
         raise RuntimeError("Antigravity output did not contain both required artifact delimiters.")
     conversation_id = None
     try:
@@ -564,7 +600,7 @@ def _extract_artifacts(stdout: str) -> tuple[str, str, str | None]:
                     break
     except json.JSONDecodeError:
         pass
-    return md_match.group(1).strip() + "\n", yaml_match.group(1).strip() + "\n", conversation_id
+    return markdown_text.strip() + "\n", yaml_match.group(1).strip() + "\n", conversation_id
 
 
 def _validate_artifacts(markdown: str, yaml_text: str) -> str:

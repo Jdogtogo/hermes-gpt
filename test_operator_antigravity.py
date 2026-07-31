@@ -98,6 +98,40 @@ def test_dry_run_validation_preflights_worktree_and_removes_it(monkeypatch, tmp_
     assert calls == [("preflight", None), ("create", None), ("remove", review_dir)]
 
 
+def test_detached_review_worktree_stays_under_authorised_root(monkeypatch, tmp_path: Path) -> None:
+    canonical = tmp_path / "canonical"
+    review_root = canonical / "logs" / "antigravity-review" / "worktrees"
+    canonical.mkdir()
+    monkeypatch.setattr(ag, "CANONICAL_WORKTREE", canonical)
+    monkeypatch.setattr(ag, "REVIEW_ROOT", review_root)
+
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, *, cwd: Path, timeout: int):
+        captured["argv"] = argv
+        captured["cwd"] = cwd
+        captured["timeout"] = timeout
+        return 0, "", ""
+
+    monkeypatch.setattr(ag, "_run", fake_run)
+
+    review_dir = ag._create_detached_worktree("dryrun-test")
+
+    assert review_root.is_dir()
+    assert review_dir == review_root / f"{ag.REVIEW_PREFIX}dryrun-test"
+    assert review_dir.is_relative_to(canonical)
+    assert captured["cwd"] == canonical
+    assert captured["argv"] == [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        str(review_dir),
+        ag.TARGET_COMMIT,
+    ]
+    assert captured["timeout"] == 120
+
+
 def test_start_launches_only_internal_worker(monkeypatch, tmp_path: Path) -> None:
     _patch_state_paths(monkeypatch, tmp_path)
     monkeypatch.setattr(ag, "_require_authority", lambda **_kwargs: _Policy())
@@ -150,6 +184,55 @@ def test_settings_permission_is_scoped_and_exactly_restored(monkeypatch, tmp_pat
     assert stat.S_IMODE(settings.stat().st_mode) == 0o640
 
 
+def test_read_permission_temporarily_suspends_only_conflicting_ask_rules(
+    monkeypatch, tmp_path: Path
+) -> None:
+    settings = tmp_path / "settings.json"
+    original = (
+        '{\n'
+        '  "permissions": {\n'
+        '    "allow": ["read_url(example.com)"],\n'
+        '    "ask": ["read_file(*)", "command(*)"],\n'
+        '    "deny": ["write_file(.git/)"]\n'
+        '  }\n'
+        '}\n'
+    ).encode("utf-8")
+    settings.write_bytes(original)
+    monkeypatch.setattr(ag, "SETTINGS_PATH", settings)
+
+    saved, mode, data = ag._load_settings()
+    review_dir = tmp_path / "review"
+    ag._install_read_permission(review_dir, data, mode)
+
+    updated = json.loads(settings.read_text(encoding="utf-8"))
+    assert updated["permissions"]["allow"] == [
+        "read_url(example.com)",
+        f"read_file({review_dir})",
+    ]
+    assert updated["permissions"]["ask"] == ["command(*)"]
+    assert updated["permissions"]["deny"] == ["write_file(.git/)"]
+
+    ag._restore_settings(saved, mode)
+    assert settings.read_bytes() == original
+
+
+def test_read_permission_refuses_to_override_read_deny(monkeypatch, tmp_path: Path) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps({"permissions": {"deny": ["read_file(*)"]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ag, "SETTINGS_PATH", settings)
+
+    _saved, mode, data = ag._load_settings()
+    try:
+        ag._install_read_permission(tmp_path / "review", data, mode)
+    except RuntimeError as exc:
+        assert "refusing to weaken" in str(exc)
+    else:
+        raise AssertionError("read_file deny rule was overridden")
+
+
 def test_settings_created_for_job_is_removed_after_restore(monkeypatch, tmp_path: Path) -> None:
     settings = tmp_path / "settings.json"
     monkeypatch.setattr(ag, "SETTINGS_PATH", settings)
@@ -200,6 +283,39 @@ def test_extract_artifacts_from_json_response() -> None:
     assert "Final verdict: PASS" in md
     assert "verdict: PASS" in yaml_text
     assert conversation_id == "conversation-test"
+    assert ag._validate_artifacts(md, yaml_text) == "PASS"
+
+
+def test_extract_artifacts_accepts_yaml_start_as_bounded_markdown_end() -> None:
+    raw = json.dumps(
+        {
+            "conversation_id": "conversation-fallback",
+            "response": (
+                f"{ag._MARKDOWN_START}\n# Review\nTarget {ag.TARGET_COMMIT}\n"
+                "Final verdict: PASS\n"
+                f"{ag._YAML_START}\n"
+                "schema_version: 1\nreview:\n"
+                f"  target_commit: {ag.TARGET_COMMIT}\n"
+                "  verdict: PASS\n"
+                "  blocking_findings: 0\n"
+                "  non_blocking_findings: 0\n"
+                "  targeted_tests_passed: true\n"
+                "  operator_suite_passed: true\n"
+                "  full_suite_passed: true\n"
+                "  source_modified: false\n"
+                "  credentials_accessed: false\n"
+                "  services_restarted: false\n"
+                f"{ag._YAML_END}\n"
+            ),
+        }
+    )
+
+    md, yaml_text, conversation_id = ag._extract_artifacts(raw)
+
+    assert "Final verdict: PASS" in md
+    assert ag._YAML_START not in md
+    assert "verdict: PASS" in yaml_text
+    assert conversation_id == "conversation-fallback"
     assert ag._validate_artifacts(md, yaml_text) == "PASS"
 
 
