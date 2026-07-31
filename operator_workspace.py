@@ -2019,9 +2019,11 @@ def hermes_workspace_git_commit(
 
     Requires an active Operator Session granting the ``git:commit`` verb.
     Never pushes, amends, resets, cleans, stashes, or changes branches.
-    Refuses if the worktree has any dirty file outside ``allowed_files``,
-    if the branch or baseline commit does not match what was expected, or
-    if ``workdir`` is not the repository's own toplevel.
+    Refuses if the worktree has any tracked, staged, renamed, or deleted file
+    outside ``allowed_files``. Unrelated untracked files are left untouched and
+    do not block an otherwise explicit path-scoped commit. Also refuses if the
+    branch or baseline commit does not match what was expected, or if ``workdir``
+    is not the repository's own toplevel.
     """
     try:
         policy = op.OperatorPolicy()
@@ -2067,22 +2069,32 @@ def hermes_workspace_git_commit(
         status_rc, status_out, _ = _git(["status", "--porcelain=v1"], workdir, runner=runner)
         if status_rc != 0:
             raise PermissionError("Could not read git status.")
-        dirty_files: list[str] = []
+        dirty_entries: list[tuple[str, str]] = []
         for line in status_out.splitlines():
             if not line.strip():
                 continue
             # Porcelain v1: "XY path" (or "XY orig -> path" for renames).
+            status = line[:2]
             entry = line[3:].strip()
             if " -> " in entry:
                 entry = entry.split(" -> ", 1)[1]
-            dirty_files.append(entry)
+            dirty_entries.append((status, entry))
 
         allowed_set = set(allowed_files)
-        out_of_scope = [f for f in dirty_files if f not in allowed_set]
+        # A path-scoped commit is safe in the presence of unrelated untracked
+        # files because the tool stages and commits only explicit allowed paths.
+        # Any out-of-scope tracked/index change still fails closed, including
+        # staged additions, modifications, deletions, and renames.
+        out_of_scope = [
+            path
+            for status, path in dirty_entries
+            if path not in allowed_set and status != "??"
+        ]
         if out_of_scope:
             raise PermissionError(
-                f"Refusing to commit: unapproved dirty files present: {out_of_scope!r}."
+                f"Refusing to commit: unapproved tracked or staged files present: {out_of_scope!r}."
             )
+        dirty_files = [path for _status, path in dirty_entries]
         to_stage = [f for f in allowed_files if f in dirty_files]
         if not to_stage:
             raise PermissionError("None of allowed_files are actually modified or untracked.")

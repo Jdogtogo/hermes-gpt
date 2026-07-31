@@ -125,11 +125,11 @@ def test_commit_requires_git_commit_verb(git_repo, clean_env, audit_override, mo
     assert _run_git(["rev-parse", "HEAD"], git_repo) == baseline
 
 
-def test_commit_rejects_out_of_scope_dirty_file(git_repo, clean_env, audit_override, monkeypatch, tmp_path):
+def test_commit_rejects_out_of_scope_tracked_file(git_repo, clean_env, audit_override, monkeypatch, tmp_path):
     record, session_root = _make_session(tmp_path, git_repo, verbs={"git": ["commit"]})
     _activate(monkeypatch, record, session_root)
     (git_repo / "approved.txt").write_text("ok\n", encoding="utf-8")
-    (git_repo / "unapproved.txt").write_text("surprise\n", encoding="utf-8")
+    (git_repo / "README.md").write_text("unexpected tracked change\n", encoding="utf-8")
     baseline = _run_git(["rev-parse", "HEAD"], git_repo)
     branch = _run_git(["branch", "--show-current"], git_repo)
 
@@ -142,7 +142,58 @@ def test_commit_rejects_out_of_scope_dirty_file(git_repo, clean_env, audit_overr
         dry_run=False,
     ))
     assert out["success"] is False
-    assert "unapproved" in out["error"] or "out_of_scope" in out["error"].lower() or "unapproved.txt" in out["error"]
+    assert "README.md" in out["error"]
+    assert _run_git(["rev-parse", "HEAD"], git_repo) == baseline
+
+
+def test_commit_allows_unrelated_untracked_file(git_repo, clean_env, audit_override, monkeypatch, tmp_path):
+    record, session_root = _make_session(
+        tmp_path,
+        git_repo,
+        verbs={"git": ["commit"], "filesystem": ["read", "edit"]},
+    )
+    _activate(monkeypatch, record, session_root)
+    (git_repo / "approved.txt").write_text("ok\n", encoding="utf-8")
+    (git_repo / "protected-local-note.txt").write_text("leave untouched\n", encoding="utf-8")
+    baseline = _run_git(["rev-parse", "HEAD"], git_repo)
+    branch = _run_git(["branch", "--show-current"], git_repo)
+
+    out = json.loads(ows.hermes_workspace_git_commit(
+        workdir=str(git_repo),
+        expected_branch=branch,
+        expected_baseline=baseline,
+        allowed_files=["approved.txt"],
+        message="add approved.txt",
+        dry_run=False,
+    ))
+
+    assert out["success"] is True
+    assert out["files"] == ["approved.txt"]
+    assert (git_repo / "protected-local-note.txt").read_text(encoding="utf-8") == "leave untouched\n"
+    assert "?? protected-local-note.txt" in _run_git(["status", "--short"], git_repo)
+    assert _run_git(["show", "--name-only", "--format=", "HEAD"], git_repo) == "approved.txt"
+
+
+def test_commit_rejects_out_of_scope_staged_addition(git_repo, clean_env, audit_override, monkeypatch, tmp_path):
+    record, session_root = _make_session(tmp_path, git_repo, verbs={"git": ["commit"]})
+    _activate(monkeypatch, record, session_root)
+    (git_repo / "approved.txt").write_text("ok\n", encoding="utf-8")
+    (git_repo / "staged-unapproved.txt").write_text("must block\n", encoding="utf-8")
+    _run_git(["add", "staged-unapproved.txt"], git_repo)
+    baseline = _run_git(["rev-parse", "HEAD"], git_repo)
+    branch = _run_git(["branch", "--show-current"], git_repo)
+
+    out = json.loads(ows.hermes_workspace_git_commit(
+        workdir=str(git_repo),
+        expected_branch=branch,
+        expected_baseline=baseline,
+        allowed_files=["approved.txt"],
+        message="add approved.txt",
+        dry_run=False,
+    ))
+
+    assert out["success"] is False
+    assert "staged-unapproved.txt" in out["error"]
     assert _run_git(["rev-parse", "HEAD"], git_repo) == baseline
 
 
