@@ -841,8 +841,9 @@ def cancel(task_id: str, dry_run: bool = False) -> str:
         _write_state(status="cancel_requested", cancel_requested_at=int(time.time()))
         if agy_pid:
             _terminate_process_group(agy_pid)
-        if pid:
-            _terminate_process_group(pid)
+        # Do not terminate the supervisor process. It must observe the durable
+        # cancel request, mark the task cancelled, and restore the exact
+        # pre-run Antigravity settings bytes in its finally block.
         return _json({"success": True, "task_id": task_id, "changed": True, "status": "cancel_requested"})
     except Exception as exc:
         return _json(op.error_from_exception(

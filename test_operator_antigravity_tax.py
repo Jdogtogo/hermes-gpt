@@ -339,3 +339,20 @@ def test_extract_and_validate_final_artifacts() -> None:
     assert "verdict: ACCEPT" in yaml_text
     assert conversation_id == "conversation-tax-test"
     assert ag._validate_artifacts(markdown, yaml_text) == "ACCEPT"
+
+
+def test_cancel_terminates_child_but_preserves_supervisor_for_cleanup(monkeypatch, tmp_path: Path) -> None:
+    _patch_paths(monkeypatch, tmp_path)
+    task_id = ag.TASK_ID_PREFIX + "c" * 20
+    ag._write_state(task_id=task_id, status="running", pid=11111, agy_pid=22222)
+    monkeypatch.setattr(ag, "_require_authority", lambda **_kwargs: _Policy())
+    monkeypatch.setattr(ag, "_pid_alive", lambda pid: pid in {11111, 22222})
+    terminated: list[int] = []
+    monkeypatch.setattr(ag, "_terminate_process_group", lambda pid: terminated.append(pid))
+
+    result = json.loads(ag.cancel(task_id, dry_run=False))
+
+    assert result["success"] is True
+    assert result["status"] == "cancel_requested"
+    assert terminated == [22222]
+    assert ag._read_state()["status"] == "cancel_requested"
