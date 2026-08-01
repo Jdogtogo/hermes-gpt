@@ -57,6 +57,47 @@ def test_request_session_creates_no_authority(session_env):
     assert pending[0]["resolved_policy"] == resolved["policy"]
 
 
+def test_new_session_request_supersedes_older_pending_request(session_env, audit_override):
+    sandbox = templates.resolve_template("sandbox")
+    maintenance = templates.resolve_template("hermes-gpt-operator-maintenance")
+    old_request = sessions.request_session(
+        policy_template="sandbox",
+        resolved_policy=sandbox["policy"],
+        requested_duration_seconds=3600,
+        reason="old request",
+        root=session_env,
+        now=2_000_000_000,
+        request_id="sr_old",
+    )
+    new_request = sessions.request_session(
+        policy_template="hermes-gpt-operator-maintenance",
+        resolved_policy=maintenance["policy"],
+        requested_duration_seconds=3600,
+        reason="new request",
+        root=session_env,
+        now=2_000_000_001,
+        request_id="sr_new",
+    )
+
+    assert old_request == "sr_old"
+    assert new_request == "sr_new"
+    pending = sessions.list_pending_session_requests(root=session_env)
+    assert [item["request_id"] for item in pending] == ["sr_new"]
+    with pytest.raises(ValueError, match="already superseded"):
+        sessions.approve_session_request("sr_old", root=session_env, now=2_000_000_002)
+
+    approved = sessions.approve_session_request("sr_new", root=session_env, now=2_000_000_002)
+    assert approved.policy["policy_template"] == "hermes-gpt-operator-maintenance"
+    audit = op.audit_tail(limit=20)
+    superseded = [
+        record for record in audit
+        if record.get("tool") == "session_approval" and record.get("decision") == "superseded"
+    ]
+    assert superseded
+    assert superseded[-1]["request_id"] == "sr_old"
+    assert superseded[-1]["superseded_by_request_id"] == "sr_new"
+
+
 def test_unknown_policy_template_rejected_before_any_request_exists():
     with pytest.raises(templates.UnknownPolicyTemplateError):
         templates.resolve_template("not-a-real-template")

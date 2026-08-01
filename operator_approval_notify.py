@@ -101,6 +101,7 @@ def _format_session_summary(details: dict[str, Any]) -> str:
     minutes = int(details.get("requested_duration_seconds", 0)) // 60
     return (
         "Hermes Operator session request\n\n"
+        f"Request ID: {details.get('request_id')}\n"
         f"Policy: {details.get('policy_template')}\n"
         f"Repository/worktree: {roots}\n"
         f"Access: {verbs}\n"

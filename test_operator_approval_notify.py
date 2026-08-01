@@ -44,6 +44,7 @@ def test_session_request_sends_correct_payload(telegram_env, monkeypatch):
         "session_creation",
         "sr_abc123",
         {
+            "request_id": "sr_abc123",
             "policy_template": "sandbox",
             "resolved_policy": {
                 "writable_roots": ["/home/jfroh/.hermes/worktrees/chatgpt-operator-scratch"],
@@ -57,6 +58,7 @@ def test_session_request_sends_correct_payload(telegram_env, monkeypatch):
     assert "test-token-value" in captured["url"]
     body = captured["json"]
     assert body["chat_id"] == "12345"
+    assert "Request ID: sr_abc123" in body["text"]
     assert "sandbox" in body["text"]
     assert "test run" in body["text"]
     buttons = body["reply_markup"]["inline_keyboard"][0]

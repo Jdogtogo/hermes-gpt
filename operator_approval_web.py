@@ -112,7 +112,8 @@ def _render_page() -> str:
         policy = item.get("resolved_policy") or {}
         sections.append(f"""
 <div class="card">
-  <p><b>Policy template:</b> {esc(item.get('policy_template'))}<br>
+  <p><b>Request ID:</b> {esc(item.get('request_id'))}<br>
+     <b>Policy template:</b> {esc(item.get('policy_template'))}<br>
      <b>Readable roots:</b> {esc(', '.join(policy.get('readable_roots') or []))}<br>
      <b>Writable roots:</b> {esc(', '.join(policy.get('writable_roots') or []))}<br>
      <b>Verbs:</b> {esc(json.dumps(policy.get('verbs') or {}))}<br>

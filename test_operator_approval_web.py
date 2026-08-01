@@ -139,6 +139,7 @@ def test_session_request_approve_via_web(env, audit_override):
     )
     with TestClient(web.app) as client:
         page = client.get("/approvals")
+        assert request_id in page.text
         assert "test via web" in page.text
         csrf = _csrf_from_page(page.text)
         resp = client.post(

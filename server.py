@@ -897,6 +897,7 @@ def hermes_operator_session_request(
             "session_creation",
             request_id,
             {
+                "request_id": request_id,
                 "policy_template": policy_template,
                 "resolved_policy": policy_snapshot,
                 "requested_duration_seconds": capped_seconds,

@@ -725,7 +725,19 @@ def request_session(
     current = int(time.time() if now is None else now)
     rid = request_id or f"sr_{secrets.token_hex(4)}"
     expires_at = current + SESSION_REQUEST_TTL_SECONDS
+    superseded: list[tuple[str, str]] = []
     with _connect(root) as connection:
+        rows = connection.execute(
+            "SELECT request_id, policy_template FROM session_creation_requests "
+            "WHERE status = 'pending' ORDER BY created_at, request_id"
+        ).fetchall()
+        superseded = [(str(row["request_id"]), str(row["policy_template"])) for row in rows]
+        if superseded:
+            connection.execute(
+                "UPDATE session_creation_requests SET status = 'superseded', "
+                "decided_by = ?, decided_at = ? WHERE status = 'pending'",
+                (f"system:newer-request:{rid}", current),
+            )
         connection.execute(
             "INSERT INTO session_creation_requests"
             "(request_id, policy_template, resolved_policy_json, requested_duration_seconds, "
@@ -740,6 +752,17 @@ def request_session(
                 current,
                 expires_at,
             ),
+        )
+    for superseded_id, superseded_template in superseded:
+        _audit_decision(
+            request_id=superseded_id,
+            request_type="session_creation",
+            decision="superseded",
+            decided_by=f"system:newer-request:{rid}",
+            extra={
+                "policy_template": superseded_template,
+                "superseded_by_request_id": rid,
+            },
         )
     return rid
 
