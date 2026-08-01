@@ -22,7 +22,7 @@ import operator_auth as op_auth
 import operator_sessions as op_sessions
 import operator_policy_templates as op_templates
 import operator_delegation as op_delegation
-import operator_antigravity as op_antigravity
+import operator_antigravity_tax as op_antigravity_tax
 import dcr_compat
 
 try:
@@ -1251,18 +1251,32 @@ def hermes_workspace_exec(
 
 
 def hermes_antigravity_review_start(dry_run: bool = True) -> str:
-    """Start the one fixed supervised Antigravity operator-regression review."""
-    return op_antigravity.hermes_antigravity_review_start(dry_run=dry_run)
+    """Start the fixed supervised Projections Calculator Antigravity review."""
+    return op_antigravity_tax.start(dry_run=dry_run)
 
 
 def hermes_antigravity_review_status() -> str:
-    """Return current state for the fixed supervised Antigravity review."""
-    return op_antigravity.hermes_antigravity_review_status()
+    """Return current state for the fixed Projections Calculator Antigravity review."""
+    return op_antigravity_tax.status()
 
 
 def hermes_antigravity_review_cancel(dry_run: bool = True) -> str:
-    """Cancel the fixed supervised Antigravity review process group."""
-    return op_antigravity.hermes_antigravity_review_cancel(dry_run=dry_run)
+    """Cancel the current fixed Projections Calculator Antigravity review."""
+    current = json.loads(op_antigravity_tax.status())
+    if not current.get("success"):
+        return json.dumps(current, indent=2, sort_keys=True)
+    task_id = current.get("task_id")
+    if not task_id:
+        return json.dumps(
+            {
+                "success": True,
+                "changed": False,
+                "status": current.get("status", "not_started"),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    return op_antigravity_tax.cancel(str(task_id), dry_run=dry_run)
 
 
 def hermes_git_status(workdir: str) -> str:

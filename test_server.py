@@ -434,6 +434,38 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
         assert forbidden not in status["registered_operator_tools"]
 
 
+def test_antigravity_public_tools_route_to_tax_calculator_launcher(monkeypatch):
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(
+        server.op_antigravity_tax,
+        "start",
+        lambda dry_run=True: calls.append(("start", dry_run)) or json.dumps({"success": True}),
+    )
+    monkeypatch.setattr(
+        server.op_antigravity_tax,
+        "status",
+        lambda: calls.append(("status", None))
+        or json.dumps({"success": True, "status": "running", "task_id": "agt_123"}),
+    )
+    monkeypatch.setattr(
+        server.op_antigravity_tax,
+        "cancel",
+        lambda task_id, dry_run=True: calls.append(("cancel", (task_id, dry_run)))
+        or json.dumps({"success": True}),
+    )
+
+    assert json.loads(server.hermes_antigravity_review_start(dry_run=True))["success"] is True
+    assert json.loads(server.hermes_antigravity_review_status())["success"] is True
+    assert json.loads(server.hermes_antigravity_review_cancel(dry_run=False))["success"] is True
+    assert calls == [
+        ("start", True),
+        ("status", None),
+        ("status", None),
+        ("cancel", ("agt_123", False)),
+    ]
+
+
 def test_authenticated_http_bridge_requires_bearer_token(monkeypatch, tmp_path):
     clear_gate_envs(monkeypatch)
     auth_root = tmp_path / "auth"
