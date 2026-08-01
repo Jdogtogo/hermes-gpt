@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import os
 import stat
 import sys
+import tarfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import operator_antigravity_tax as ag
 
@@ -227,9 +231,108 @@ def test_existing_non_executable_output_file_is_writable(tmp_path: Path) -> None
     assert ag._output_path_is_writable(tmp_path / "new" / "review.yaml") is True
 
 
+def test_preflight_accepts_dirty_live_worktree_because_review_uses_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _patch_paths(monkeypatch, tmp_path)
+    agy = tmp_path / "agy"
+    agy.write_text("#!/bin/sh\n", encoding="utf-8")
+    os.chmod(agy, 0o700)
+    monkeypatch.setattr(ag, "AGY_BINARY", agy)
+    monkeypatch.setattr(
+        ag.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_name=ag.HOST_USER),
+    )
+    monkeypatch.setattr(ag.os, "getuid", lambda: 1000)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        if argv[:3] == ["git", "rev-parse", "--verify"]:
+            short = argv[3].split("^")[0]
+            return 0, f"full-{short}\n", ""
+        if argv[:2] == ["git", "status"]:
+            raise AssertionError("preflight must not inspect or reject unrelated worktree changes")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(ag, "_run", fake_run)
+
+    resolved = ag._preflight()
+
+    assert resolved == {commit: f"full-{commit}" for commit in ag.TARGET_COMMITS}
+    assert len(calls) == len(ag.TARGET_COMMITS)
+
+
+def test_changed_test_discovery_uses_resolved_commit_range_and_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    review_root = tmp_path / "approved-commit-snapshot"
+    review_root.mkdir()
+    (review_root / "test_changed.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    resolved = {commit: f"full-{commit}" for commit in ag.TARGET_COMMITS}
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["cwd"] = kwargs["cwd"]
+        return 0, "test_changed.py\n", ""
+
+    monkeypatch.setattr(ag, "_run", fake_run)
+
+    commands = ag._collect_changed_test_commands(review_root, resolved)
+
+    assert captured["argv"] == [
+        "git",
+        "diff",
+        "--name-only",
+        f"full-{ag.TARGET_COMMITS[0]}^..full-{ag.TARGET_COMMITS[-1]}",
+    ]
+    assert captured["cwd"] == ag.TAX_CALCULATOR_ROOT
+    assert ["pytest", "-q", "-p", "no:cacheprovider", "test_changed.py"] in commands
+
+
+def test_snapshot_archive_extracts_regular_files_and_rejects_links(tmp_path: Path) -> None:
+    regular = io.BytesIO()
+    with tarfile.open(fileobj=regular, mode="w:") as archive:
+        payload = b"approved source\n"
+        member = tarfile.TarInfo("src/example.txt")
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+
+    destination = tmp_path / "snapshot"
+    ag._extract_snapshot_archive(regular.getvalue(), destination)
+    assert (destination / "src" / "example.txt").read_bytes() == b"approved source\n"
+
+    unsafe = io.BytesIO()
+    with tarfile.open(fileobj=unsafe, mode="w:") as archive:
+        member = tarfile.TarInfo("src/link")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "/etc/passwd"
+        archive.addfile(member)
+
+    with pytest.raises(RuntimeError, match="Unsupported review snapshot archive entry type"):
+        ag._extract_snapshot_archive(unsafe.getvalue(), tmp_path / "unsafe-snapshot")
+
+    sensitive = io.BytesIO()
+    with tarfile.open(fileobj=sensitive, mode="w:") as archive:
+        payload = b"secret\n"
+        member = tarfile.TarInfo("config/.env.production")
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+
+    with pytest.raises(RuntimeError, match="Sensitive path is not permitted"):
+        ag._extract_snapshot_archive(sensitive.getvalue(), tmp_path / "sensitive-snapshot")
+
+
 def test_prompt_and_control_status_support_checkpoints(tmp_path: Path) -> None:
     checkpoint = tmp_path / "slice-01.txt"
-    prompt = ag._build_prompt(1, [checkpoint], tmp_path / "inputs")
+    prompt = ag._build_prompt(
+        1,
+        [checkpoint],
+        tmp_path / "inputs",
+        tmp_path / "approved-commit-snapshot",
+    )
     assert "bounded review slice 2" in prompt
     assert str(checkpoint) in prompt
     assert "HERMES_SLICE_STATUS: CONTINUE" in prompt
@@ -265,7 +368,13 @@ def test_worker_continues_from_checkpoint_then_completes(monkeypatch, tmp_path: 
         lambda: {commit: f"full-{commit}" for commit in ag.TARGET_COMMITS},
     )
 
-    def fake_collect(_resolved, target_input_dir, **_kwargs):
+    monkeypatch.setattr(
+        ag,
+        "_create_review_snapshot",
+        lambda _resolved, destination, **_kwargs: destination.mkdir(parents=True, exist_ok=True),
+    )
+
+    def fake_collect(_resolved, target_input_dir, _review_root, **_kwargs):
         target_input_dir.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(ag, "_collect_review_inputs", fake_collect)
@@ -328,8 +437,15 @@ def test_worker_stops_after_repeated_identical_failure(monkeypatch, tmp_path: Pa
     )
     monkeypatch.setattr(
         ag,
+        "_create_review_snapshot",
+        lambda _resolved, destination, **_kwargs: destination.mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        ag,
         "_collect_review_inputs",
-        lambda _resolved, target_input_dir, **_kwargs: target_input_dir.mkdir(parents=True, exist_ok=True),
+        lambda _resolved, target_input_dir, _review_root, **_kwargs: target_input_dir.mkdir(
+            parents=True, exist_ok=True
+        ),
     )
     monkeypatch.setattr(ag, "_load_settings", lambda: (None, None, {}))
     monkeypatch.setattr(ag, "_install_read_permissions", lambda *_args: None)

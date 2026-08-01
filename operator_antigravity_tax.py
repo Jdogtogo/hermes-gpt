@@ -8,16 +8,19 @@ state are written only to fixed Hermes-owned locations.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import pwd
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import operator_policy as op
@@ -63,6 +66,22 @@ _MARKDOWN_START = "---BEGIN_MARKDOWN---"
 _MARKDOWN_END = "---END_MARKDOWN---"
 _YAML_START = "---BEGIN_YAML---"
 _YAML_END = "---END_YAML---"
+
+_SENSITIVE_SNAPSHOT_COMPONENTS = frozenset(
+    {
+        "credentials",
+        "api keys",
+        "oauth tokens",
+        "authentication databases",
+        "secret stores",
+        "private keys",
+        "ssh material",
+        "runtime session databases",
+        "operator approval databases",
+        "operator policy",
+        "operator session state",
+    }
+)
 
 
 def _json(data: dict[str, Any]) -> str:
@@ -177,6 +196,83 @@ def _run(argv: list[str], *, cwd: Path, timeout: int) -> tuple[int, str, str]:
     return proc.returncode, op.redact_output(proc.stdout), op.redact_output(proc.stderr)
 
 
+def _run_bytes(argv: list[str], *, cwd: Path, timeout: int) -> tuple[int, bytes, str]:
+    proc = subprocess.run(
+        argv,
+        cwd=str(cwd),
+        env=_sanitized_env(),
+        capture_output=True,
+        text=False,
+        timeout=timeout,
+        shell=False,
+    )
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    return proc.returncode, proc.stdout, op.redact_output(stderr)
+
+
+def _snapshot_member_is_sensitive(relative: PurePosixPath) -> bool:
+    lowered_parts = tuple(part.casefold() for part in relative.parts)
+    for part in lowered_parts:
+        if part == ".env" or part.startswith(".env."):
+            return True
+        if part in _SENSITIVE_SNAPSHOT_COMPONENTS:
+            return True
+    return len(lowered_parts) >= 2 and lowered_parts[-2:] == (".git", "config")
+
+
+def _extract_snapshot_archive(archive_bytes: bytes, destination: Path) -> None:
+    temporary = destination.with_name(destination.name + f".tmp-{uuid.uuid4().hex[:8]}")
+    temporary.mkdir(parents=True, exist_ok=False)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+            members = archive.getmembers()
+            if len(members) > 100_000:
+                raise RuntimeError("Review snapshot archive contains too many entries.")
+            total_size = 0
+            for member in members:
+                relative = PurePosixPath(member.name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise RuntimeError(f"Unsafe review snapshot archive path: {member.name}")
+                if _snapshot_member_is_sensitive(relative):
+                    raise RuntimeError(
+                        f"Sensitive path is not permitted in the review snapshot: {member.name}"
+                    )
+                if not (member.isdir() or member.isfile()):
+                    raise RuntimeError(
+                        f"Unsupported review snapshot archive entry type: {member.name}"
+                    )
+                total_size += max(0, int(member.size))
+                if total_size > 2 * 1024 * 1024 * 1024:
+                    raise RuntimeError("Review snapshot archive exceeds the 2 GiB safety limit.")
+            archive.extractall(path=temporary, members=members)
+        os.replace(temporary, destination)
+    except BaseException:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def _create_review_snapshot(
+    resolved_commits: dict[str, str],
+    destination: Path,
+    *,
+    timeout: int,
+) -> None:
+    if destination.exists():
+        raise RuntimeError(f"Review snapshot path already exists: {destination}")
+    final_commit = resolved_commits[TARGET_COMMITS[-1]]
+    rc, archive_bytes, stderr = _run_bytes(
+        ["git", "archive", "--format=tar", final_commit],
+        cwd=TAX_CALCULATOR_ROOT,
+        timeout=timeout,
+    )
+    if rc != 0 or not archive_bytes:
+        raise RuntimeError(
+            f"Could not create immutable review snapshot for {final_commit}: {stderr.strip()}"
+        )
+    _extract_snapshot_archive(archive_bytes, destination)
+
+
 def _output_path_is_writable(target: Path) -> bool:
     """Return whether the fixed output can be safely created or replaced.
 
@@ -220,36 +316,27 @@ def _preflight() -> dict[str, str]:
         if rc != 0 or not stdout.strip():
             raise RuntimeError(f"Target commit {commit} is unavailable: {stderr.strip()}")
         resolved[commit] = stdout.strip()
-    rc, stdout, stderr = _run(
-        ["git", "rev-parse", "HEAD"], cwd=TAX_CALCULATOR_ROOT, timeout=30
-    )
-    if rc != 0 or stdout.strip() != resolved[TARGET_COMMITS[-1]]:
-        raise RuntimeError(
-            "material_scope_change: Tax Calculator HEAD is not the approved final review commit "
-            f"{resolved[TARGET_COMMITS[-1]]}: {stderr.strip()}"
-        )
-    rc, stdout, stderr = _run(
-        ["git", "status", "--porcelain=v1"], cwd=TAX_CALCULATOR_ROOT, timeout=30
-    )
-    tracked_changes = [line for line in stdout.splitlines() if line and not line.startswith("?? ")]
-    if rc != 0 or tracked_changes:
-        raise RuntimeError(
-            "material_scope_change: Tax Calculator has tracked working-tree changes; "
-            "refusing to review a state different from the approved commits. "
-            + stderr.strip()
-        )
     return resolved
 
 
-def _collect_changed_test_commands() -> list[list[str]]:
+def _collect_changed_test_commands(
+    review_root: Path,
+    resolved_commits: dict[str, str],
+) -> list[list[str]]:
     commands: list[list[str]] = [["pytest", "-q", "-p", "no:cacheprovider"]]
+    resolved_range = (
+        f"{resolved_commits[TARGET_COMMITS[0]]}^.."
+        f"{resolved_commits[TARGET_COMMITS[-1]]}"
+    )
     rc, stdout, _stderr = _run(
-        ["git", "diff", "--name-only", TARGET_RANGE], cwd=TAX_CALCULATOR_ROOT, timeout=60
+        ["git", "diff", "--name-only", resolved_range],
+        cwd=TAX_CALCULATOR_ROOT,
+        timeout=60,
     )
     if rc == 0:
         seen: set[str] = set()
         for relative in stdout.splitlines():
-            path = TAX_CALCULATOR_ROOT / relative
+            path = review_root / relative
             lowered = relative.lower()
             if not path.is_file():
                 continue
@@ -264,8 +351,8 @@ def _collect_changed_test_commands() -> list[list[str]]:
                 seen.add(key)
                 commands.append(command)
     for name in ("run-fixtures.mjs", "run-fixtures-v2.mjs"):
-        for path in sorted(TAX_CALCULATOR_ROOT.rglob(name)):
-            relative = str(path.relative_to(TAX_CALCULATOR_ROOT))
+        for path in sorted(review_root.rglob(name)):
+            relative = str(path.relative_to(review_root))
             command = ["node", relative]
             key = "\0".join(command)
             if not any("\0".join(existing) == key for existing in commands):
@@ -276,6 +363,7 @@ def _collect_changed_test_commands() -> list[list[str]]:
 def _collect_review_inputs(
     resolved_commits: dict[str, str],
     input_dir: Path,
+    review_root: Path,
     *,
     envelope_deadline: int,
     expected_session_id: str,
@@ -299,12 +387,32 @@ def _collect_review_inputs(
         f"returncode={baseline_rc}\n\nSTDOUT\n{baseline_stdout}\n\nSTDERR\n{baseline_stderr}\n",
     )
     _atomic_write(input_dir / "resolved-commits.json", json.dumps(resolved_commits, indent=2) + "\n")
+    _atomic_write(
+        input_dir / "review-snapshot.json",
+        json.dumps(
+            {
+                "source_repository": str(TAX_CALCULATOR_ROOT),
+                "snapshot_root": str(review_root),
+                "snapshot_commit": resolved_commits[TARGET_COMMITS[-1]],
+                "source_worktree_may_contain_unrelated_changes": True,
+                "tests_execute_only_in_snapshot": True,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
 
+    final_commit = resolved_commits[TARGET_COMMITS[-1]]
+    resolved_range = (
+        f"{resolved_commits[TARGET_COMMITS[0]]}^.."
+        f"{resolved_commits[TARGET_COMMITS[-1]]}"
+    )
     evidence_commands = [
-        ["git", "log", "-3", "--format=fuller", "--decorate=short"],
-        ["git", "diff", "--stat", TARGET_RANGE],
-        ["git", "diff", TARGET_RANGE, "--"],
-        ["git", "grep", "-n", "PASS=93"],
+        ["git", "log", "-3", "--format=fuller", "--decorate=short", final_commit],
+        ["git", "diff", "--stat", resolved_range],
+        ["git", "diff", resolved_range, "--"],
+        ["git", "grep", "-n", "PASS=93", final_commit, "--"],
     ]
     sections: list[str] = []
     for argv in evidence_commands:
@@ -328,12 +436,12 @@ def _collect_review_inputs(
     _atomic_write(input_dir / "git-evidence.md", "\n".join(sections))
 
     test_sections: list[str] = []
-    for argv in _collect_changed_test_commands():
+    for argv in _collect_changed_test_commands(review_root, resolved_commits):
         started = time.time()
         try:
             rc, stdout, stderr = _run(
                 argv,
-                cwd=TAX_CALCULATOR_ROOT,
+                cwd=review_root,
                 timeout=bounded_timeout(WORKER_SLICE_TIMEOUT_SECONDS),
             )
         except subprocess.TimeoutExpired:
@@ -414,12 +522,20 @@ def _restore_settings(original: bytes | None, mode: int | None) -> None:
         os.chmod(SETTINGS_PATH, mode)
 
 
-def _build_prompt(slice_index: int, checkpoint_paths: list[Path], input_dir: Path) -> str:
+def _build_prompt(
+    slice_index: int,
+    checkpoint_paths: list[Path],
+    input_dir: Path,
+    review_root: Path,
+) -> str:
     commits = ", ".join(TARGET_COMMITS)
     checkpoint_text = "\n".join(f"- {path}" for path in checkpoint_paths) or "- none (initial slice)"
     return f"""Act as an independent senior tax-calculation software reviewer.
 This is bounded review slice {slice_index + 1}. Review the fixed Projections Calculator
-commits {commits} in the repository rooted at {TAX_CALCULATOR_ROOT}.
+commits {commits} using the immutable approved-commit snapshot rooted at {review_root}.
+The live source repository at {TAX_CALCULATOR_ROOT} may contain unrelated work in progress;
+do not inspect it directly. Use the supplied Git evidence under {input_dir} for commit history
+and diffs, and use only {review_root} for source, fixtures, documentation and tests.
 
 Read every file under {input_dir} first, including all prior slice checkpoints listed
 below. Reconcile their completed work before continuing and never repeat completed
@@ -428,9 +544,9 @@ analysis merely to fill time.
 Prior checkpoint files:
 {checkpoint_text}
 
-Inspect relevant source, fixtures, tests and documentation directly in the repository.
-Do not modify files and do not run commands. Independently challenge the previous
-implementer's conclusions.
+Inspect relevant source, fixtures, tests and documentation directly in the immutable
+snapshot. Do not modify files and do not run commands. Independently challenge the
+previous implementer's conclusions.
 
 Verify all of the following:
 1. JavaScript standard work-related deduction logic exactly matches the authoritative Python implementation.
@@ -617,6 +733,7 @@ def _terminate_process_group(pid: int) -> None:
 def _run_agy_slice(
     *,
     prompt: str,
+    review_root: Path,
     timeout: int,
     expected_session_id: str,
     expected_snapshot_hash: str,
@@ -635,7 +752,7 @@ def _run_agy_slice(
             "--print",
             prompt,
         ],
-        cwd=str(TAX_CALCULATOR_ROOT),
+        cwd=str(review_root),
         env=_sanitized_env(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -683,7 +800,8 @@ def start(dry_run: bool = False) -> str:
             "success": True,
             "dry_run": bool(dry_run or policy.effective_dry_run(dry_run)),
             "route": "supervised-host-agy-tax-review",
-            "workdir": str(TAX_CALCULATOR_ROOT),
+            "source_repository": str(TAX_CALCULATOR_ROOT),
+            "execution_source": "isolated-approved-commit-snapshot",
             "target_commits": list(TARGET_COMMITS),
             "resolved_commits": resolved,
             "model": MODEL,
@@ -883,15 +1001,37 @@ def _worker(task_id: str) -> int:
         envelope_deadline = int(state.get("envelope_deadline") or 0)
         run_dir = Path(str(state.get("run_dir") or ""))
         input_dir = Path(str(state.get("input_dir") or ""))
-        if not run_dir.is_absolute() or not input_dir.is_absolute() or input_dir.parent != run_dir:
+        review_root = run_dir / "approved-commit-snapshot"
+        expected_runs_root = RUNS_DIR.resolve(strict=False)
+        resolved_run_dir = run_dir.resolve(strict=False)
+        resolved_input_dir = input_dir.resolve(strict=False)
+        if (
+            not run_dir.is_absolute()
+            or not input_dir.is_absolute()
+            or resolved_run_dir.parent != expected_runs_root
+            or resolved_input_dir.parent != resolved_run_dir
+        ):
             raise RuntimeError("Task state contains invalid run directory paths.")
         _assert_authority(expected_session_id, expected_snapshot_hash)
         _write_state(status="running", pid=os.getpid(), worker_started_at=int(time.time()))
 
         resolved = _preflight()
+        remaining_for_snapshot = envelope_deadline - int(time.time())
+        if remaining_for_snapshot <= 0:
+            raise subprocess.TimeoutExpired(cmd="git archive", timeout=300)
+        _create_review_snapshot(
+            resolved,
+            review_root,
+            timeout=max(1, min(300, remaining_for_snapshot)),
+        )
+        _write_state(
+            snapshot_root=str(review_root),
+            snapshot_commit=resolved[TARGET_COMMITS[-1]],
+        )
         _collect_review_inputs(
             resolved,
             input_dir,
+            review_root,
             envelope_deadline=envelope_deadline,
             expected_session_id=expected_session_id,
             expected_snapshot_hash=expected_snapshot_hash,
@@ -900,7 +1040,7 @@ def _worker(task_id: str) -> int:
 
         settings_original, settings_mode, settings_data = _load_settings()
         restore_required = True
-        _install_read_permissions([TAX_CALCULATOR_ROOT, input_dir], settings_data, settings_mode)
+        _install_read_permissions([review_root, input_dir], settings_data, settings_mode)
 
         checkpoint_dir = input_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -950,7 +1090,8 @@ def _worker(task_id: str) -> int:
                 latest_checkpoint=str(checkpoint_paths[-1]) if checkpoint_paths else None,
             )
             rc, stdout, stderr = _run_agy_slice(
-                prompt=_build_prompt(slice_index, checkpoint_paths, input_dir),
+                prompt=_build_prompt(slice_index, checkpoint_paths, input_dir, review_root),
+                review_root=review_root,
                 timeout=slice_timeout,
                 expected_session_id=expected_session_id,
                 expected_snapshot_hash=expected_snapshot_hash,
