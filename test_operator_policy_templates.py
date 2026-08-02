@@ -161,6 +161,29 @@ def test_unknown_template_rejected():
         templates.resolve_template("does-not-exist")
 
 
+def test_jb_mailbox_reconciliation_is_narrow_and_source_read_only():
+    resolved = templates.resolve_template("jb-mailbox-canonical-asset-reconciliation")
+    policy = resolved["policy"]
+    source_root = "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage"
+
+    assert resolved["active"] is True
+    assert resolved["max_duration_seconds"] == 4 * 60 * 60
+    assert policy["allowed_profiles"] == ["backend-eng"]
+    assert source_root in policy["readable_roots"]
+    assert source_root not in policy["writable_roots"]
+    assert policy["writable_roots"] == [
+        "/home/jfroh/.hermes/ops-brain/evidence",
+        "/home/jfroh/.hermes/ops-brain/projects/jb-mailbox-triage-dashboard.md",
+    ]
+    assert policy["verbs"] == {
+        "filesystem": ["read", "edit"],
+        "tests": ["run"],
+    }
+    assert "git" not in policy["verbs"]
+    assert "services" not in policy["verbs"]
+    assert f"{source_root}/**/.git/config" in policy["hard_denied_paths"]
+
+
 def test_tax_calculator_template_is_active():
     assert "tax-calculator-controller" in templates.active_template_names()
     assert "sandbox" in templates.active_template_names()

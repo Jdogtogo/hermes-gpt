@@ -388,6 +388,59 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": None,
         "baseline_required": False,
     },
+    "jb-mailbox-canonical-asset-reconciliation": {
+        "active": True,
+        "description": (
+            "Read-only reconciliation of the recovered JB Mailbox Triage implementation "
+            "foundation against canonical OpsBrain specifications, with narrowly scoped "
+            "evidence and project-record writes only."
+        ),
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["backend-eng"],
+            "readable_roots": [
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage",
+                "/home/jfroh/.hermes/ops-brain",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/ops-brain/evidence",
+                "/home/jfroh/.hermes/ops-brain/projects/jb-mailbox-triage-dashboard.md",
+            ],
+            "hard_denied_paths": [
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/.env",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/.env.*",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/**/credentials",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/**/API keys",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/**/OAuth tokens",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/**/authentication databases",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/**/secret stores",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/**/private keys",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/**/SSH material",
+                "/mnt/c/Users/jfroh/OneDrive - The Trustee for JP and LA FROHNERT PTY LIMITED/Exit/Externally Share Client Folders/Documents/New project/practice-hub-jv-email-triage/**/.git/config",
+                "/home/jfroh/.hermes/ops-brain/.env",
+                "/home/jfroh/.hermes/ops-brain/.env.*",
+                "/home/jfroh/.hermes/ops-brain/**/credentials",
+                "/home/jfroh/.hermes/ops-brain/**/API keys",
+                "/home/jfroh/.hermes/ops-brain/**/OAuth tokens",
+                "/home/jfroh/.hermes/ops-brain/**/authentication databases",
+                "/home/jfroh/.hermes/ops-brain/**/secret stores",
+                "/home/jfroh/.hermes/ops-brain/**/private keys",
+                "/home/jfroh/.hermes/ops-brain/**/SSH material",
+                "/home/jfroh/.hermes/ops-brain/**/.git/config",
+                "/home/jfroh/.hermes/ops-brain/**/runtime session databases",
+                "/home/jfroh/.hermes/ops-brain/**/operator approval databases",
+                "/home/jfroh/.hermes/ops-brain/**/operator policy/session state",
+            ],
+            "verbs": {
+                "filesystem": ["read", "edit"],
+                "tests": ["run"],
+            },
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": None,
+        "baseline_required": False,
+    },
     "tax-calculator-controller": {
         "active": True,
         "description": (
