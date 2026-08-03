@@ -43,6 +43,8 @@ LONG_HORIZON_STOP_CONDITIONS = frozenset({
     "authority_expiry",
 })
 SLICE_STATUS_PREFIX = "HERMES_SLICE_STATUS:"
+FINAL_ANSWER_BEGIN = "---BEGIN_HERMES_FINAL_ANSWER---"
+FINAL_ANSWER_END = "---END_HERMES_FINAL_ANSWER---"
 ADAPTER_NAME = "hermes-profile-delegation"
 TERMINAL_STATES = frozenset({"completed", "incomplete", "failed", "timed_out", "cancelled", "blocked"})
 RESUMABLE_STATES = frozenset({"incomplete", "failed", "timed_out", "blocked"})
@@ -173,6 +175,81 @@ def _safe_text(value: str) -> str:
     if len(redacted) <= MAX_OUTPUT_CHARS:
         return redacted
     return redacted[:MAX_OUTPUT_CHARS] + f"\n... [truncated {len(redacted)-MAX_OUTPUT_CHARS} chars]"
+
+
+def _legacy_token_candidate(value: str) -> bool:
+    """Return true only for a narrow machine-token shaped legacy answer."""
+    candidate = value.strip()
+    if not candidate or len(candidate) > 256 or not candidate[0].isalnum():
+        return False
+    allowed_punctuation = "_.:-"
+    return any("A" <= char <= "Z" for char in candidate) and all(
+        ("A" <= char <= "Z") or char.isdigit() or char in allowed_punctuation
+        for char in candidate
+    )
+
+
+def _final_answer_noise_line(value: str) -> bool:
+    stripped = value.strip()
+    lowered = stripped.lower()
+    if not stripped:
+        return True
+    if stripped.upper().startswith(SLICE_STATUS_PREFIX):
+        return True
+    if lowered.startswith("session_id:"):
+        return True
+    if "tirith security scanner" in lowered:
+        return True
+    if stripped.startswith("⚠"):
+        return True
+    if "reasoning" in lowered and any(char in stripped for char in "┌─┐"):
+        return True
+    if lowered.startswith("... [truncated"):
+        return True
+    return False
+
+
+def _extract_final_answer(stdout: str, stderr: str = "") -> tuple[str | None, str]:
+    """Extract a caller-facing answer while retaining raw output separately.
+
+    New workers are instructed to wrap their final response in deterministic
+    delimiters. Legacy output receives only a narrow fallback: a machine-token
+    shaped terminal line, or a single non-diagnostic line. Ambiguous transcripts
+    fail closed instead of presenting reasoning or diagnostics as a final answer.
+    """
+    streams = (stdout or "", stderr or "")
+    saw_structured_marker = False
+    for stream in streams:
+        if FINAL_ANSWER_BEGIN in stream or FINAL_ANSWER_END in stream:
+            saw_structured_marker = True
+        end_index = stream.rfind(FINAL_ANSWER_END)
+        if end_index < 0:
+            continue
+        start_index = stream.rfind(FINAL_ANSWER_BEGIN, 0, end_index)
+        if start_index < 0:
+            continue
+        answer = stream[start_index + len(FINAL_ANSWER_BEGIN):end_index].strip()
+        if not answer:
+            return None, "structured_empty"
+        return _safe_text(answer), "structured_delimiters"
+
+    if saw_structured_marker:
+        return None, "structured_incomplete"
+
+    meaningful = [
+        line.strip()
+        for line in (stdout or "").splitlines()
+        if not _final_answer_noise_line(line)
+    ]
+    if not meaningful:
+        return None, "not_found"
+
+    candidate = meaningful[-1]
+    if _legacy_token_candidate(candidate):
+        return _safe_text(candidate), "legacy_terminal_token"
+    if len(meaningful) == 1:
+        return _safe_text(candidate), "legacy_single_line"
+    return None, "unstructured_ambiguous"
 
 
 def _workspace_snapshot(root: Path) -> dict[str, tuple[int, int]]:
@@ -732,6 +809,14 @@ def _build_argv(
         )
         if allow_web:
             toolsets.append("web")
+    prefix += (
+        "\nPlace only the final response intended for the caller between these exact delimiter lines:\n"
+        f"{FINAL_ANSWER_BEGIN}\n"
+        "<final response>\n"
+        f"{FINAL_ANSWER_END}\n"
+        "Keep reasoning, diagnostics, warnings, tool transcripts, and control lines outside the delimiters. "
+        "Always emit both delimiters, even when the final response is one line."
+    )
     if long_horizon and long_horizon.get("enabled"):
         prefix += (
             "\nThis is one bounded slice of a durable long-horizon task. Reconcile the latest "
@@ -1485,6 +1570,10 @@ def hermes_delegated_task_result(task_id: str) -> str:
                 },
                 indent=2,
             )
+        final_answer, final_answer_extraction_status = _extract_final_answer(
+            str(task.get("stdout") or ""),
+            str(task.get("stderr") or ""),
+        )
         return json.dumps({
             "success": task["status"] == "completed",
             "logical_work_id": task.get("logical_work_id"),
@@ -1502,6 +1591,8 @@ def hermes_delegated_task_result(task_id: str) -> str:
             "status": task["status"],
             "ready": True,
             "returncode": task.get("returncode"),
+            "final_answer": final_answer,
+            "final_answer_extraction_status": final_answer_extraction_status,
             "stdout": task.get("stdout", ""),
             "stderr": task.get("stderr", ""),
             "messages": task.get("messages", []),

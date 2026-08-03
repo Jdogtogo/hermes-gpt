@@ -620,6 +620,109 @@ def test_result_redacts_and_returns_terminal_output(monkeypatch, tmp_path):
     assert result["success"] is True
     assert result["ready"] is True
     assert result["stdout"] == "done"
+    assert result["final_answer"] == "done"
+    assert result["final_answer_extraction_status"] == "legacy_single_line"
+    assert "stderr" in result
+    assert "messages" in result
+    assert "changed_files" in result
+
+
+def test_extract_final_answer_legacy_token_after_diagnostics_and_reasoning():
+    stdout = (
+        "⚠ tirith security scanner enabled but not available — command scanning will use pattern matching only\n"
+        "┌─ Reasoning ─────────────────────────────┐\n"
+        "The file contains Result: PASS. I must return the requested token.\n"
+        "HERMES_CONNECTOR_DELEGATION_OK\n"
+    )
+
+    answer, status = delegation._extract_final_answer(stdout)
+
+    assert answer == "HERMES_CONNECTOR_DELEGATION_OK"
+    assert status == "legacy_terminal_token"
+
+
+def test_extract_final_answer_prefers_structured_multiline_block():
+    stdout = (
+        "diagnostic before response\n"
+        f"{delegation.FINAL_ANSWER_BEGIN}\n"
+        "First line\nSecond line\n"
+        f"{delegation.FINAL_ANSWER_END}\n"
+        "HERMES_SLICE_STATUS: COMPLETE\n"
+    )
+
+    answer, status = delegation._extract_final_answer(stdout)
+
+    assert answer == "First line\nSecond line"
+    assert status == "structured_delimiters"
+
+
+def test_extract_final_answer_fails_closed_for_incomplete_structured_block():
+    stdout = (
+        f"{delegation.FINAL_ANSWER_BEGIN}\n"
+        "partial answer without closing delimiter\n"
+        "HERMES_CONNECTOR_DELEGATION_OK\n"
+    )
+
+    answer, status = delegation._extract_final_answer(stdout)
+
+    assert answer is None
+    assert status == "structured_incomplete"
+
+
+def test_extract_final_answer_fails_closed_for_ambiguous_legacy_transcript():
+    stdout = "I inspected the file.\nI think the final response should confirm success.\n"
+
+    answer, status = delegation._extract_final_answer(stdout)
+
+    assert answer is None
+    assert status == "unstructured_ambiguous"
+
+
+def test_extract_final_answer_returns_not_found_for_diagnostics_only():
+    stdout = (
+        "⚠ tirith security scanner enabled but not available\n"
+        "┌─ Reasoning ─────────────────────────────┐\n"
+        "HERMES_SLICE_STATUS: FAILED\n"
+    )
+
+    answer, status = delegation._extract_final_answer(stdout)
+
+    assert answer is None
+    assert status == "not_found"
+
+
+def test_extract_final_answer_preserves_redaction(monkeypatch):
+    monkeypatch.setattr(
+        delegation.op,
+        "redact_output",
+        lambda value: value.replace("secret-value", "[REDACTED]"),
+    )
+    stdout = (
+        f"{delegation.FINAL_ANSWER_BEGIN}\n"
+        "Result contains secret-value\n"
+        f"{delegation.FINAL_ANSWER_END}\n"
+    )
+
+    answer, status = delegation._extract_final_answer(stdout)
+
+    assert answer == "Result contains [REDACTED]"
+    assert status == "structured_delimiters"
+
+
+def test_build_argv_requires_structured_final_answer_delimiters(tmp_path):
+    argv = delegation._build_argv(
+        prompt="Return a result.",
+        mode="read_only",
+        profile="default",
+        workdir=tmp_path,
+        max_turns=10,
+        allow_web=False,
+    )
+    effective_prompt = argv[argv.index("-q") + 1]
+
+    assert delegation.FINAL_ANSWER_BEGIN in effective_prompt
+    assert delegation.FINAL_ANSWER_END in effective_prompt
+    assert "Keep reasoning, diagnostics, warnings" in effective_prompt
 
 
 ALL_LONG_HORIZON_STOPS = sorted(delegation.LONG_HORIZON_STOP_CONDITIONS)
