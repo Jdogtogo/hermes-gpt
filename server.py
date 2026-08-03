@@ -23,6 +23,7 @@ import operator_sessions as op_sessions
 import operator_policy_templates as op_templates
 import operator_delegation as op_delegation
 import operator_antigravity_tax as op_antigravity_tax
+import operator_antigravity_dispatch as op_antigravity_dispatch
 import dcr_compat
 
 try:
@@ -1280,6 +1281,32 @@ def hermes_antigravity_review_cancel(dry_run: bool = True) -> str:
     return op_antigravity_tax.cancel(str(task_id), dry_run=dry_run)
 
 
+def hermes_antigravity_smoke_test(dry_run: bool = True) -> str:
+    """Run the fixed exact-output host Antigravity connectivity test."""
+    return op_antigravity_dispatch.hermes_antigravity_smoke_test(dry_run=dry_run)
+
+
+def hermes_antigravity_dispatch(packet_path: str, dry_run: bool = True) -> str:
+    """Queue a governed read-only Antigravity analysis from a structured packet."""
+    return op_antigravity_dispatch.hermes_antigravity_dispatch(
+        packet_path=packet_path,
+        dry_run=dry_run,
+    )
+
+
+def hermes_antigravity_dispatch_status(task_id: str) -> str:
+    """Return state and bounded evidence for one governed Antigravity dispatch."""
+    return op_antigravity_dispatch.hermes_antigravity_dispatch_status(task_id=task_id)
+
+
+def hermes_antigravity_dispatch_cancel(task_id: str, dry_run: bool = True) -> str:
+    """Cancel one governed Antigravity dispatch process group."""
+    return op_antigravity_dispatch.hermes_antigravity_dispatch_cancel(
+        task_id=task_id,
+        dry_run=dry_run,
+    )
+
+
 def hermes_git_status(workdir: str) -> str:
     return op_workspace.hermes_git_status(workdir=workdir)
 
@@ -1756,6 +1783,10 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_antigravity_review_start,
         hermes_antigravity_review_status,
         hermes_antigravity_review_cancel,
+        hermes_antigravity_smoke_test,
+        hermes_antigravity_dispatch,
+        hermes_antigravity_dispatch_status,
+        hermes_antigravity_dispatch_cancel,
         hermes_delegate_task_forecast,
         hermes_delegate_task,
         hermes_delegated_task_status,

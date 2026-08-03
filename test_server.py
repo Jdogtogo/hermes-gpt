@@ -350,6 +350,10 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_workspace_run_test",
         "hermes_workspace_exec",
         "hermes_workspace_git_commit",
+        "hermes_antigravity_smoke_test",
+        "hermes_antigravity_dispatch",
+        "hermes_antigravity_dispatch_status",
+        "hermes_antigravity_dispatch_cancel",
         "hermes_delegate_task",
         "hermes_delegated_task_status",
         "hermes_delegated_task_result",
@@ -409,7 +413,7 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     # Self-report matches the actual live tool surface, exactly.
     assert sorted(status["registered_operator_tools"]) == live_names
     assert status["registered_tool_count"] == len(live_names)
-    assert len(live_names) == 34
+    assert len(live_names) == 38
 
     # The session and narrowly gated maintenance tools must be reported...
     for required in [
@@ -422,6 +426,10 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
         "hermes_antigravity_review_start",
         "hermes_antigravity_review_status",
         "hermes_antigravity_review_cancel",
+        "hermes_antigravity_smoke_test",
+        "hermes_antigravity_dispatch",
+        "hermes_antigravity_dispatch_status",
+        "hermes_antigravity_dispatch_cancel",
     ]:
         assert required in status["registered_operator_tools"]
     # ...and the deliberately-excluded tools must not be.
@@ -463,6 +471,47 @@ def test_antigravity_public_tools_route_to_tax_calculator_launcher(monkeypatch):
         ("status", None),
         ("status", None),
         ("cancel", ("agt_123", False)),
+    ]
+
+
+def test_governed_antigravity_dispatch_tools_route_to_dispatch_module(monkeypatch):
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        server.op_antigravity_dispatch,
+        "hermes_antigravity_smoke_test",
+        lambda dry_run=True: calls.append(("smoke", dry_run)) or json.dumps({"success": True}),
+    )
+    monkeypatch.setattr(
+        server.op_antigravity_dispatch,
+        "hermes_antigravity_dispatch",
+        lambda packet_path, dry_run=True: calls.append(("dispatch", (packet_path, dry_run)))
+        or json.dumps({"success": True}),
+    )
+    monkeypatch.setattr(
+        server.op_antigravity_dispatch,
+        "hermes_antigravity_dispatch_status",
+        lambda task_id: calls.append(("status", task_id)) or json.dumps({"success": True}),
+    )
+    monkeypatch.setattr(
+        server.op_antigravity_dispatch,
+        "hermes_antigravity_dispatch_cancel",
+        lambda task_id, dry_run=True: calls.append(("cancel", (task_id, dry_run)))
+        or json.dumps({"success": True}),
+    )
+
+    assert json.loads(server.hermes_antigravity_smoke_test(dry_run=True))["success"] is True
+    assert json.loads(
+        server.hermes_antigravity_dispatch("/approved/packet.json", dry_run=False)
+    )["success"] is True
+    assert json.loads(server.hermes_antigravity_dispatch_status("agd_123"))["success"] is True
+    assert json.loads(
+        server.hermes_antigravity_dispatch_cancel("agd_123", dry_run=False)
+    )["success"] is True
+    assert calls == [
+        ("smoke", True),
+        ("dispatch", ("/approved/packet.json", False)),
+        ("status", "agd_123"),
+        ("cancel", ("agd_123", False)),
     ]
 
 
