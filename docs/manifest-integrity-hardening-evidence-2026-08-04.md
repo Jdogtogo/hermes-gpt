@@ -63,13 +63,16 @@ Completed controller verification:
 4. Native baseline generation:
    - FastMCP's registered input schemas produced fingerprint `5e3d36f8ffcd1aafcfc39157f0411907710f585dae93136edefa07c496e3d9c8` for the exact 38-tool surface.
 
-Remaining acceptance gates:
+Completed runtime verification after deployment/restart:
 
-1. Runtime read-only check after deployment/restart:
-   - call `hermes_operator_status`;
-   - verify `public_manifest.status == "PASS"`;
-   - verify registered count `38` and exact pinned fingerprint.
-2. Genuine-new-ChatGPT-conversation gate:
+- `hermes_operator_status` returned `public_manifest.status == "PASS"`.
+- Registered and expected counts were both `38`.
+- Expected and actual schema fingerprints both equalled `5e3d36f8ffcd1aafcfc39157f0411907710f585dae93136edefa07c496e3d9c8`.
+- Missing, unexpected, duplicate, and schema-drift results were all empty/false.
+
+Remaining acceptance gate:
+
+1. Genuine-new-ChatGPT-conversation gate:
    - compare discovery with the canonical manifest;
    - execute one read call;
    - execute one authorised actual write;
@@ -83,4 +86,4 @@ Remaining acceptance gates:
 
 ## Next Action
 
-Commit only the listed owned files, deploy/restart the operator connector when safe, verify the runtime `public_manifest` PASS result, then complete the genuine-new-conversation evidence gate.
+Complete the genuine-new-ChatGPT-conversation evidence gate, then reconcile the result into Mission Control/OpsBrain under an authority scope that permits those records to be updated.
