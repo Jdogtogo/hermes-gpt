@@ -17,6 +17,7 @@ import operator_skills as op_skills
 import operator_config as op_config
 import operator_workspace as op_workspace
 import operator_diagnostics as op_diagnostics
+import operator_manifest as op_manifest
 import operator_bridge as op_bridge
 import operator_auth as op_auth
 import operator_sessions as op_sessions
@@ -66,6 +67,11 @@ RUNTIME_TRANSPORT = "unknown"
 # populated by register_tools(); see build_server()/register_tools().
 RUNTIME_PROFILE = LOCAL_DEV_PROFILE
 REGISTERED_TOOL_NAMES: list[str] = []
+REGISTERED_TOOL_MANIFEST: list[dict[str, Any]] = []
+REGISTERED_MANIFEST_VALIDATION: dict[str, Any] = {
+    "applicable": False,
+    "status": "NOT_APPLICABLE",
+}
 
 HERMES_ROOT: Path | None = None
 IMPORT_ERROR: str | None = None
@@ -679,6 +685,7 @@ def hermes_operator_status() -> str:
             },
             "registered_operator_tools": registered,
             "registered_tool_count": len(registered),
+            "public_manifest": dict(REGISTERED_MANIFEST_VALIDATION),
             "audit_log_path": str(op_policy.audit_log_path()),
         }
         return json.dumps(result, indent=2)
@@ -1814,8 +1821,43 @@ def register_tools(
         registered.append(tool.__name__)
 
     def finalize() -> None:
-        global REGISTERED_TOOL_NAMES
+        global REGISTERED_TOOL_NAMES, REGISTERED_TOOL_MANIFEST, REGISTERED_MANIFEST_VALIDATION
         REGISTERED_TOOL_NAMES = sorted(registered)
+
+        if profile != CHATGPT_OPERATOR_PROFILE:
+            REGISTERED_TOOL_MANIFEST = []
+            REGISTERED_MANIFEST_VALIDATION = {
+                "applicable": False,
+                "status": "NOT_APPLICABLE",
+                "manifest_version": op_manifest.MANIFEST_VERSION,
+            }
+            return
+
+        manager = getattr(server, "_tool_manager", None)
+        if manager is None or not hasattr(manager, "list_tools"):
+            raise RuntimeError("FastMCP native tool registry is unavailable for manifest validation.")
+
+        native_records = [
+            op_manifest.native_tool_record(tool) for tool in manager.list_tools()
+        ]
+        native_by_name = {record["name"]: record for record in native_records}
+        missing_native = sorted(set(registered) - set(native_by_name))
+        if missing_native:
+            raise RuntimeError(
+                "FastMCP native registry omitted registered tools: " + ", ".join(missing_native)
+            )
+
+        # Rebuild in registration order so duplicate registrations remain
+        # visible to validation instead of being hidden by the manager's map.
+        REGISTERED_TOOL_MANIFEST = [native_by_name[name] for name in registered]
+        validation = op_manifest.validate_manifest(REGISTERED_TOOL_MANIFEST)
+        validation["applicable"] = True
+        REGISTERED_MANIFEST_VALIDATION = validation
+        if not validation["valid"]:
+            raise RuntimeError(
+                "ChatGPT operator public manifest integrity failure: "
+                + json.dumps(validation, sort_keys=True)
+            )
 
     if profile == CHATGPT_RESTRICTED_PROFILE:
         restricted_tools = {

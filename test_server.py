@@ -413,7 +413,19 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     # Self-report matches the actual live tool surface, exactly.
     assert sorted(status["registered_operator_tools"]) == live_names
     assert status["registered_tool_count"] == len(live_names)
-    assert len(live_names) == 38
+
+    public_manifest = status["public_manifest"]
+    assert public_manifest["applicable"] is True
+    assert public_manifest["manifest_version"] == server.op_manifest.MANIFEST_VERSION
+    assert public_manifest["expected_tool_count"] == 38
+    assert public_manifest["registered_tool_count"] == len(live_names)
+    assert public_manifest["schema_fingerprint"] == server.op_manifest.EXPECTED_SCHEMA_FINGERPRINT
+    assert public_manifest["missing_tools"] == []
+    assert public_manifest["unexpected_tools"] == []
+    assert public_manifest["duplicate_tool_names"] == []
+    assert public_manifest["schema_drift"] is False
+    assert public_manifest["valid"] is True
+    assert public_manifest["status"] == "PASS"
 
     # The session and narrowly gated maintenance tools must be reported...
     for required in [

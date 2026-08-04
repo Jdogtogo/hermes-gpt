@@ -37,6 +37,7 @@ py-modules = [
   "operator_workspace",
   "operator_antigravity",
   "operator_diagnostics",
+  "operator_manifest",
   "operator_bridge",
   "operator_agent",
   "operator_auth",
@@ -62,6 +63,8 @@ py-modules = [
   "docs/chatgpt-operator-deployment.md",
   "docs/workspace-test-runner.md",
   "docs/workspace-command-execution.md",
+  "docs/hermes-operator-manifest-integrity.md",
+  "docs/manifest-integrity-hardening-evidence-2026-08-04.md",
 ]
 "share/hermes-gpt/examples" = [
   "examples/start-hermes-gpt.example.ps1",
