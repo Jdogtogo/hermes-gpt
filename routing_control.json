@@ -1,0 +1,75 @@
+{
+  "$comment": [
+    "Reviewed, non-secret routing control surface for delegated Hermes workers.",
+    "This file contains NO credentials, tokens, keys or account identifiers.",
+    "It records provider qualification state only. Credentials remain in the",
+    "profile .env that the delegated runtime links read-only.",
+    "Editing this file is the supported way to change live routing eligibility;",
+    "it deliberately avoids an unsafe direct edit of the read-only-mounted root",
+    "config.yaml.",
+    "Provider order is the accepted canonical policy and must not be reordered",
+    "without an approved decision record."
+  ],
+  "version": 1,
+  "free_only": true,
+  "max_alternate_attempts": 1,
+  "require_qualified_primary": false,
+  "include_qualified_routes": true,
+  "provider_order": ["nvidia", "openrouter", "gemini", "nous", "ollama"],
+  "providers": {
+    "nvidia": {
+      "eligible": true,
+      "quarantined": false,
+      "free_tier_only": true,
+      "reason": "NVIDIA direct completed the bounded alternate attempt in the task-bound authority pilot with exact-output evidence.",
+      "qualified_models": [
+        "nvidia/nemotron-3-ultra-550b-a55b"
+      ],
+      "evidence_ref": "ops-brain/evidence/mission-control-task-bound-authority-pilot-2026-08-02.md"
+    },
+    "openrouter": {
+      "eligible": true,
+      "quarantined": false,
+      "free_tier_only": true,
+      "reason": "OpenRouter free lane is the current live delegated route. Only :free models are qualified; account and upstream model limits remain conservative.",
+      "qualified_models": [
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "cohere/north-mini-code:free"
+      ],
+      "evidence_ref": "ops-brain/evidence/hermes-live-provider-routing-pilot-2026-08-02.md"
+    },
+    "gemini": {
+      "eligible": true,
+      "quarantined": false,
+      "free_tier_only": true,
+      "reason": "Gemini direct is live and authenticated; the pilot observed HTTP 429 free-tier quota exhaustion, which the runtime classifies as a bounded-recoverable rate limit.",
+      "qualified_models": [
+        "gemini-3.5-flash-lite"
+      ],
+      "evidence_ref": "ops-brain/evidence/mission-control-task-bound-authority-pilot-2026-08-02.md"
+    },
+    "nous": {
+      "eligible": false,
+      "quarantined": true,
+      "free_tier_only": true,
+      "reason": "Nous is free-tier eligible but operationally blocked: the delegated-worker OAuth-lock path is not writable without broadening credential access. Preserved as a discovered provider record; promote only after independent account, exact-output and delegated-tool qualification.",
+      "qualified_models": [],
+      "discovered_models": [
+        "tencent/hy3"
+      ],
+      "evidence_ref": "ops-brain/evidence/hermes-live-provider-routing-pilot-2026-08-02.md"
+    },
+    "ollama": {
+      "eligible": false,
+      "quarantined": true,
+      "free_tier_only": true,
+      "reason": "Ollama is quarantined and ineligible for critical apply work until a current local service health check, model availability, exact-output response, tool execution, file write/read-back and structured evidence completion all pass. Preserved as a discovered provider record.",
+      "qualified_models": [],
+      "discovered_models": [
+        "qwen2.5:7b-instruct",
+        "llama3.1:8b"
+      ],
+      "evidence_ref": "ops-brain/evidence/hermes-live-provider-routing-pilot-2026-08-02.md"
+    }
+  }
+}

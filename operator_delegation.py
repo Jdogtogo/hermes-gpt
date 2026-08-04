@@ -24,8 +24,10 @@ import yaml
 import operator_policy as op
 import operator_antigravity as op_antigravity
 import operator_antigravity_tax as op_antigravity_tax
+import operator_routing as routing
 
 HERMES_BIN = str(Path.home() / ".local" / "bin" / "hermes")
+HERMES_ROOT = Path.home() / ".hermes"
 FILE_READ_SAFE_ROOT_ENV = "HERMES_FILE_READ_SAFE_ROOT"
 MAX_PROMPT_BYTES = 65536
 MAX_OUTPUT_CHARS = 20000
@@ -126,39 +128,80 @@ def _save(task: dict[str, Any]) -> None:
     _atomic_write(_task_path(str(task["task_id"])), task)
 
 
-def _prepare_runtime_home(task: dict[str, Any]) -> Path:
+def _resolve_task_routing(task: dict[str, Any]) -> routing.ResolvedRouting:
+    """Resolve the complete routing configuration for one delegated task.
+
+    Precedence is task routing, then profile routing, then global defaults.
+    """
+    profile = str(task.get("profile", "default"))
+    profile_home = op.resolve_profile_home(profile, HERMES_ROOT)
+    return routing.resolve_routing(
+        hermes_root=HERMES_ROOT,
+        profile=profile,
+        profile_home=profile_home,
+        task_routing=task.get("routing") or {},
+        deadline_seconds=int(task.get("timeout") or 0),
+    )
+
+
+def _prepare_runtime_home(
+    task: dict[str, Any],
+    *,
+    route_override: routing.RouteCandidate | None = None,
+) -> Path:
     """Create a writable, isolated Hermes home for one delegated process.
 
     The operator service runs with ``ProtectHome=read-only``. A child Hermes
     process therefore cannot write its normal ``~/.hermes/logs/agent.log``.
-    Materialising only the selected profile's model configuration and a
-    read-only ``.env`` link keeps logging/state inside the operator worktree
-    while preserving the configured inference provider without loading the
-    owner's plugins, MCP servers, memory, or unrelated profile state.
+    Materialising the resolved routing configuration and a read-only ``.env``
+    link keeps logging/state inside the operator worktree while preserving the
+    selected inference provider *and its eligible fallback chain* without
+    loading the owner's plugins, MCP servers, memory, or unrelated profile
+    state.
+
+    ``route_override`` promotes an alternate route to primary for a bounded
+    cross-provider recovery attempt.
     """
     runtime_home = _TASKS_ROOT / "runtime" / str(task["task_id"])
     runtime_home.mkdir(parents=True, exist_ok=True)
 
-    hermes_root = Path.home() / ".hermes"
-    profile_home = op.resolve_profile_home(str(task.get("profile", "default")), hermes_root)
+    profile = str(task.get("profile", "default"))
+    profile_home = op.resolve_profile_home(profile, HERMES_ROOT)
     config_path = profile_home / "config.yaml"
     if not config_path.is_file():
         raise FileNotFoundError(f"Hermes profile config not found: {config_path}")
 
-    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    model_config = loaded.get("model")
-    if not isinstance(model_config, dict) or not model_config:
-        raise ValueError(f"Hermes profile has no usable model configuration: {config_path}")
+    resolved = _resolve_task_routing(task)
+    primary = route_override or resolved.primary
 
     # Keep the runtime profile deliberately minimal. Credentials remain in the
     # profile .env and are linked read-only below rather than copied into task
     # records or output.
-    runtime_config = {
-        "model": model_config,
+    runtime_config: dict[str, Any] = {
+        "model": primary.to_runtime_dict(),
         "display": {"interface": "cli"},
     }
+    # The resolved fallback chain must survive materialisation: without it a
+    # delegated worker cannot perform cross-provider recovery at all. Entries
+    # are compared on normalised route identity so an alias of the materialised
+    # primary is never presented back to it as a fallback.
+    chain = [
+        candidate.to_fallback_dict()
+        for candidate in resolved.alternates[: resolved.max_alternate_attempts]
+        if candidate.key != primary.key
+    ]
+    if chain:
+        runtime_config["fallback_providers"] = chain
     (runtime_home / "config.yaml").write_text(
         yaml.safe_dump(runtime_config, sort_keys=False), encoding="utf-8"
+    )
+
+    # Auditable, non-secret record of what this runtime was allowed to use.
+    audit = resolved.to_audit_dict()
+    audit["materialised_primary"] = primary.to_audit_dict()
+    audit["materialised_fallback_providers"] = chain
+    (runtime_home / "routing.json").write_text(
+        json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8"
     )
 
     source_env = profile_home / ".env"
@@ -670,8 +713,51 @@ def _classify_failure(*, rc: int, stdout: str, stderr: str, status: str, reason:
     return None, None
 
 
+#: Status the delegated task takes for each recovery class.
+_RECOVERY_STATUS = {
+    routing.RecoveryClass.SUCCESS: "completed",
+    routing.RecoveryClass.MODEL_RECOVERABLE: "incomplete",
+    routing.RecoveryClass.OPERATOR_ESCALATION: "timed_out",
+}
+
+
+def _tool_progress(stdout: str, changed_files: list[str]) -> bool:
+    """Best-effort evidence that the worker executed tools rather than planned."""
+    if changed_files:
+        return True
+    lowered = (stdout or "").lower()
+    return any(
+        marker in lowered
+        for marker in ("tool:", "tool call", "[file]", "wrote ", "edited ", "created ")
+    )
+
+
+def classify_attempt(
+    *, task: dict[str, Any], rc: int, stdout: str, stderr: str, changed_files: list[str]
+) -> tuple[routing.FailureClass, routing.RecoveryClass, str]:
+    """Classify one delegated attempt against the routing failure taxonomy."""
+    final_answer, answer_reason = _extract_final_answer(stdout, stderr)
+    return routing.classify_outcome(
+        status=str(task.get("status") or ""),
+        rc=rc,
+        stdout=stdout,
+        stderr=stderr,
+        mode=str(task.get("mode") or ""),
+        changed_files=changed_files,
+        final_answer=final_answer,
+        final_answer_reason=answer_reason,
+        tool_progress=_tool_progress(stdout, changed_files),
+    )
+
+
 def _assess_outcome(*, task: dict[str, Any], rc: int, stdout: str, stderr: str, changed_files: list[str]) -> tuple[str, str]:
-    """Classify substantive completion instead of trusting process exit alone."""
+    """Classify substantive completion instead of trusting process exit alone.
+
+    The long-horizon slice-control protocol is authoritative when enabled;
+    otherwise the routing failure taxonomy decides. An unusable response —
+    empty, provider-fallback, reasoning-only, planning loop, or an unjustified
+    apply no-op — is never accepted as completion.
+    """
     if rc == 124:
         return "timed_out", "delegated attempt exceeded its bounded execution timeout"
     long_horizon = task.get("long_horizon") or {}
@@ -693,22 +779,16 @@ def _assess_outcome(*, task: dict[str, Any], rc: int, stdout: str, stderr: str, 
             return "failed", "long-horizon worker declared the slice failed"
         if control is not None:
             return "failed", f"unrecognised long-horizon slice control status: {control}"
-    if rc != 0:
-        return "failed", f"process exited with return code {rc}"
-    combined = f"{stdout}\n{stderr}".strip()
-    lowered = combined.lower()
-    if not combined:
-        return "incomplete", "process exited cleanly but produced no output"
-    incomplete_markers = (
-        "no reply: the model returned empty content",
-        "model returned empty content",
-        "try `continue`, switch model/provider",
+
+    failure, recovery, reason = classify_attempt(
+        task=task, rc=rc, stdout=stdout, stderr=stderr, changed_files=changed_files
     )
-    if any(marker in lowered for marker in incomplete_markers):
-        return "incomplete", "model produced an explicit empty-response/fallback failure"
-    if task.get("mode") == "apply" and not changed_files:
-        return "incomplete", "apply task produced no workspace changes"
-    return "completed", "substantive output and required workspace evidence were produced"
+    task["failure_class"] = failure.value
+    task["recovery_class"] = recovery.value
+    if recovery is routing.RecoveryClass.FAIL_CLOSED:
+        status = "blocked" if failure is routing.FailureClass.PERMISSION_FAILURE else "failed"
+        return status, reason
+    return _RECOVERY_STATUS[recovery], reason
 
 
 def _capture_authority_envelope(
@@ -799,7 +879,12 @@ def _build_argv(
             "You may edit files with the file tool, but terminal, shell, service, "
             "network, skill, credential, and git operations are unavailable. "
             "Do not claim tests or commits were run. Report files changed and "
-            "the exact verification still required by the controller."
+            "the exact verification still required by the controller. "
+            "Begin executing tools early; do not produce repeated plans without "
+            "acting. If the correct outcome is genuinely to change nothing, you "
+            "must say so explicitly inside the final response with the line "
+            f"'{routing.NO_CHANGE_JUSTIFICATION_PREFIX} <observed state evidence>'. "
+            "A silent no-op is treated as a model failure, not a result."
         )
     else:
         toolsets = ["file_read_only"]
@@ -956,6 +1041,132 @@ def _schedule_automatic_continuation(task_id: str) -> None:
             _record_long_horizon_stop(current, "continuation_queue_failed")
 
 
+def _run_worker_process(
+    task_id: str, task: dict[str, Any], env: dict[str, str]
+) -> tuple[int, str, str, str]:
+    """Run one bounded provider attempt and return its raw outcome.
+
+    Returns ``(returncode, stdout, stderr, authority_failure)``. Authority is
+    re-checked while the process runs so a withdrawn session stops work.
+    """
+    authority_failure = ""
+    process = subprocess.Popen(
+        task["argv"],
+        cwd=task["workdir"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    with _LOCK:
+        _PROCESSES[task_id] = process
+        current = _load(task_id)
+        _transition(current, "running", reason="provider process started")
+        current["pid"] = process.pid
+        _write_checkpoint(current, reason="provider process started")
+        _save(current)
+        _record_mission_control(current, event="running")
+    deadline = time.monotonic() + int(task["timeout"])
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=10)
+            return 124, stdout, stderr, authority_failure
+        try:
+            stdout, stderr = process.communicate(timeout=min(AUTHORITY_POLL_SECONDS, remaining))
+            return int(process.returncode or 0), stdout, stderr, authority_failure
+        except subprocess.TimeoutExpired:
+            try:
+                _require_task_authority(task)
+            except Exception as exc:
+                authority_failure = str(exc)
+                os.killpg(process.pid, signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=10)
+                return 125, stdout, stderr, authority_failure
+
+
+def _select_bounded_alternate(
+    task: dict[str, Any],
+    *,
+    resolved: routing.ResolvedRouting,
+    route: routing.RouteCandidate,
+    failed_routes: list[routing.RouteCandidate],
+    alternates_used: int,
+) -> routing.RouteCandidate | None:
+    """Return an eligible alternate route, or ``None`` to stop and fail closed.
+
+    Only genuine model/provider defects consume the bounded alternate budget:
+    permission, tool-policy, evidence and deadline failures never trigger a
+    blind walk across providers.
+    """
+    try:
+        failure = routing.FailureClass(str(task.get("failure_class") or ""))
+    except ValueError:
+        return None
+    if not routing.is_recoverable(failure):
+        return None
+    return routing.select_alternate(
+        resolved,
+        failed_routes=[*failed_routes, route],
+        attempts_used=alternates_used,
+    )
+
+
+def _record_alternate_attempt(
+    task: dict[str, Any],
+    *,
+    failed_route: routing.RouteCandidate,
+    alternate: routing.RouteCandidate,
+    reason: str,
+) -> None:
+    """Mint a new attempt identity for a bounded cross-provider recovery."""
+    predecessor = str(task.get("attempt_id") or "")
+    attempts = list(task.get("attempts") or [])
+    identity = routing.new_attempt_identity(
+        logical_work_id=str(task.get("logical_work_id") or ""),
+        route=alternate,
+        attempt_number=len(attempts) + 2,
+        predecessor_attempt_id=predecessor,
+    )
+    attempts.append(
+        {
+            "attempt_id": predecessor,
+            "attempt_number": len(attempts) + 1,
+            "provider": failed_route.provider,
+            "provider_lane": failed_route.lane,
+            "model": failed_route.model,
+            "failure_class": task.get("failure_class"),
+            "recovery_class": task.get("recovery_class"),
+            "outcome_reason": reason,
+            "finished_at": _now(),
+        }
+    )
+    task["attempts"] = attempts
+    task["attempt_id"] = identity["attempt_id"]
+    task["predecessor_attempt_id"] = predecessor
+    task["active_route"] = alternate.to_audit_dict()
+    task["recovery_selection"] = {
+        "selected_classification": task.get("failure_class"),
+        "failed_route": failed_route.to_audit_dict(),
+        "alternate_route": alternate.to_audit_dict(),
+        "reason": reason,
+    }
+    task.setdefault("events", []).append(
+        {
+            "at": _now(),
+            "from": "running",
+            "to": "running",
+            "reason": (
+                f"bounded cross-provider recovery: {failed_route.lane}/{failed_route.model} "
+                f"-> {alternate.lane}/{alternate.model} ({reason})"
+            ),
+        }
+    )
+
+
 def _worker(task_id: str) -> None:
     with _LOCK:
         task = _load(task_id)
@@ -976,94 +1187,86 @@ def _worker(task_id: str) -> None:
     env[FILE_READ_SAFE_ROOT_ENV] = task["workdir"]
     runtime_home: Path | None = None
     before_snapshot = _workspace_snapshot(Path(task["workdir"])) if task.get("mode") == "apply" else {}
-    authority_failure = ""
     try:
         _require_task_authority(task)
-        runtime_home = _prepare_runtime_home(task)
-        env["HERMES_HOME"] = str(runtime_home)
-        process = subprocess.Popen(
-            task["argv"],
-            cwd=task["workdir"],
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        with _LOCK:
-            _PROCESSES[task_id] = process
-            task = _load(task_id)
-            _transition(task, "running", reason="provider process started")
-            task["pid"] = process.pid
-            _write_checkpoint(task, reason="provider process started")
-            _save(task)
-            _record_mission_control(task, event="running")
-        deadline = time.monotonic() + int(task["timeout"])
+        resolved = _resolve_task_routing(task)
+        route = resolved.primary
+        failed_routes: list[routing.RouteCandidate] = []
+        alternates_used = 0
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                os.killpg(process.pid, signal.SIGTERM)
-                stdout, stderr = process.communicate(timeout=10)
-                rc = 124
-                break
-            try:
-                stdout, stderr = process.communicate(timeout=min(AUTHORITY_POLL_SECONDS, remaining))
-                rc = int(process.returncode or 0)
-                break
-            except subprocess.TimeoutExpired:
-                try:
-                    _require_task_authority(task)
-                except Exception as exc:
-                    authority_failure = str(exc)
-                    os.killpg(process.pid, signal.SIGTERM)
-                    stdout, stderr = process.communicate(timeout=10)
-                    rc = 125
-                    break
-        with _LOCK:
-            task = _load(task_id)
-            cancelled = task["status"] == "cancel_requested"
-            task["returncode"] = rc
-            task["stdout"] = _safe_text(stdout)
-            task["stderr"] = _safe_text(stderr)
-            task["finished_at"] = _now()
-            task["pid"] = None
-            after_snapshot = _workspace_snapshot(Path(task["workdir"])) if task.get("mode") == "apply" else {}
-            changed_files = _changed_files(before_snapshot, after_snapshot) if task.get("mode") == "apply" else []
-            task["changed_files"] = changed_files
-            if cancelled:
-                _transition(task, "cancelled", reason="task cancellation was requested")
-                task["outcome_reason"] = "task cancellation was requested"
-            elif authority_failure:
-                _transition(task, "blocked", reason="task authority was withdrawn")
-                task["outcome_reason"] = f"task authority was withdrawn: {authority_failure}"
-            else:
-                status, reason = _assess_outcome(
-                    task=task,
+            runtime_home = _prepare_runtime_home(task, route_override=route)
+            env["HERMES_HOME"] = str(runtime_home)
+            rc, stdout, stderr, authority_failure = _run_worker_process(task_id, task, env)
+            with _LOCK:
+                task = _load(task_id)
+                cancelled = task["status"] == "cancel_requested"
+                task["returncode"] = rc
+                task["stdout"] = _safe_text(stdout)
+                task["stderr"] = _safe_text(stderr)
+                task["pid"] = None
+                after_snapshot = _workspace_snapshot(Path(task["workdir"])) if task.get("mode") == "apply" else {}
+                changed_files = _changed_files(before_snapshot, after_snapshot) if task.get("mode") == "apply" else []
+                task["changed_files"] = changed_files
+
+                if not cancelled and not authority_failure:
+                    status, reason = _assess_outcome(
+                        task=task,
+                        rc=rc,
+                        stdout=stdout,
+                        stderr=stderr,
+                        changed_files=changed_files,
+                    )
+                    alternate = _select_bounded_alternate(
+                        task,
+                        resolved=resolved,
+                        route=route,
+                        failed_routes=failed_routes,
+                        alternates_used=alternates_used,
+                    )
+                    if alternate is not None:
+                        # Bounded cross-provider recovery: same logical work,
+                        # new attempt identity, explicit predecessor.
+                        _record_alternate_attempt(
+                            task,
+                            failed_route=route,
+                            alternate=alternate,
+                            reason=reason,
+                        )
+                        _save(task)
+                        _record_mission_control(task, event="running")
+                        failed_routes.append(route)
+                        route = alternate
+                        alternates_used += 1
+                        continue
+
+                task["finished_at"] = _now()
+                if cancelled:
+                    _transition(task, "cancelled", reason="task cancellation was requested")
+                    task["outcome_reason"] = "task cancellation was requested"
+                elif authority_failure:
+                    _transition(task, "blocked", reason="task authority was withdrawn")
+                    task["outcome_reason"] = f"task authority was withdrawn: {authority_failure}"
+                else:
+                    _transition(task, status, reason=reason)
+                    task["outcome_reason"] = reason
+                task["failure_category"], task["provider_error_category"] = _classify_failure(
                     rc=rc,
                     stdout=stdout,
                     stderr=stderr,
-                    changed_files=changed_files,
+                    status=str(task["status"]),
+                    reason=str(task.get("outcome_reason") or ""),
                 )
-                _transition(task, status, reason=reason)
-                task["outcome_reason"] = reason
-            task["failure_category"], task["provider_error_category"] = _classify_failure(
-                rc=rc,
-                stdout=stdout,
-                stderr=stderr,
-                status=str(task["status"]),
-                reason=str(task.get("outcome_reason") or ""),
-            )
-            _write_checkpoint(task, reason=str(task.get("outcome_reason") or task["status"]))
-            _save(task)
-            _record_mission_control(task, event=str(task["status"]))
-            audit_error = task["stderr"][:500] if task["status"] != "completed" else ""
-            _audit(
-                task,
-                success=task["status"] == "completed",
-                summary=f"delegated task {task['status']} rc={rc}: {task.get('outcome_reason', '')}",
-                error=audit_error,
-            )
+                _write_checkpoint(task, reason=str(task.get("outcome_reason") or task["status"]))
+                _save(task)
+                _record_mission_control(task, event=str(task["status"]))
+                audit_error = task["stderr"][:500] if task["status"] != "completed" else ""
+                _audit(
+                    task,
+                    success=task["status"] == "completed",
+                    summary=f"delegated task {task['status']} rc={rc}: {task.get('outcome_reason', '')}",
+                    error=audit_error,
+                )
+                break
     except Exception as exc:
         with _LOCK:
             task = _load(task_id)
@@ -1440,6 +1643,8 @@ def hermes_delegate_task(
             "root_task_id": task_id,
             "task_id": task_id,
             "attempt_id": attempt_id,
+            "predecessor_attempt_id": None,
+            "attempts": [],
             "interaction_id": interaction_id,
             "continuation_sequence": 0,
             "status": "queued",
@@ -1475,6 +1680,14 @@ def hermes_delegate_task(
             "long_horizon": long_horizon,
             "authority": authority,
         }
+        # Record the resolved routing decision up front so the selected primary,
+        # eligible alternates and excluded/quarantined routes are auditable even
+        # if the worker never starts. Resolution failures are recorded rather
+        # than raised here; the worker still fails closed on an ineligible route.
+        try:
+            task["routing_audit"] = _resolve_task_routing(task).to_audit_dict()
+        except Exception as exc:
+            task["routing_audit"] = {"error": str(exc)}
         _transition(task, "queued", reason="delegated task queued")
         with _LOCK:
             _write_checkpoint(task, reason="delegated task queued")

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import operator_delegation as delegation
+import operator_routing as routing
 
 
 class FakePolicy:
@@ -83,6 +84,11 @@ def test_apply_delegation_is_durable_and_excludes_terminal_web_and_skills(monkey
 
 def test_prepare_runtime_home_is_writable_and_profile_minimal(monkeypatch, tmp_path):
     monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    (hermes_root / "config.yaml").write_text("model:\n  provider: openrouter\n", encoding="utf-8")
+    monkeypatch.setattr(delegation, "HERMES_ROOT", hermes_root)
+    _pin_control(monkeypatch, tmp_path, include_qualified_routes=False)
     profile_home = tmp_path / "profile"
     profile_home.mkdir()
     (profile_home / "config.yaml").write_text(
@@ -103,10 +109,17 @@ def test_prepare_runtime_home_is_writable_and_profile_minimal(monkeypatch, tmp_p
     loaded = delegation.yaml.safe_load(
         (runtime_home / "config.yaml").read_text(encoding="utf-8")
     )
+    # No eligible alternates are configured, so no fallback chain is emitted and
+    # the runtime profile stays minimal: no plugins, MCP servers or memory.
     assert loaded == {
-        "model": {"provider": "openrouter", "default": "test/model"},
+        "model": {
+            "provider": "openrouter",
+            "model": "test/model",
+            "default": "test/model",
+        },
         "display": {"interface": "cli"},
     }
+    assert "plugins" not in loaded
     assert (runtime_home / ".env").is_symlink()
     assert (runtime_home / "logs").parent == runtime_home
     (runtime_home / "logs").mkdir()
@@ -1101,3 +1114,310 @@ def test_chain_cancel_handles_awaiting_continuation_state(monkeypatch, tmp_path)
     assert result["success"] is True
     assert result["chain_cancelled"] is True
     assert delegation._load(task["task_id"])["status"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Delegated runtime fallback inheritance and bounded cross-provider recovery
+# ---------------------------------------------------------------------------
+
+_NVIDIA_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+_OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+
+def _pin_control(monkeypatch, tmp_path, **overrides):
+    """Write and select a bounded routing control surface for one test."""
+    raw = json.loads(routing.DEFAULT_ROUTING_CONTROL_PATH.read_text(encoding="utf-8"))
+    raw.update(overrides)
+    path = tmp_path / "routing_control.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.setenv(routing.ROUTING_CONTROL_ENV, str(path))
+    return path
+
+
+def _routing_workspace(monkeypatch, tmp_path, *, fallbacks=None):
+    """Hermetic profile/global config plus the shipped routing control."""
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    chain = [{"provider": "nvidia", "model": _NVIDIA_MODEL}] if fallbacks is None else fallbacks
+    (hermes_root / "config.yaml").write_text(
+        delegation.yaml.safe_dump(
+            {
+                "model": {"provider": "openrouter", "model": _OPENROUTER_MODEL},
+                "fallback_providers": chain,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (hermes_root / ".env").write_text("OPENROUTER_API_KEY=secret\n", encoding="utf-8")
+    monkeypatch.setattr(delegation, "HERMES_ROOT", hermes_root)
+    monkeypatch.setattr(
+        delegation.op, "resolve_profile_home", lambda profile, root: hermes_root
+    )
+    return hermes_root
+
+
+def _queued_task(monkeypatch, tmp_path, workdir):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(delegation.threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(delegation, "_require_task_authority", lambda task: None)
+    result = json.loads(
+        delegation.hermes_delegate_task(
+            prompt="Apply the requested bounded change.",
+            workdir=str(workdir),
+            mode="apply",
+            timeout=120,
+        )
+    )
+    assert result["success"] is True, result
+    return result["task_id"]
+
+
+def test_runtime_materialisation_preserves_the_resolved_fallback_chain(monkeypatch, tmp_path):
+    """The root-cause fix: fallback_providers must survive materialisation."""
+    _routing_workspace(monkeypatch, tmp_path)
+
+    runtime_home = delegation._prepare_runtime_home(
+        {"task_id": "dt_" + "a" * 32, "profile": "default", "timeout": 120}
+    )
+
+    loaded = delegation.yaml.safe_load(
+        (runtime_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert loaded["model"]["provider"] == "openrouter"
+    assert loaded["model"]["model"] == _OPENROUTER_MODEL
+    assert loaded["fallback_providers"] == [
+        {"provider": "nvidia", "model": _NVIDIA_MODEL}
+    ]
+
+    audit = json.loads((runtime_home / "routing.json").read_text(encoding="utf-8"))
+    assert audit["primary"]["lane"] == "openrouter"
+    # NVIDIA direct leads the canonical order, so it is the single materialised
+    # alternate even though more routes are eligible.
+    assert audit["alternates"][0]["lane"] == "nvidia"
+    assert audit["materialised_fallback_providers"] == [
+        {"provider": "nvidia", "model": _NVIDIA_MODEL}
+    ]
+    assert audit["free_only"] is True
+    assert audit["max_alternate_attempts"] == 1
+    assert audit["provider_order"] == list(routing.CANONICAL_PROVIDER_ORDER)
+    assert audit["deadline_seconds"] == 120
+
+
+def test_quarantined_routes_are_recorded_with_reasons(monkeypatch, tmp_path):
+    _routing_workspace(
+        monkeypatch,
+        tmp_path,
+        fallbacks=[
+            {"provider": "ollama", "model": "qwen2.5:7b-instruct"},
+            {"provider": "nous", "model": "tencent/hy3"},
+            {"provider": "nvidia", "model": _NVIDIA_MODEL},
+        ],
+    )
+
+    runtime_home = delegation._prepare_runtime_home(
+        {"task_id": "dt_" + "b" * 32, "profile": "default", "timeout": 60}
+    )
+    audit = json.loads((runtime_home / "routing.json").read_text(encoding="utf-8"))
+
+    lanes = {item["lane"] for item in audit["alternates"]}
+    assert "ollama" not in lanes
+    assert "nous" not in lanes
+    excluded = {item["provider"]: item["reason"] for item in audit["excluded"]}
+    assert "quarantined" in excluded["ollama"].lower()
+    assert "blocked" in excluded["nous"].lower()
+
+
+def test_empty_response_triggers_exactly_one_cross_provider_alternate(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _routing_workspace(monkeypatch, tmp_path)
+    task_id = _queued_task(monkeypatch, tmp_path, workdir)
+
+    runtimes: list[dict] = []
+    calls = {"n": 0}
+
+    def fake_run(task_id_arg, task, env):
+        calls["n"] += 1
+        runtimes.append(
+            delegation.yaml.safe_load(
+                (Path(env["HERMES_HOME"]) / "config.yaml").read_text(encoding="utf-8")
+            )
+        )
+        if calls["n"] == 1:
+            return 0, "No reply: the model returned empty content", "", ""
+        # The alternate does real work so the apply evidence gate is satisfied.
+        (workdir / "applied.txt").write_text("done\n", encoding="utf-8")
+        return (
+            0,
+            f"{delegation.FINAL_ANSWER_BEGIN}\nApplied the change.\n{delegation.FINAL_ANSWER_END}",
+            "",
+            "",
+        )
+
+    monkeypatch.setattr(delegation, "_run_worker_process", fake_run)
+    monkeypatch.setattr(delegation, "_schedule_automatic_continuation", lambda tid: None)
+
+    original_attempt_id = delegation._load(task_id)["attempt_id"]
+    delegation._worker(task_id)
+    task = delegation._load(task_id)
+
+    # Exactly one alternate attempt: bounded, not a walk of the provider list.
+    assert calls["n"] == 2
+    assert runtimes[0]["model"]["provider"] == "openrouter"
+    assert runtimes[1]["model"]["provider"] == "nvidia"
+    assert runtimes[1]["model"]["model"] == _NVIDIA_MODEL
+
+    assert task["status"] == "completed"
+    # New attempt identity with predecessor and preserved logical work id.
+    assert task["attempt_id"] != original_attempt_id
+    assert task["predecessor_attempt_id"] == original_attempt_id
+    assert task["logical_work_id"].startswith("lw_")
+    assert len(task["attempts"]) == 1
+    assert task["attempts"][0]["attempt_id"] == original_attempt_id
+    assert task["attempts"][0]["failure_class"] == routing.FailureClass.EMPTY_RESPONSE.value
+    assert task["recovery_selection"]["alternate_route"]["lane"] == "nvidia"
+    assert task["recovery_selection"]["failed_route"]["lane"] == "openrouter"
+
+
+def test_rate_limited_primary_recovers_on_the_alternate(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _routing_workspace(monkeypatch, tmp_path)
+    task_id = _queued_task(monkeypatch, tmp_path, workdir)
+
+    calls = {"n": 0}
+
+    def fake_run(task_id_arg, task, env):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return 0, "", "HTTP 429 free-tier input quota exhausted", ""
+        (workdir / "applied.txt").write_text("done\n", encoding="utf-8")
+        return (
+            0,
+            f"{delegation.FINAL_ANSWER_BEGIN}\nApplied.\n{delegation.FINAL_ANSWER_END}",
+            "",
+            "",
+        )
+
+    monkeypatch.setattr(delegation, "_run_worker_process", fake_run)
+    monkeypatch.setattr(delegation, "_schedule_automatic_continuation", lambda tid: None)
+    delegation._worker(task_id)
+
+    task = delegation._load(task_id)
+    assert calls["n"] == 2
+    assert task["status"] == "completed"
+    assert task["attempts"][0]["failure_class"] == routing.FailureClass.RATE_LIMIT.value
+
+
+def test_permission_failure_does_not_consume_a_model_alternate(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _routing_workspace(monkeypatch, tmp_path)
+    task_id = _queued_task(monkeypatch, tmp_path, workdir)
+
+    calls = {"n": 0}
+
+    def fake_run(task_id_arg, task, env):
+        calls["n"] += 1
+        return 0, "permission denied for the requested path", "", ""
+
+    monkeypatch.setattr(delegation, "_run_worker_process", fake_run)
+    monkeypatch.setattr(delegation, "_schedule_automatic_continuation", lambda tid: None)
+    delegation._worker(task_id)
+
+    task = delegation._load(task_id)
+    assert calls["n"] == 1
+    assert task["status"] == "blocked"
+    assert task["failure_class"] == routing.FailureClass.PERMISSION_FAILURE.value
+    assert task.get("attempts") == []
+
+
+def test_retry_exhaustion_fails_closed_with_no_eligible_alternate(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    # Only quarantined lanes are offered and control-supplied routes are off,
+    # so no alternate is eligible and the task must fail closed.
+    _routing_workspace(
+        monkeypatch,
+        tmp_path,
+        fallbacks=[{"provider": "ollama", "model": "qwen2.5:7b-instruct"}],
+    )
+    _pin_control(monkeypatch, tmp_path, include_qualified_routes=False)
+    task_id = _queued_task(monkeypatch, tmp_path, workdir)
+
+    calls = {"n": 0}
+
+    def fake_run(task_id_arg, task, env):
+        calls["n"] += 1
+        return 0, "No reply: the model returned empty content", "", ""
+
+    monkeypatch.setattr(delegation, "_run_worker_process", fake_run)
+    monkeypatch.setattr(delegation, "_schedule_automatic_continuation", lambda tid: None)
+    delegation._worker(task_id)
+
+    task = delegation._load(task_id)
+    assert calls["n"] == 1
+    assert task["status"] == "incomplete"
+    assert task["failure_class"] == routing.FailureClass.EMPTY_RESPONSE.value
+    assert task.get("attempts") == []
+
+
+def test_alternate_is_not_attempted_twice(monkeypatch, tmp_path):
+    """Both attempts failing must stop, not walk the remaining providers."""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _routing_workspace(
+        monkeypatch,
+        tmp_path,
+        fallbacks=[
+            {"provider": "nvidia", "model": _NVIDIA_MODEL},
+            {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
+        ],
+    )
+    task_id = _queued_task(monkeypatch, tmp_path, workdir)
+
+    calls = {"n": 0}
+
+    def fake_run(task_id_arg, task, env):
+        calls["n"] += 1
+        return 0, "No reply: the model returned empty content", "", ""
+
+    monkeypatch.setattr(delegation, "_run_worker_process", fake_run)
+    monkeypatch.setattr(delegation, "_schedule_automatic_continuation", lambda tid: None)
+    delegation._worker(task_id)
+
+    task = delegation._load(task_id)
+    assert calls["n"] == 2
+    assert task["status"] == "incomplete"
+    assert len(task["attempts"]) == 1
+
+
+def test_queued_task_records_the_routing_decision(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    _routing_workspace(monkeypatch, tmp_path)
+    task_id = _queued_task(monkeypatch, tmp_path, workdir)
+
+    audit = delegation._load(task_id)["routing_audit"]
+    assert audit["primary"]["lane"] == "openrouter"
+    assert audit["alternates"][0]["lane"] == "nvidia"
+    assert audit["max_alternate_attempts"] == 1
+    assert audit["free_only"] is True
+    assert audit["excluded"]
+
+
+def test_apply_prompt_requires_explicit_no_change_justification(tmp_path):
+    argv = delegation._build_argv(
+        prompt="do the thing",
+        mode="apply",
+        profile="default",
+        workdir=tmp_path,
+        max_turns=5,
+        allow_web=False,
+    )
+    effective = argv[argv.index("-q") + 1]
+    assert routing.NO_CHANGE_JUSTIFICATION_PREFIX in effective
+    assert "silent no-op is treated as a model failure" in effective
