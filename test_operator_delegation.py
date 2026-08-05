@@ -126,6 +126,156 @@ def test_prepare_runtime_home_is_writable_and_profile_minimal(monkeypatch, tmp_p
     (runtime_home / "logs" / "agent.log").write_text("ok\n", encoding="utf-8")
 
 
+def test_prepare_private_nous_runtime_home_stages_access_only_state(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "owner-hermes"
+    hermes_root.mkdir()
+    (hermes_root / delegation.AUTH_FILENAME).write_text(
+        json.dumps(
+            {
+                "active_provider": "openrouter",
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-access",
+                        "refresh_token": "nous-refresh",
+                        "agent_key": "agent-jwt",
+                    },
+                    "openrouter": {"api_key": "must-not-copy"},
+                },
+                "credential_pool": {
+                    "nous": [
+                        {
+                            "access_token": "pool-access",
+                            "refresh_token": "pool-refresh",
+                            "source": "device_code",
+                        }
+                    ],
+                    "openrouter": [{"api_key": "must-not-copy"}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    shared_dir = hermes_root / "shared"
+    shared_dir.mkdir()
+    (shared_dir / delegation.NOUS_AUTH_FILENAME).write_text(
+        json.dumps(
+            {
+                "access_token": "shared-access",
+                "refresh_token": "shared-refresh",
+                "shared_only": "present",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(delegation, "HERMES_ROOT", hermes_root)
+    monkeypatch.delenv(delegation.SHARED_AUTH_DIR_ENV, raising=False)
+
+    runtime_home = tmp_path / "workspace" / "runtime"
+    runtime_home.mkdir(parents=True)
+    (runtime_home / "config.yaml").write_text("model:\n  provider: nous\n", encoding="utf-8")
+    (runtime_home / "routing.json").write_text("{}\n", encoding="utf-8")
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / delegation.AUTH_FILENAME).write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "nous": {
+                        "access_token": "profile-access",
+                        "refresh_token": "profile-refresh",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_env = profile_home / ".env"
+    source_env.write_text("NOUS_TEST=1\n", encoding="utf-8")
+    (runtime_home / ".env").symlink_to(source_env)
+
+    private_parent = tmp_path / "private-home"
+    private_parent.mkdir()
+    monkeypatch.setattr(
+        delegation.tempfile,
+        "mkdtemp",
+        lambda prefix: str(private_parent),
+    )
+    route = delegation.routing.RouteCandidate(provider="nous", model="tencent/hy3:free")
+
+    private_home = delegation._prepare_private_nous_runtime_home(
+        runtime_home,
+        route,
+        "dt_test",
+        profile_home,
+    )
+
+    assert private_home == private_parent / ".hermes"
+    assert private_home is not None
+    assert private_home.parent != runtime_home.parent
+    staged = json.loads((private_home / delegation.AUTH_FILENAME).read_text(encoding="utf-8"))
+    assert staged["active_provider"] == "nous"
+    assert set(staged["providers"]) == {"nous"}
+    assert staged["providers"]["nous"]["access_token"] == "profile-access"
+    assert staged["providers"]["nous"]["shared_only"] == "present"
+    assert set(staged["credential_pool"]) == {"nous"}
+    assert "refresh_token" not in json.dumps(staged)
+    assert "must-not-copy" not in json.dumps(staged)
+    assert (private_home / "config.yaml").read_text(encoding="utf-8") == (
+        runtime_home / "config.yaml"
+    ).read_text(encoding="utf-8")
+    assert (private_home / ".env").is_symlink()
+    assert private_parent.stat().st_mode & 0o777 == 0o700
+    assert private_home.stat().st_mode & 0o777 == 0o700
+    assert (private_home / delegation.AUTH_FILENAME).stat().st_mode & 0o777 == 0o600
+    assert (private_home / "shared").stat().st_mode & 0o777 == 0o700
+    assert list((private_home / "shared").iterdir()) == []
+
+
+def test_prepare_private_nous_runtime_home_fails_closed_without_auth(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "owner-hermes"
+    hermes_root.mkdir()
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    monkeypatch.setattr(delegation, "HERMES_ROOT", hermes_root)
+    monkeypatch.delenv(delegation.SHARED_AUTH_DIR_ENV, raising=False)
+
+    runtime_home = tmp_path / "runtime"
+    runtime_home.mkdir()
+    (runtime_home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    private_parent = tmp_path / "private-home"
+    private_parent.mkdir()
+    monkeypatch.setattr(delegation.tempfile, "mkdtemp", lambda prefix: str(private_parent))
+    route = delegation.routing.RouteCandidate(provider="nous", model="tencent/hy3:free")
+
+    with pytest.raises(RuntimeError, match="No usable access-only Nous auth state"):
+        delegation._prepare_private_nous_runtime_home(
+            runtime_home,
+            route,
+            "dt_test",
+            profile_home,
+        )
+
+    assert not private_parent.exists()
+
+
+def test_prepare_private_nous_runtime_home_is_nous_only(monkeypatch, tmp_path):
+    runtime_home = tmp_path / "runtime"
+    runtime_home.mkdir()
+    route = delegation.routing.RouteCandidate(provider="nvidia", model="test/model")
+    monkeypatch.setattr(
+        delegation.tempfile,
+        "mkdtemp",
+        lambda prefix: pytest.fail("non-Nous route must not allocate private auth home"),
+    )
+
+    assert delegation._prepare_private_nous_runtime_home(
+        runtime_home,
+        route,
+        "dt_test",
+        tmp_path / "profile",
+    ) is None
+
+
 def test_delegate_task_forecast_reports_granted_authority(monkeypatch, tmp_path):
     monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
     monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
@@ -1206,13 +1356,13 @@ def test_runtime_materialisation_preserves_the_resolved_fallback_chain(monkeypat
     assert audit["deadline_seconds"] == 120
 
 
-def test_quarantined_routes_are_recorded_with_reasons(monkeypatch, tmp_path):
+def test_quarantined_routes_are_recorded_while_qualified_nous_is_available(monkeypatch, tmp_path):
     _routing_workspace(
         monkeypatch,
         tmp_path,
         fallbacks=[
             {"provider": "ollama", "model": "qwen2.5:7b-instruct"},
-            {"provider": "nous", "model": "tencent/hy3"},
+            {"provider": "nous", "model": "tencent/hy3:free"},
             {"provider": "nvidia", "model": _NVIDIA_MODEL},
         ],
     )
@@ -1224,10 +1374,77 @@ def test_quarantined_routes_are_recorded_with_reasons(monkeypatch, tmp_path):
 
     lanes = {item["lane"] for item in audit["alternates"]}
     assert "ollama" not in lanes
-    assert "nous" not in lanes
+    assert "nous" in lanes
     excluded = {item["provider"]: item["reason"] for item in audit["excluded"]}
     assert "quarantined" in excluded["ollama"].lower()
-    assert "blocked" in excluded["nous"].lower()
+    assert "duplicate" in excluded["nous"].lower()
+
+
+def test_worker_uses_and_cleans_private_nous_home(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    hermes_root = _routing_workspace(monkeypatch, tmp_path, fallbacks=[])
+    (hermes_root / "config.yaml").write_text(
+        delegation.yaml.safe_dump(
+            {
+                "model": {"provider": "nous", "model": "tencent/hy3:free"},
+                "fallback_providers": [],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (hermes_root / delegation.AUTH_FILENAME).write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "nous": {
+                        "access_token": "access-only",
+                        "refresh_token": "must-not-stage",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    task_id = _queued_task(monkeypatch, tmp_path, workdir)
+
+    private_parent = tmp_path / "private-nous-home"
+    private_parent.mkdir()
+    monkeypatch.setattr(delegation.tempfile, "mkdtemp", lambda prefix: str(private_parent))
+    observed: dict[str, str] = {}
+
+    def fake_run(task_id_arg, task, env):
+        observed.update(
+            {
+                "HOME": env["HOME"],
+                "HERMES_HOME": env["HERMES_HOME"],
+                "HERMES_SHARED_AUTH_DIR": env[delegation.SHARED_AUTH_DIR_ENV],
+            }
+        )
+        private_home = Path(env["HERMES_HOME"])
+        staged = json.loads(
+            (private_home / delegation.AUTH_FILENAME).read_text(encoding="utf-8")
+        )
+        assert "refresh_token" not in json.dumps(staged)
+        assert Path(env[delegation.SHARED_AUTH_DIR_ENV]) == private_home / "shared"
+        (workdir / "applied.txt").write_text("done\n", encoding="utf-8")
+        return (
+            0,
+            f"{delegation.FINAL_ANSWER_BEGIN}\nApplied.\n{delegation.FINAL_ANSWER_END}",
+            "",
+            "",
+        )
+
+    monkeypatch.setattr(delegation, "_run_worker_process", fake_run)
+    monkeypatch.setattr(delegation, "_schedule_automatic_continuation", lambda tid: None)
+
+    delegation._worker(task_id)
+
+    assert delegation._load(task_id)["status"] == "completed"
+    assert Path(observed["HOME"]) == private_parent
+    assert Path(observed["HERMES_HOME"]) == private_parent / ".hermes"
+    assert not private_parent.exists()
 
 
 def test_empty_response_triggers_exactly_one_cross_provider_alternate(monkeypatch, tmp_path):

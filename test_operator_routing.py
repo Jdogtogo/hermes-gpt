@@ -52,7 +52,7 @@ def _control(**overrides) -> routing.RoutingControl:
             lane="nous",
             eligible=True,
             quarantined=False,
-            qualified_models=("tencent/hy3",),
+            qualified_models=("tencent/hy3:free",),
         ),
         "ollama": routing.ProviderControl(
             lane="ollama",
@@ -97,7 +97,7 @@ NVIDIA = {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"}
 OR_NEMOTRON = {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}
 OR_COHERE = {"provider": "openrouter", "model": "cohere/north-mini-code:free"}
 GEMINI = {"provider": "gemini", "model": "gemini-3.5-flash-lite"}
-NOUS = {"provider": "nous", "model": "tencent/hy3"}
+NOUS = {"provider": "nous", "model": "tencent/hy3:free"}
 OLLAMA = {"provider": "ollama", "model": "qwen2.5:7b-instruct"}
 
 
@@ -348,11 +348,13 @@ def test_shipped_control_keeps_ollama_quarantined():
     assert control.qualified_models == ()
 
 
-def test_shipped_control_keeps_nous_ineligible_while_oauth_lock_unresolved():
+def test_shipped_control_qualifies_free_tencent_hy3_on_nous():
     control = _shipped().control_for("nous")
-    assert control.eligible is False
-    assert control.quarantined is True
-    assert "oauth" in control.reason.lower()
+    assert control.eligible is True
+    assert control.quarantined is False
+    assert control.qualified_models == ("tencent/hy3:free",)
+    assert "task-local auth staging" in control.reason.lower()
+    assert "tencent/hy3:free" in control.reason.lower()
 
 
 def test_shipped_control_preserves_nous_and_ollama_as_discovered_records():
@@ -370,7 +372,7 @@ def test_shipped_control_is_free_only_and_bounded():
     assert control.provider_order == routing.CANONICAL_PROVIDER_ORDER
 
 
-def test_quarantined_lanes_are_excluded_under_the_shipped_control(tmp_path):
+def test_shipped_control_excludes_quarantined_lanes_and_includes_qualified_nous(tmp_path):
     resolved = _resolve(
         tmp_path,
         profile_config={"model": OR_NEMOTRON, "fallback_providers": [OLLAMA, NOUS, NVIDIA]},
@@ -379,10 +381,10 @@ def test_quarantined_lanes_are_excluded_under_the_shipped_control(tmp_path):
     lanes = [item.lane for item in resolved.alternates]
     assert lanes[0] == "nvidia"
     assert "ollama" not in lanes
-    assert "nous" not in lanes
+    assert "nous" in lanes
     excluded = {item.provider: item.reason for item in resolved.excluded}
     assert "quarantined" in excluded["ollama"].lower()
-    assert "blocked" in excluded["nous"].lower()
+    assert "duplicate" in excluded["nous"].lower()
 
 
 def test_quarantined_primary_fails_closed(tmp_path):
@@ -483,8 +485,8 @@ def test_control_supplied_routes_never_include_quarantined_lanes(tmp_path):
     )
     lanes = {item.lane for item in resolved.alternates}
     assert "ollama" not in lanes
-    assert "nous" not in lanes
-    assert lanes <= {"nvidia", "openrouter", "gemini"}
+    assert "nous" in lanes
+    assert lanes <= {"nvidia", "openrouter", "gemini", "nous"}
 
 
 def test_control_supplied_routes_are_canonically_ordered(tmp_path):
