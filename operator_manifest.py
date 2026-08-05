@@ -7,8 +7,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-MANIFEST_VERSION = "1.0.0"
-EXPECTED_TOOL_COUNT = 38
+MANIFEST_VERSION = "1.0.1"
+EXPECTED_TOOL_COUNT = 40
 
 # Canonical public surface for the authenticated ChatGPT operator connector.
 # This is intentionally independent of registration order.
@@ -16,6 +16,8 @@ CANONICAL_TOOL_NAMES = tuple(
     sorted(
         {
             "hermes_approval_web_service_restart",
+            "hermes_computer_use_status",
+            "hermes_computer_use_doctor",
             "hermes_antigravity_dispatch",
             "hermes_antigravity_dispatch_cancel",
             "hermes_antigravity_dispatch_status",
@@ -58,11 +60,11 @@ CANONICAL_TOOL_NAMES = tuple(
 )
 
 if len(CANONICAL_TOOL_NAMES) != EXPECTED_TOOL_COUNT:
-    raise RuntimeError("Canonical ChatGPT operator tool manifest must contain exactly 38 unique names.")
+    raise RuntimeError("Canonical ChatGPT operator tool manifest must contain exactly 40 unique names.")
 
 # Pinned after computing the canonical MCP input-schema payload. Intentional
 # public tool or schema changes must update both this digest and MANIFEST_VERSION.
-EXPECTED_SCHEMA_FINGERPRINT = "5e3d36f8ffcd1aafcfc39157f0411907710f585dae93136edefa07c496e3d9c8"
+EXPECTED_SCHEMA_FINGERPRINT = "b2aa84ef8cb05a7995afb164eb195c9c582da40ac52e31d9634673b01b871c96"
 
 
 def _canonicalize(value: Any) -> Any:

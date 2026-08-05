@@ -417,7 +417,7 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     public_manifest = status["public_manifest"]
     assert public_manifest["applicable"] is True
     assert public_manifest["manifest_version"] == server.op_manifest.MANIFEST_VERSION
-    assert public_manifest["expected_tool_count"] == 38
+    assert public_manifest["expected_tool_count"] == 40
     assert public_manifest["registered_tool_count"] == len(live_names)
     assert public_manifest["schema_fingerprint"] == server.op_manifest.EXPECTED_SCHEMA_FINGERPRINT
     assert public_manifest["missing_tools"] == []
@@ -452,6 +452,49 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
         "hermes_owner_write_file",
     ]:
         assert forbidden not in status["registered_operator_tools"]
+
+
+def test_computer_use_readonly_tools_route_to_bounded_host_diagnostics(monkeypatch, tmp_path):
+    """The public tools must call only the bounded host-diagnostics adapter."""
+    clear_gate_envs(monkeypatch)
+    agent_root = tmp_path / "agent"
+    hermes_root = tmp_path / ".hermes"
+    calls = []
+    monkeypatch.setattr(server, "HERMES_ROOT", agent_root)
+    monkeypatch.setattr(server, "_default_hermes_root", lambda: hermes_root)
+    monkeypatch.setattr(
+        server.op_computer_use,
+        "computer_use_status",
+        lambda **kwargs: calls.append(("status", kwargs)) or json.dumps({"success": True}),
+    )
+    monkeypatch.setattr(
+        server.op_computer_use,
+        "computer_use_doctor",
+        lambda **kwargs: calls.append(("doctor", kwargs)) or json.dumps({"success": True}),
+    )
+
+    assert json.loads(server.hermes_computer_use_status())["success"] is True
+    assert json.loads(server.hermes_computer_use_doctor(timeout=27))["success"] is True
+    assert calls == [
+        ("status", {"agent_root": agent_root, "hermes_root": hermes_root}),
+        ("doctor", {"timeout": 27, "agent_root": agent_root, "hermes_root": hermes_root}),
+    ]
+
+
+def test_computer_use_tools_in_operator_surface(monkeypatch, tmp_path):
+    """Both computer-use tools must appear on the chatgpt-operator surface."""
+    clear_gate_envs(monkeypatch)
+    enable_operator_session(monkeypatch, tmp_path)
+
+    built = server.build_server(
+        http=True,
+        transport="streamable-http",
+        profile=server.CHATGPT_OPERATOR_PROFILE,
+    )
+    names = tool_names(built)
+    assert "hermes_computer_use_status" in names
+    assert "hermes_computer_use_doctor" in names
+    assert sorted(server.op_manifest.CANONICAL_TOOL_NAMES) == sorted(names)
 
 
 def test_antigravity_public_tools_route_to_tax_calculator_launcher(monkeypatch):

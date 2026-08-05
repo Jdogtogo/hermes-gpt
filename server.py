@@ -17,6 +17,7 @@ import operator_skills as op_skills
 import operator_config as op_config
 import operator_workspace as op_workspace
 import operator_diagnostics as op_diagnostics
+import operator_computer_use_diagnostics as op_computer_use
 import operator_manifest as op_manifest
 import operator_bridge as op_bridge
 import operator_auth as op_auth
@@ -1012,6 +1013,23 @@ def hermes_operator_recover(profile: str = "default", apply: bool = False) -> st
     )
 
 
+def hermes_computer_use_status() -> str:
+    """Return real, read-only WSL host and Cua Driver capability status."""
+    return op_computer_use.computer_use_status(
+        agent_root=HERMES_ROOT,
+        hermes_root=_default_hermes_root(),
+    )
+
+
+def hermes_computer_use_doctor(timeout: int = 15) -> str:
+    """Run the fixed read-only `hermes computer-use doctor` route."""
+    return op_computer_use.computer_use_doctor(
+        timeout=timeout,
+        agent_root=HERMES_ROOT,
+        hermes_root=_default_hermes_root(),
+    )
+
+
 # --- Cron wrappers (pass hermes_root through) ----------------------------
 
 
@@ -1775,6 +1793,8 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_operator_audit_tail,
         hermes_operator_doctor,
         hermes_operator_snapshot,
+        hermes_computer_use_status,
+        hermes_computer_use_doctor,
         hermes_config_get,
         hermes_env_status,
         hermes_gateway_status,
