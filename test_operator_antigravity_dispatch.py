@@ -69,6 +69,9 @@ def test_public_surface_has_no_prompt_command_model_or_environment_inputs() -> N
         "dry_run",
     ]
     assert ag.AGY_BINARY == Path("/home/jfroh/.local/bin/agy")
+    assert ag.STATE_ROOT == Path("/home/jfroh/.hermes/ops-brain/antigravity/runtime")
+    assert ag.STATE_ROOT != ag.CANONICAL_WORKTREE
+    assert ag.CANONICAL_WORKTREE not in ag.STATE_ROOT.parents
     assert ag.MODE == "plan"
     assert ag.MODE in ag._agy_argv("fixed", timeout_value="60s")
     assert ag.MODEL in ag._agy_argv("fixed", timeout_value="60s")

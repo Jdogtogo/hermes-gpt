@@ -29,7 +29,7 @@ HOST_HOME = Path("/home/jfroh")
 CANONICAL_WORKTREE = Path(
     "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"
 )
-STATE_ROOT = CANONICAL_WORKTREE / "logs" / "antigravity-dispatch"
+STATE_ROOT = Path("/home/jfroh/.hermes/ops-brain/antigravity/runtime")
 JOBS_ROOT = STATE_ROOT / "jobs"
 SMOKE_ROOT = STATE_ROOT / "smoke"
 MODEL = "gemini-3.6-flash-low"
