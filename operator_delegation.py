@@ -33,7 +33,6 @@ HERMES_ROOT = Path.home() / ".hermes"
 FILE_READ_SAFE_ROOT_ENV = "HERMES_FILE_READ_SAFE_ROOT"
 SHARED_AUTH_DIR_ENV = "HERMES_SHARED_AUTH_DIR"
 AUTH_FILENAME = "auth.json"
-NOUS_AUTH_FILENAME = "nous_auth.json"
 MAX_PROMPT_BYTES = 65536
 MAX_OUTPUT_CHARS = 20000
 MAX_TIMEOUT_SECONDS = 3600
@@ -218,177 +217,95 @@ def _prepare_runtime_home(
     return runtime_home
 
 
-def _strip_refresh_tokens(value: Any) -> Any:
-    """Return a deep copy with rotating OAuth refresh tokens removed."""
-    if isinstance(value, dict):
-        return {
-            key: _strip_refresh_tokens(item)
-            for key, item in value.items()
-            if str(key) != "refresh_token"
-        }
-    if isinstance(value, list):
-        return [_strip_refresh_tokens(item) for item in value]
-    return value
+def _profile_has_nous_auth(profile_home: Path) -> bool:
+    """Return whether the selected profile carries usable Nous auth state.
 
-
-def _minimal_nous_auth_store(source: dict[str, Any]) -> dict[str, Any]:
-    """Extract only access-time Nous state from the owner's auth store.
-
-    Delegated workers must never consume a copied single-use refresh token:
-    doing so would rotate the server-side token while leaving the owner's store
-    stale. The private snapshot therefore carries current access/JWT material
-    only. An expired snapshot fails cleanly and requires normal owner-side
-    re-authentication rather than mutating credentials from the sandbox.
+    Values are never returned or logged. The check exists only to prevent a
+    delegated worker from falling back to the owner's global auth store.
     """
-    staged: dict[str, Any] = {"active_provider": "nous"}
+    auth_path = profile_home / AUTH_FILENAME
+    if not auth_path.is_file():
+        return False
+    try:
+        loaded = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(loaded, dict):
+        return False
 
-    providers = source.get("providers")
-    if isinstance(providers, dict) and isinstance(providers.get("nous"), dict):
-        staged["providers"] = {"nous": _strip_refresh_tokens(providers["nous"])}
-
-    pool = source.get("credential_pool")
-    if isinstance(pool, dict) and isinstance(pool.get("nous"), list):
-        staged["credential_pool"] = {"nous": _strip_refresh_tokens(pool["nous"])}
-
-    return staged
-
-
-def _merge_nous_auth_store(
-    base: dict[str, Any],
-    incoming: dict[str, Any],
-) -> dict[str, Any]:
-    """Merge one access-only Nous auth source, with incoming values winning."""
-    merged = dict(base)
-    merged["active_provider"] = "nous"
-
-    incoming_providers = incoming.get("providers")
-    if isinstance(incoming_providers, dict) and isinstance(incoming_providers.get("nous"), dict):
-        providers = merged.setdefault("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-            merged["providers"] = providers
-        existing = providers.get("nous")
-        existing_state = existing if isinstance(existing, dict) else {}
-        providers["nous"] = {
-            **existing_state,
-            **incoming_providers["nous"],
-        }
-
-    incoming_pool = incoming.get("credential_pool")
-    if isinstance(incoming_pool, dict) and isinstance(incoming_pool.get("nous"), list):
-        pool = merged.setdefault("credential_pool", {})
-        if not isinstance(pool, dict):
-            pool = {}
-            merged["credential_pool"] = pool
-        pool["nous"] = incoming_pool["nous"]
-
-    return merged
+    providers = loaded.get("providers")
+    has_provider_state = (
+        isinstance(providers, dict)
+        and isinstance(providers.get("nous"), dict)
+        and bool(providers.get("nous"))
+    )
+    pool = loaded.get("credential_pool")
+    has_pool_state = (
+        isinstance(pool, dict)
+        and isinstance(pool.get("nous"), list)
+        and bool(pool.get("nous"))
+    )
+    return has_provider_state or has_pool_state
 
 
-def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
-    with path.open("x", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    path.chmod(0o600)
-
-
-def _prepare_private_nous_runtime_home(
-    runtime_home: Path,
+def _prepare_ephemeral_nous_shared_dir(
     route: routing.RouteCandidate,
     task_id: str,
+) -> Path | None:
+    """Create an empty private shared-auth directory for one Nous process.
+
+    Nous mirrors refreshed state through ``HERMES_SHARED_AUTH_DIR``. The
+    Operator service cannot write the owner's canonical shared directory under
+    ``ProtectHome=read-only``. Redirect only that best-effort mirror to a
+    task-private directory outside the delegated file workspace, then remove it
+    when the process ends. The selected profile remains the durable auth store.
+    """
+    if route.lane != "nous":
+        return None
+    path = Path(tempfile.mkdtemp(prefix=f"hermes-nous-shared-{task_id}-"))
+    path.chmod(0o700)
+    return path
+
+
+def _prepare_nous_profile_runtime_home(
+    route: routing.RouteCandidate,
     profile_home: Path,
 ) -> Path | None:
-    """Create a private, access-only Hermes home for one delegated Nous run.
+    """Use the selected Nous profile as the runtime home.
 
-    The directory is created under the service's private temporary area, not
-    beneath the delegated workspace, so file tools cannot inspect credentials.
-    It receives the already-materialised config, the profile ``.env`` symlink,
-    a minimal Nous-only ``auth.json`` with refresh tokens removed, and an empty
-    writable shared-auth directory. The caller removes the entire temporary
-    parent in ``finally``.
+    Hermes then owns its normal auth lock and refresh-token rotation in the
+    profile that the caller explicitly selected. The delegated model still
+    cannot inspect that directory because ``HERMES_FILE_READ_SAFE_ROOT`` remains
+    pinned to the approved task workdir.
     """
     if route.lane != "nous":
         return None
 
-    private_parent = Path(tempfile.mkdtemp(prefix=f"hermes-nous-{task_id}-"))
-    private_parent.chmod(0o700)
-    private_home = private_parent / ".hermes"
-    private_home.mkdir(mode=0o700)
-    private_home.chmod(0o700)
+    profiles_root = (HERMES_ROOT / "profiles").resolve(strict=False)
+    resolved_profile = profile_home.resolve(strict=False)
+    if not resolved_profile.is_relative_to(profiles_root):
+        raise RuntimeError("Delegated Nous tasks require a named Hermes profile home.")
 
-    for filename in ("config.yaml", "routing.json"):
-        source = runtime_home / filename
-        if source.is_file():
-            target = private_home / filename
-            shutil.copyfile(source, target)
-            target.chmod(0o600)
+    config_path = resolved_profile / "config.yaml"
+    if not config_path.is_file():
+        raise RuntimeError("Delegated Nous profile config is missing.")
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError("Delegated Nous profile config is unreadable.") from exc
+    model = config.get("model") if isinstance(config, dict) else None
+    if not isinstance(model, dict):
+        raise RuntimeError("Delegated Nous profile model configuration is missing.")
+    provider = str(model.get("provider") or "").strip()
+    configured_model = str(model.get("model") or model.get("default") or "").strip()
+    if routing.normalise_provider(provider) != "nous":
+        raise RuntimeError("Delegated Nous profile provider does not match the selected route.")
+    if configured_model.casefold() != str(route.model).strip().casefold():
+        raise RuntimeError("Delegated Nous profile model does not match the selected route.")
+    if not _profile_has_nous_auth(resolved_profile):
+        raise RuntimeError("The selected Nous profile has no usable local auth state.")
 
-    runtime_env = runtime_home / ".env"
-    if runtime_env.is_symlink():
-        (private_home / ".env").symlink_to(runtime_env.resolve(strict=False))
-
-    staged_auth: dict[str, Any] = {"active_provider": "nous"}
-
-    def merge_auth_file(source_path: Path, label: str) -> None:
-        nonlocal staged_auth
-        if not source_path.is_file():
-            return
-        try:
-            loaded = json.loads(source_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            shutil.rmtree(private_parent, ignore_errors=True)
-            raise RuntimeError(f"Unable to stage delegated Nous {label} state.") from exc
-        if isinstance(loaded, dict):
-            staged_auth = _merge_nous_auth_store(
-                staged_auth,
-                _minimal_nous_auth_store(loaded),
-            )
-
-    # Lowest precedence first; profile-local state wins when present.
-    merge_auth_file(HERMES_ROOT / AUTH_FILENAME, "root auth")
-
-    shared_dirs = [HERMES_ROOT / "shared"]
-    source_shared_override = os.environ.get(SHARED_AUTH_DIR_ENV, "").strip()
-    if source_shared_override:
-        override_dir = Path(source_shared_override).expanduser()
-        if override_dir not in shared_dirs:
-            shared_dirs.append(override_dir)
-    for source_shared_dir in shared_dirs:
-        source_shared_auth = source_shared_dir / NOUS_AUTH_FILENAME
-        if not source_shared_auth.is_file():
-            continue
-        try:
-            shared_state = json.loads(source_shared_auth.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            shutil.rmtree(private_parent, ignore_errors=True)
-            raise RuntimeError("Unable to stage delegated Nous shared auth state.") from exc
-        if isinstance(shared_state, dict):
-            staged_auth = _merge_nous_auth_store(
-                staged_auth,
-                {
-                    "active_provider": "nous",
-                    "providers": {"nous": _strip_refresh_tokens(shared_state)},
-                },
-            )
-
-    merge_auth_file(profile_home / AUTH_FILENAME, "profile auth")
-
-    providers = staged_auth.get("providers")
-    pool = staged_auth.get("credential_pool")
-    has_provider_state = isinstance(providers, dict) and isinstance(providers.get("nous"), dict)
-    has_pool_state = isinstance(pool, dict) and bool(pool.get("nous"))
-    if not (has_provider_state or has_pool_state):
-        shutil.rmtree(private_parent, ignore_errors=True)
-        raise RuntimeError("No usable access-only Nous auth state is available for delegation.")
-
-    _write_private_json(private_home / AUTH_FILENAME, staged_auth)
-
-    shared_dir = private_home / "shared"
-    shared_dir.mkdir(mode=0o700)
-    shared_dir.chmod(0o700)
-    return private_home
+    return resolved_profile
 
 
 def _safe_text(value: str) -> str:
@@ -1363,9 +1280,8 @@ def _worker(task_id: str) -> None:
 
     env = os.environ.copy()
     env[FILE_READ_SAFE_ROOT_ENV] = task["workdir"]
-    original_home = env.get("HOME")
     runtime_home: Path | None = None
-    private_runtime_home: Path | None = None
+    shared_auth_dir: Path | None = None
     before_snapshot = _workspace_snapshot(Path(task["workdir"])) if task.get("mode") == "apply" else {}
     try:
         _require_task_authority(task)
@@ -1375,27 +1291,18 @@ def _worker(task_id: str) -> None:
         failed_routes: list[routing.RouteCandidate] = []
         alternates_used = 0
         while True:
-            if private_runtime_home is not None:
-                shutil.rmtree(private_runtime_home.parent, ignore_errors=True)
-                private_runtime_home = None
-            if original_home is None:
-                env.pop("HOME", None)
-            else:
-                env["HOME"] = original_home
+            if shared_auth_dir is not None:
+                shutil.rmtree(shared_auth_dir, ignore_errors=True)
+                shared_auth_dir = None
             env.pop(SHARED_AUTH_DIR_ENV, None)
 
             runtime_home = _prepare_runtime_home(task, route_override=route)
-            private_runtime_home = _prepare_private_nous_runtime_home(
-                runtime_home,
-                route,
-                task_id,
-                profile_home,
-            )
-            effective_runtime_home = private_runtime_home or runtime_home
+            nous_profile_home = _prepare_nous_profile_runtime_home(route, profile_home)
+            shared_auth_dir = _prepare_ephemeral_nous_shared_dir(route, task_id)
+            effective_runtime_home = nous_profile_home or runtime_home
             env["HERMES_HOME"] = str(effective_runtime_home)
-            if private_runtime_home is not None:
-                env["HOME"] = str(private_runtime_home.parent)
-                env[SHARED_AUTH_DIR_ENV] = str(private_runtime_home / "shared")
+            if shared_auth_dir is not None:
+                env[SHARED_AUTH_DIR_ENV] = str(shared_auth_dir)
 
             rc, stdout, stderr, authority_failure = _run_worker_process(task_id, task, env)
             with _LOCK:
@@ -1482,8 +1389,8 @@ def _worker(task_id: str) -> None:
             _record_mission_control(task, event="failed")
             _audit(task, success=False, summary="delegated task launch failed", error=str(exc))
     finally:
-        if private_runtime_home is not None:
-            shutil.rmtree(private_runtime_home.parent, ignore_errors=True)
+        if shared_auth_dir is not None:
+            shutil.rmtree(shared_auth_dir, ignore_errors=True)
         if runtime_home is not None:
             runtime_env = runtime_home / ".env"
             try:
