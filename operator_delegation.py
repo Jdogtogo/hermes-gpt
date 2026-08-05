@@ -923,6 +923,8 @@ def _require_task_authority(task: dict[str, Any]) -> None:
     authority = task.get("authority") or {}
     policy = op.OperatorPolicy()
     policy.require_enabled()
+    if bool(authority.get("allow_web")):
+        policy.require_verb("network", "web")
     if policy.session_id != authority.get("session_id"):
         raise PermissionError("originating Operator Session is no longer active")
     if policy.snapshot_hash != authority.get("snapshot_hash"):
@@ -1455,6 +1457,8 @@ def hermes_delegate_task_forecast(
 
         policy = op.OperatorPolicy()
         policy.require_enabled()
+        if allow_web:
+            policy.require_verb("network", "web")
         long_horizon = _normalize_long_horizon(
             timeout=timeout,
             worker_slice_timeout=worker_slice_timeout,
@@ -1609,6 +1613,8 @@ def hermes_delegate_task(
 
         policy = op.OperatorPolicy()
         policy.require_enabled()
+        if allow_web:
+            policy.require_verb("network", "web")
         long_horizon = _normalize_long_horizon(
             timeout=timeout,
             worker_slice_timeout=worker_slice_timeout,

@@ -44,6 +44,20 @@ class FakePolicy:
         assert (resource, verb) == ("filesystem", "edit")
 
 
+class NoWebPolicy(FakePolicy):
+    def require_verb(self, resource, verb):
+        if resource == "network" and verb == "web":
+            raise PermissionError("Delegated web authority is not granted.")
+        return super().require_verb(resource, verb)
+
+
+class WebPolicy(FakePolicy):
+    verbs = {"filesystem": ["edit"], "network": ["web"]}
+
+    def require_verb(self, resource, verb):
+        assert (resource, verb) in {("filesystem", "edit"), ("network", "web")}
+
+
 def test_apply_delegation_is_durable_and_excludes_terminal_web_and_skills(monkeypatch, tmp_path):
     monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
     monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)
@@ -386,6 +400,75 @@ def test_tax_calculator_antigravity_delegation_and_lifecycle_route_to_fixed_runn
     assert json.loads(delegation.hermes_delegated_task_status(task_id))["status"] == "running"
     assert json.loads(delegation.hermes_delegated_task_result(task_id))["ready"] is True
     assert json.loads(delegation.hermes_delegated_task_cancel(task_id))["status"] == "cancel_requested"
+
+
+def test_read_only_forecast_requires_explicit_web_authority(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", NoWebPolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+
+    result = json.loads(
+        delegation.hermes_delegate_task_forecast(
+            workdir=str(tmp_path),
+            mode="plan",
+            profile="default",
+            allow_web=True,
+            timeout=60,
+            total_task_window=60,
+            worker_slice_timeout=60,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["granted"] is False
+    assert "web authority" in result["denial"]["error"].lower()
+
+
+def test_read_only_delegation_requires_explicit_web_authority_before_launch(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", NoWebPolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+
+    result = json.loads(
+        delegation.hermes_delegate_task(
+            prompt="Inspect the repository.",
+            workdir=str(tmp_path),
+            mode="plan",
+            profile="default",
+            allow_web=True,
+            timeout=60,
+            total_task_window=60,
+            worker_slice_timeout=60,
+        )
+    )
+
+    assert result["success"] is False
+    assert not (tmp_path / "tasks").exists()
+
+
+def test_read_only_delegation_allows_web_with_explicit_web_authority(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", WebPolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(delegation.threading.Thread, "start", lambda self: None)
+
+    result = json.loads(
+        delegation.hermes_delegate_task(
+            prompt="Inspect the repository.",
+            workdir=str(tmp_path),
+            mode="plan",
+            profile="default",
+            allow_web=True,
+            timeout=60,
+            total_task_window=60,
+            worker_slice_timeout=60,
+        )
+    )
+
+    assert result["success"] is True
+    task = delegation._load(result["task_id"])
+    tool_arg = task["argv"][task["argv"].index("-t") + 1]
+    assert tool_arg == "file_read_only,web"
+    assert task["authority"]["allow_web"] is True
 
 
 def test_delegate_task_forecast_reports_denial_without_queuing(monkeypatch, tmp_path):
