@@ -14,6 +14,27 @@ def test_sandbox_resolves_to_exact_paths():
     assert policy["writable_roots"] == ["/home/jfroh/.hermes/worktrees/chatgpt-operator-scratch"]
 
 
+def test_canonical_preservation_integration_is_read_only_on_canonical_and_release_roots():
+    resolved = templates.resolve_template("hermes-canonical-preservation-integration")
+    policy = resolved["policy"]
+    canonical = "/home/jfroh/hermes-gpt"
+    integration = "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration"
+    assert canonical in policy["readable_roots"]
+    assert canonical not in policy["writable_roots"]
+    assert integration in policy["writable_roots"]
+    assert resolved["allowed_branches"] == ["mission-control/preservation-integration"]
+    assert resolved["baseline_required"] is True
+    assert resolved["risk_tier"] == 2
+    assert policy["allowed_profiles"] == ["default", "hy3-free-test", "nvidia-live-test"]
+    assert policy["egress_hosts"] == []
+    assert policy["service_units"] == []
+    assert "services" not in policy["verbs"]
+    assert "network" not in policy["verbs"]
+    assert "/home/jfroh/.hermes/releases/v018-live" in policy["hard_denied_paths"]
+    assert "/home/jfroh/.hermes/releases/v019" in policy["hard_denied_paths"]
+    assert all(not root.startswith("/home/jfroh/.hermes/releases/") for root in policy["writable_roots"])
+
+
 def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
     resolved = templates.resolve_template("hermes-gpt-operator-maintenance")
     policy = resolved["policy"]
