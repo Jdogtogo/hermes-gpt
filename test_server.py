@@ -350,6 +350,7 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_workspace_run_test",
         "hermes_workspace_exec",
         "hermes_workspace_git_commit",
+        "hermes_routing_release_v019",
         "hermes_antigravity_smoke_test",
         "hermes_antigravity_dispatch",
         "hermes_antigravity_dispatch_status",
@@ -417,7 +418,7 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     public_manifest = status["public_manifest"]
     assert public_manifest["applicable"] is True
     assert public_manifest["manifest_version"] == server.op_manifest.MANIFEST_VERSION
-    assert public_manifest["expected_tool_count"] == 40
+    assert public_manifest["expected_tool_count"] == 41
     assert public_manifest["registered_tool_count"] == len(live_names)
     assert public_manifest["schema_fingerprint"] == server.op_manifest.EXPECTED_SCHEMA_FINGERPRINT
     assert public_manifest["missing_tools"] == []

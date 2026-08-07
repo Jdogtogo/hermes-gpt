@@ -16,6 +16,7 @@ import operator_cron as op_cron
 import operator_skills as op_skills
 import operator_config as op_config
 import operator_workspace as op_workspace
+import operator_release as op_release
 import operator_diagnostics as op_diagnostics
 import operator_computer_use_diagnostics as op_computer_use
 import operator_manifest as op_manifest
@@ -1358,6 +1359,11 @@ def hermes_workspace_git_commit(
     )
 
 
+def hermes_routing_release_v019(dry_run: bool = True) -> str:
+    """Promote the reviewed routing branch and create immutable release v019."""
+    return op_release.hermes_routing_release_v019(dry_run=dry_run)
+
+
 def hermes_delegate_task_forecast(
     workdir: str,
     mode: str = "apply",
@@ -1807,6 +1813,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_workspace_run_test,
         hermes_workspace_exec,
         hermes_workspace_git_commit,
+        hermes_routing_release_v019,
         hermes_antigravity_review_start,
         hermes_antigravity_review_status,
         hermes_antigravity_review_cancel,

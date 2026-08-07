@@ -67,6 +67,56 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
         "baseline_required": False,
     },
+    "hermes-routing-v019-release": {
+        "active": True,
+        "description": (
+            "Fixed, human-approved promotion of routing-policy-resolver into main and immutable v019. "
+            "No arbitrary branches, tags, release paths, deployment, credentials, or service changes."
+        ),
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "readable_roots": [
+                "/home/jfroh/.hermes/worktrees/routing-policy-resolver",
+                "/home/jfroh/.hermes/worktrees/routing-v019-main",
+                "/home/jfroh/.hermes/hermes-agent",
+                "/home/jfroh/.hermes/releases/v018-live",
+                "/home/jfroh/.hermes/releases/v019",
+                "/home/jfroh/.hermes/ops-brain/projects/mission-control.md",
+                "/home/jfroh/.hermes/ops-brain/projects/hermes-stabilization-sprint.md",
+                "/home/jfroh/.hermes/ops-brain/evidence/routing-v019-promotion-2026-08-06.md",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/worktrees/routing-v019-main",
+                "/home/jfroh/.hermes/releases/v019",
+                "/home/jfroh/.hermes/ops-brain/projects/mission-control.md",
+                "/home/jfroh/.hermes/ops-brain/projects/hermes-stabilization-sprint.md",
+                "/home/jfroh/.hermes/ops-brain/evidence/routing-v019-promotion-2026-08-06.md",
+            ],
+            "hard_denied_paths": [
+                "/home/jfroh/.hermes/.env",
+                "/home/jfroh/.hermes/.env.*",
+                "/home/jfroh/.hermes/auth",
+                "/home/jfroh/.hermes/auth.json",
+                "/home/jfroh/.hermes/credentials",
+                "/home/jfroh/.hermes/**/credentials",
+                "/home/jfroh/.hermes/**/API keys",
+                "/home/jfroh/.hermes/**/OAuth tokens",
+                "/home/jfroh/.hermes/**/secret stores",
+                "/home/jfroh/.hermes/**/private keys",
+                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt",
+                "/home/jfroh/.hermes/worktrees/*operator*",
+            ],
+            "verbs": {
+                "filesystem": ["read", "edit"],
+                "git": ["release"],
+                "tests": ["run"],
+            },
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": None,
+        "baseline_required": False,
+    },
     "tax-calculator-antigravity-review": {
         "active": True,
         "description": (

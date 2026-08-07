@@ -127,10 +127,11 @@ def test_validate_manifest_reports_schema_drift_when_names_match():
     assert result["issues"] == ["schema_drift"]
 
 
-def test_canonical_chatgpt_operator_name_manifest_is_40_tools():
-    assert manifest.EXPECTED_TOOL_COUNT == 40
-    assert len(manifest.CANONICAL_TOOL_NAMES) == 40
-    assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 40
+def test_canonical_chatgpt_operator_name_manifest_is_41_tools():
+    assert manifest.EXPECTED_TOOL_COUNT == 41
+    assert len(manifest.CANONICAL_TOOL_NAMES) == 41
+    assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 41
+    assert "hermes_routing_release_v019" in manifest.CANONICAL_TOOL_NAMES
     for required in {
         "hermes_antigravity_dispatch",
         "hermes_antigravity_dispatch_cancel",
