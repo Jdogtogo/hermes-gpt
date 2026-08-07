@@ -319,7 +319,7 @@ def test_unprobed_route_is_rejected(tmp_path):
         },
     )
     assert resolved.alternates == []
-    assert any("no current account-specific qualification" in i.reason for i in resolved.excluded)
+    assert any("no current Hermes-Agent qualification" in i.reason for i in resolved.excluded)
 
 
 def test_lane_outside_canonical_order_is_rejected(tmp_path):
@@ -341,11 +341,12 @@ def _shipped() -> routing.RoutingControl:
     return routing.load_routing_control(routing.DEFAULT_ROUTING_CONTROL_PATH)
 
 
-def test_shipped_control_keeps_ollama_quarantined():
+def test_shipped_control_qualifies_fresh_ollama_qwen():
     control = _shipped().control_for("ollama")
-    assert control.eligible is False
-    assert control.quarantined is True
-    assert control.qualified_models == ()
+    assert control.eligible is True
+    assert control.quarantined is False
+    assert control.qualified_models == ("qwen2.5:7b-instruct",)
+    assert "fresh host qualification" in control.reason.lower()
 
 
 def test_shipped_control_qualifies_free_tencent_hy3_on_nous():
@@ -368,11 +369,12 @@ def test_shipped_control_preserves_nous_and_ollama_as_discovered_records():
 def test_shipped_control_is_free_only_and_bounded():
     control = _shipped()
     assert control.free_only is True
-    assert control.max_alternate_attempts == routing.DEFAULT_MAX_ALTERNATE_ATTEMPTS == 1
+    assert control.max_alternate_attempts == 3
+    assert control.max_alternate_attempts <= routing.MAX_ALTERNATE_ATTEMPTS_CEILING
     assert control.provider_order == routing.CANONICAL_PROVIDER_ORDER
 
 
-def test_shipped_control_excludes_quarantined_lanes_and_includes_qualified_nous(tmp_path):
+def test_shipped_control_includes_qualified_agent_routes_but_excludes_direct_only_ollama(tmp_path):
     resolved = _resolve(
         tmp_path,
         profile_config={"model": OR_NEMOTRON, "fallback_providers": [OLLAMA, NOUS, NVIDIA]},
@@ -382,14 +384,25 @@ def test_shipped_control_excludes_quarantined_lanes_and_includes_qualified_nous(
     assert lanes[0] == "nvidia"
     assert "ollama" not in lanes
     assert "nous" in lanes
-    excluded = {item.provider: item.reason for item in resolved.excluded}
-    assert "quarantined" in excluded["ollama"].lower()
-    assert "duplicate" in excluded["nous"].lower()
+    ollama = _shipped().control_for("ollama")
+    assert ollama.direct_inference_models == ("qwen2.5:7b-instruct",)
+    assert ollama.agent_qualification_explicit is True
+    assert ollama.agent_qualified_models == ()
 
 
-def test_quarantined_primary_fails_closed(tmp_path):
-    with pytest.raises(routing.RoutingError, match="not eligible"):
-        _resolve(tmp_path, profile_config={"model": OLLAMA}, control=_shipped())
+def test_unqualified_ollama_model_is_not_added_as_automatic_route(tmp_path):
+    resolved = _resolve(
+        tmp_path,
+        profile_config={
+            "model": OR_NEMOTRON,
+            "fallback_providers": [{"provider": "ollama", "model": "llama3.1:8b"}],
+        },
+        control=_shipped(),
+    )
+    assert all(
+        not (item.lane == "ollama" and item.model == "llama3.1:8b")
+        for item in resolved.alternates
+    )
 
 
 def test_missing_control_surface_fails_closed(tmp_path):
@@ -477,7 +490,7 @@ def test_control_surface_supplies_a_cross_provider_alternate(tmp_path):
     assert alternate.lane != resolved.primary.lane
 
 
-def test_control_supplied_routes_never_include_quarantined_lanes(tmp_path):
+def test_control_supplied_routes_include_only_qualified_lanes(tmp_path):
     resolved = _resolve(
         tmp_path,
         profile_config={"model": OR_NEMOTRON},
@@ -496,8 +509,9 @@ def test_control_supplied_routes_are_canonically_ordered(tmp_path):
         control=_shipped(),
     )
     lanes = [item.lane for item in resolved.alternates]
+    assert resolved.primary.lane == "nvidia"
     assert lanes == sorted(lanes, key=routing.CANONICAL_PROVIDER_ORDER.index)
-    assert lanes[0] == "nvidia"
+    assert "ollama" not in lanes
 
 
 def test_control_supplied_routes_never_duplicate_the_primary(tmp_path):
@@ -584,6 +598,20 @@ def test_reasoning_only_response_is_bounded_recoverable():
 def test_rate_limit_is_bounded_recoverable():
     failure, recovery, _ = _classify(stderr="HTTP 429 quota exceeded for free tier")
     assert failure is routing.FailureClass.RATE_LIMIT
+    assert recovery is routing.RecoveryClass.MODEL_RECOVERABLE
+
+
+def test_budget_exhaustion_is_bounded_recoverable_before_generic_403_permission_handling():
+    failure, recovery, _ = _classify(stderr="HTTP 403: monthly budget limit exceeded")
+    assert failure is routing.FailureClass.PROVIDER_BUDGET_EXHAUSTED
+    assert recovery is routing.RecoveryClass.MODEL_RECOVERABLE
+
+
+def test_agent_context_capability_mismatch_is_bounded_recoverable():
+    failure, recovery, _ = _classify(
+        stderr="model context window 32768 is smaller than minimum required 64000"
+    )
+    assert failure is routing.FailureClass.PROVIDER_CAPABILITY_MISMATCH
     assert recovery is routing.RecoveryClass.MODEL_RECOVERABLE
 
 

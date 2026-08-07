@@ -308,6 +308,15 @@ def _prepare_nous_profile_runtime_home(
     return resolved_profile
 
 
+def _structural_route_failure(candidate: routing.RouteCandidate, profile_home: Path) -> str:
+    """Return a deterministic pre-launch incompatibility reason, or empty string."""
+    profiles_root = (HERMES_ROOT / "profiles").resolve(strict=False)
+    resolved_profile = profile_home.resolve(strict=False)
+    if candidate.lane == "nous" and not resolved_profile.is_relative_to(profiles_root):
+        return "Nous delegation requires a named Hermes profile home"
+    return ""
+
+
 def _select_structurally_runnable_route(
     resolved: routing.ResolvedRouting,
     profile_home: Path,
@@ -319,18 +328,12 @@ def _select_structurally_runnable_route(
     occur after launch remain fail-closed and are never silently converted into
     a model fallback.
     """
-    profiles_root = (HERMES_ROOT / "profiles").resolve(strict=False)
-    resolved_profile = profile_home.resolve(strict=False)
     skipped: list[dict[str, Any]] = []
     candidates = [resolved.primary, *resolved.alternates]
     for candidate in candidates:
-        if candidate.lane == "nous" and not resolved_profile.is_relative_to(profiles_root):
-            skipped.append(
-                {
-                    "route": candidate.to_audit_dict(),
-                    "reason": "Nous delegation requires a named Hermes profile home",
-                }
-            )
+        failure = _structural_route_failure(candidate, profile_home)
+        if failure:
+            skipped.append({"route": candidate.to_audit_dict(), "reason": failure})
             continue
         return candidate, skipped
     raise RuntimeError("No delegated route is structurally runnable for the selected Hermes profile.")
@@ -1226,12 +1229,13 @@ def _select_bounded_alternate(
     route: routing.RouteCandidate,
     failed_routes: list[routing.RouteCandidate],
     alternates_used: int,
+    profile_home: Path,
 ) -> routing.RouteCandidate | None:
-    """Return an eligible alternate route, or ``None`` to stop and fail closed.
+    """Return an eligible, structurally runnable alternate route, or ``None``.
 
-    Only genuine model/provider defects consume the bounded alternate budget:
-    permission, tool-policy, evidence and deadline failures never trigger a
-    blind walk across providers.
+    Only genuine model/provider defects consume the bounded alternate budget.
+    Deterministically incompatible candidates are skipped before launch and do
+    not consume an attempt.
     """
     try:
         failure = routing.FailureClass(str(task.get("failure_class") or ""))
@@ -1239,11 +1243,23 @@ def _select_bounded_alternate(
         return None
     if not routing.is_recoverable(failure):
         return None
-    return routing.select_alternate(
-        resolved,
-        failed_routes=[*failed_routes, route],
-        attempts_used=alternates_used,
-    )
+
+    skipped_routes = [*failed_routes, route]
+    while True:
+        alternate = routing.select_alternate(
+            resolved,
+            failed_routes=skipped_routes,
+            attempts_used=alternates_used,
+        )
+        if alternate is None:
+            return None
+        structural_failure = _structural_route_failure(alternate, profile_home)
+        if not structural_failure:
+            return alternate
+        task.setdefault("routing_preflight_skips", []).append(
+            {"route": alternate.to_audit_dict(), "reason": structural_failure}
+        )
+        skipped_routes.append(alternate)
 
 
 def _record_alternate_attempt(
@@ -1378,6 +1394,7 @@ def _worker(task_id: str) -> None:
                         route=route,
                         failed_routes=failed_routes,
                         alternates_used=alternates_used,
+                        profile_home=profile_home,
                     )
                     if alternate is not None:
                         # Bounded cross-provider recovery: same logical work,

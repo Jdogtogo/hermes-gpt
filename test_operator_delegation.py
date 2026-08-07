@@ -106,7 +106,7 @@ def test_prepare_runtime_home_is_writable_and_profile_minimal(monkeypatch, tmp_p
     profile_home = tmp_path / "profile"
     profile_home.mkdir()
     (profile_home / "config.yaml").write_text(
-        "model:\n  provider: openrouter\n  default: test/model\nplugins:\n  enabled:\n    - chronos\n",
+        f"model:\n  provider: openrouter\n  default: {_OPENROUTER_MODEL}\nplugins:\n  enabled:\n    - chronos\n",
         encoding="utf-8",
     )
     (profile_home / ".env").write_text("OPENROUTER_API_KEY=secret\n", encoding="utf-8")
@@ -128,8 +128,8 @@ def test_prepare_runtime_home_is_writable_and_profile_minimal(monkeypatch, tmp_p
     assert loaded == {
         "model": {
             "provider": "openrouter",
-            "model": "test/model",
-            "default": "test/model",
+            "model": _OPENROUTER_MODEL,
+            "default": _OPENROUTER_MODEL,
         },
         "display": {"interface": "cli"},
     }
@@ -1488,25 +1488,28 @@ def test_runtime_materialisation_preserves_the_resolved_fallback_chain(monkeypat
     )
     assert loaded["model"]["provider"] == "openrouter"
     assert loaded["model"]["model"] == _OPENROUTER_MODEL
-    assert loaded["fallback_providers"] == [
-        {"provider": "nvidia", "model": _NVIDIA_MODEL}
-    ]
+    assert loaded["fallback_providers"][0] == {"provider": "nvidia", "model": _NVIDIA_MODEL}
+    assert len(loaded["fallback_providers"]) == 3
+    assert all(item["provider"] != "ollama" for item in loaded["fallback_providers"])
 
     audit = json.loads((runtime_home / "routing.json").read_text(encoding="utf-8"))
     assert audit["primary"]["lane"] == "openrouter"
-    # NVIDIA direct leads the canonical order, so it is the single materialised
-    # alternate even though more routes are eligible.
+    # NVIDIA direct leads the canonical order; the bounded live policy now
+    # materialises up to three qualified free Agent alternates.
     assert audit["alternates"][0]["lane"] == "nvidia"
-    assert audit["materialised_fallback_providers"] == [
-        {"provider": "nvidia", "model": _NVIDIA_MODEL}
-    ]
+    assert audit["materialised_fallback_providers"][0] == {
+        "provider": "nvidia",
+        "model": _NVIDIA_MODEL,
+    }
+    assert len(audit["materialised_fallback_providers"]) == 3
+    assert all(item["provider"] != "ollama" for item in audit["materialised_fallback_providers"])
     assert audit["free_only"] is True
-    assert audit["max_alternate_attempts"] == 1
+    assert audit["max_alternate_attempts"] == 3
     assert audit["provider_order"] == list(routing.CANONICAL_PROVIDER_ORDER)
     assert audit["deadline_seconds"] == 120
 
 
-def test_quarantined_routes_are_recorded_while_qualified_nous_is_available(monkeypatch, tmp_path):
+def test_direct_only_ollama_is_excluded_while_nous_remains_agent_available(monkeypatch, tmp_path):
     _routing_workspace(
         monkeypatch,
         tmp_path,
@@ -1525,9 +1528,9 @@ def test_quarantined_routes_are_recorded_while_qualified_nous_is_available(monke
     lanes = {item["lane"] for item in audit["alternates"]}
     assert "ollama" not in lanes
     assert "nous" in lanes
-    excluded = {item["provider"]: item["reason"] for item in audit["excluded"]}
-    assert "quarantined" in excluded["ollama"].lower()
-    assert "duplicate" in excluded["nous"].lower()
+    control = routing.load_routing_control().control_for("ollama")
+    assert control.direct_inference_models == ("qwen2.5:7b-instruct",)
+    assert control.agent_qualified_models == ()
 
 
 def test_worker_uses_selected_nous_profile_and_keeps_file_root_confined(monkeypatch, tmp_path):
@@ -1724,12 +1727,12 @@ def test_permission_failure_does_not_consume_a_model_alternate(monkeypatch, tmp_
 def test_retry_exhaustion_fails_closed_with_no_eligible_alternate(monkeypatch, tmp_path):
     workdir = tmp_path / "work"
     workdir.mkdir()
-    # Only quarantined lanes are offered and control-supplied routes are off,
+    # Only an unqualified Ollama model is offered and control-supplied routes are off,
     # so no alternate is eligible and the task must fail closed.
     _routing_workspace(
         monkeypatch,
         tmp_path,
-        fallbacks=[{"provider": "ollama", "model": "qwen2.5:7b-instruct"}],
+        fallbacks=[{"provider": "ollama", "model": "llama3.1:8b"}],
     )
     _pin_control(monkeypatch, tmp_path, include_qualified_routes=False)
     task_id = _queued_task(monkeypatch, tmp_path, workdir)
@@ -1751,8 +1754,8 @@ def test_retry_exhaustion_fails_closed_with_no_eligible_alternate(monkeypatch, t
     assert task.get("attempts") == []
 
 
-def test_alternate_is_not_attempted_twice(monkeypatch, tmp_path):
-    """Both attempts failing must stop, not walk the remaining providers."""
+def test_bounded_alternates_are_each_attempted_at_most_once(monkeypatch, tmp_path):
+    """Recovery may use the bounded free chain, but never repeats a failed route."""
     workdir = tmp_path / "work"
     workdir.mkdir()
     _routing_workspace(
@@ -1776,9 +1779,11 @@ def test_alternate_is_not_attempted_twice(monkeypatch, tmp_path):
     delegation._worker(task_id)
 
     task = delegation._load(task_id)
-    assert calls["n"] == 2
+    assert calls["n"] == 4
     assert task["status"] == "incomplete"
-    assert len(task["attempts"]) == 1
+    assert len(task["attempts"]) == 3
+    attempted_routes = {(item["provider_lane"], item["model"]) for item in task["attempts"]}
+    assert len(attempted_routes) == len(task["attempts"])
 
 
 def test_queued_task_records_the_routing_decision(monkeypatch, tmp_path):
@@ -1790,7 +1795,7 @@ def test_queued_task_records_the_routing_decision(monkeypatch, tmp_path):
     audit = delegation._load(task_id)["routing_audit"]
     assert audit["primary"]["lane"] == "openrouter"
     assert audit["alternates"][0]["lane"] == "nvidia"
-    assert audit["max_alternate_attempts"] == 1
+    assert audit["max_alternate_attempts"] == 3
     assert audit["free_only"] is True
     assert audit["excluded"]
 

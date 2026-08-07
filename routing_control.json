@@ -12,8 +12,8 @@
   ],
   "version": 1,
   "free_only": true,
-  "max_alternate_attempts": 1,
-  "require_qualified_primary": false,
+  "max_alternate_attempts": 3,
+  "require_qualified_primary": true,
   "include_qualified_routes": true,
   "provider_order": ["nvidia", "openrouter", "gemini", "nous", "ollama"],
   "providers": {
@@ -62,16 +62,21 @@
       "evidence_ref": "https://portal.nousresearch.com/info"
     },
     "ollama": {
-      "eligible": false,
-      "quarantined": true,
+      "eligible": true,
+      "quarantined": false,
       "free_tier_only": true,
-      "reason": "Ollama is quarantined and ineligible for critical apply work until a current local service health check, model availability, exact-output response, tool execution, file write/read-back and structured evidence completion all pass. Preserved as a discovered provider record.",
-      "qualified_models": [],
-      "discovered_models": [
-        "qwen2.5:7b-instruct",
-        "llama3.1:8b"
+      "reason": "Ollama local qwen2.5:7b-instruct passed fresh host qualification on 2026-08-07 including service health, installed-model verification, exact-output responses, native tool use, file write/read-back and structured evidence completion.",
+      "qualified_models": [
+        "qwen2.5:7b-instruct"
       ],
-      "evidence_ref": "ops-brain/evidence/hermes-live-provider-routing-pilot-2026-08-02.md"
+      "agent_qualified_models": [],
+      "direct_inference_models": [
+        "qwen2.5:7b-instruct"
+      ],
+      "discovered_models": [
+        "qwen2.5:7b-instruct"
+      ],
+      "evidence_ref": "model-routing-migration/evidence/ollama-live-qualification-2026-08-07T111049Z/qualification.json"
     }
   }
 }

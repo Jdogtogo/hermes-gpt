@@ -104,6 +104,8 @@ class FailureClass(str, Enum):
     TRANSIENT_PROVIDER_FAILURE = "transient_provider_failure"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     PROVIDER_CONFIGURATION = "provider_configuration"
+    PROVIDER_BUDGET_EXHAUSTED = "provider_budget_exhausted"
+    PROVIDER_CAPABILITY_MISMATCH = "provider_capability_mismatch"
     DEADLINE_EXHAUSTED = "deadline_exhausted"
     EVIDENCE_FAILURE = "evidence_failure"
     PERMISSION_FAILURE = "permission_failure"
@@ -122,6 +124,8 @@ _RECOVERABLE = frozenset(
         FailureClass.RATE_LIMIT,
         FailureClass.TRANSIENT_PROVIDER_FAILURE,
         FailureClass.PROVIDER_UNAVAILABLE,
+        FailureClass.PROVIDER_BUDGET_EXHAUSTED,
+        FailureClass.PROVIDER_CAPABILITY_MISMATCH,
     }
 )
 
@@ -172,10 +176,20 @@ class ProviderControl:
     reason: str = "no qualification record"
     free_tier_only: bool = True
     qualified_models: tuple[str, ...] = ()
+    agent_qualified_models: tuple[str, ...] = ()
+    agent_qualification_explicit: bool = False
+    direct_inference_models: tuple[str, ...] = ()
     evidence_ref: str = ""
 
     def qualifies(self, model: str) -> bool:
         return normalise_model(model) in {normalise_model(m) for m in self.qualified_models}
+
+    def qualifies_for_agent(self, model: str) -> bool:
+        models = self.agent_qualified_models if self.agent_qualification_explicit else self.qualified_models
+        return normalise_model(model) in {normalise_model(m) for m in models}
+
+    def agent_models(self) -> tuple[str, ...]:
+        return self.agent_qualified_models if self.agent_qualification_explicit else self.qualified_models
 
 
 @dataclass(frozen=True)
@@ -204,7 +218,7 @@ class RoutingControl:
             provider_control = self.control_for(lane)
             if provider_control.quarantined or not provider_control.eligible:
                 continue
-            for model in provider_control.qualified_models:
+            for model in provider_control.agent_models():
                 routes.append(RouteCandidate(provider=lane, model=model, origin="control"))
         return routes
 
@@ -247,6 +261,8 @@ def load_routing_control(path: Path | None = None) -> RoutingControl:
         if not lane or not isinstance(value, dict):
             continue
         models = value.get("qualified_models") or []
+        agent_models = value["agent_qualified_models"] if "agent_qualified_models" in value else models
+        direct_models = value["direct_inference_models"] if "direct_inference_models" in value else models
         providers[lane] = ProviderControl(
             lane=lane,
             eligible=bool(value.get("eligible", False)),
@@ -254,6 +270,9 @@ def load_routing_control(path: Path | None = None) -> RoutingControl:
             reason=str(value.get("reason") or ""),
             free_tier_only=bool(value.get("free_tier_only", True)),
             qualified_models=tuple(str(item) for item in models if str(item).strip()),
+            agent_qualified_models=tuple(str(item) for item in (agent_models or []) if str(item).strip()),
+            agent_qualification_explicit="agent_qualified_models" in value,
+            direct_inference_models=tuple(str(item) for item in (direct_models or []) if str(item).strip()),
             evidence_ref=str(value.get("evidence_ref") or ""),
         )
 
@@ -440,10 +459,17 @@ def _eligibility_failure(
         return f"provider lane {candidate.lane!r} is outside the canonical provider order"
     if control.free_only and candidate.paid:
         return "paid route rejected by free-only policy"
+    if (
+        control.free_only
+        and candidate.lane == "openrouter"
+        and provider_control.free_tier_only
+        and not str(candidate.model).strip().lower().endswith(":free")
+    ):
+        return "OpenRouter route is not explicitly proven free (:free suffix required)"
     if provider_control.quarantined or not provider_control.eligible:
         return provider_control.reason or f"provider lane {candidate.lane!r} is quarantined"
-    if require_qualified and not provider_control.qualifies(candidate.model):
-        return "model has no current account-specific qualification record"
+    if require_qualified and not provider_control.qualifies_for_agent(candidate.model):
+        return "model has no current Hermes-Agent qualification record"
     return ""
 
 
@@ -492,21 +518,31 @@ def resolve_routing(
 
     excluded: list[ExcludedRoute] = []
 
-    # A quarantined or paid primary always fails closed. Nous and Ollama stay
-    # ineligible here until their independent qualification gates pass.
+    # An ineligible configured primary is not allowed to launch. Instead of
+    # failing the whole logical task immediately, retain the exclusion evidence
+    # and promote the highest-priority qualified free Agent route below. This is
+    # a pre-launch routing decision, not a paid or policy bypass.
     primary_failure = _eligibility_failure(
         primary, control, require_qualified=control.require_qualified_primary
     )
     primary_control = control.control_for(primary.lane)
-    if primary_failure and (
-        primary_control.quarantined
-        or not primary_control.eligible
-        or (control.free_only and primary.paid)
-        or control.require_qualified_primary
-    ):
-        raise RoutingError(
-            f"primary route {primary.provider}/{primary.model} is not eligible: {primary_failure}"
+    primary_ineligible = bool(
+        primary_failure
+        and (
+            primary_control.quarantined
+            or not primary_control.eligible
+            or (control.free_only and primary.paid)
+            or control.require_qualified_primary
+            or (
+                control.free_only
+                and primary.lane == "openrouter"
+                and primary_control.free_tier_only
+                and not str(primary.model).strip().lower().endswith(":free")
+            )
         )
+    )
+    if primary_ineligible:
+        excluded.append(ExcludedRoute(primary.provider, primary.model, primary_failure))
 
     # --- alternates: accumulate in precedence order, then gate --------------
     ordered_sources = [
@@ -541,6 +577,14 @@ def resolve_routing(
 
     # Canonical provider order decides selection priority, not file order.
     eligible.sort(key=lambda item: item.priority(control.provider_order))
+
+    if primary_ineligible:
+        if not eligible:
+            raise RoutingError(
+                f"configured primary {primary.provider}/{primary.model} is not eligible ({primary_failure}) "
+                "and no qualified free Hermes-Agent route is available"
+            )
+        primary = eligible.pop(0)
 
     return ResolvedRouting(
         primary=primary,
@@ -617,6 +661,22 @@ _RATE_LIMIT_MARKERS = (
     "quota exceeded",
     "resource_exhausted",
 )
+_BUDGET_MARKERS = (
+    "monthly budget",
+    "budget limit",
+    "budget exceeded",
+    "insufficient credits",
+    "credit balance",
+    "credits exhausted",
+    "spend limit",
+)
+_CAPABILITY_MISMATCH_MARKERS = (
+    "context window",
+    "minimum required context",
+    "smaller than minimum required",
+    "requires at least 64000",
+    "requires at least 64,000",
+)
 _UNAVAILABLE_MARKERS = (
     "503",
     "service unavailable",
@@ -681,6 +741,21 @@ def classify_outcome(
     """
     combined = f"{stdout or ''}\n{stderr or ''}".lower()
     changed_files = changed_files or []
+
+    # Provider budget/capability failures are recoverable and must be checked
+    # before generic permission markers such as HTTP 403/"forbidden".
+    if _contains(combined, _BUDGET_MARKERS):
+        return (
+            FailureClass.PROVIDER_BUDGET_EXHAUSTED,
+            RecoveryClass.MODEL_RECOVERABLE,
+            "provider budget or credit allowance is exhausted",
+        )
+    if _contains(combined, _CAPABILITY_MISMATCH_MARKERS):
+        return (
+            FailureClass.PROVIDER_CAPABILITY_MISMATCH,
+            RecoveryClass.MODEL_RECOVERABLE,
+            "provider/model capability does not meet Hermes Agent requirements",
+        )
 
     # Authority and policy failures must never consume a model alternate.
     if status == "blocked" or _contains(combined, _PERMISSION_MARKERS):
