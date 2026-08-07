@@ -308,6 +308,34 @@ def _prepare_nous_profile_runtime_home(
     return resolved_profile
 
 
+def _select_structurally_runnable_route(
+    resolved: routing.ResolvedRouting,
+    profile_home: Path,
+) -> tuple[routing.RouteCandidate, list[dict[str, Any]]]:
+    """Skip routes that the selected profile cannot structurally execute.
+
+    This is intentionally narrow. It only handles deterministic profile-shape
+    incompatibility before process launch. Credential or provider failures that
+    occur after launch remain fail-closed and are never silently converted into
+    a model fallback.
+    """
+    profiles_root = (HERMES_ROOT / "profiles").resolve(strict=False)
+    resolved_profile = profile_home.resolve(strict=False)
+    skipped: list[dict[str, Any]] = []
+    candidates = [resolved.primary, *resolved.alternates]
+    for candidate in candidates:
+        if candidate.lane == "nous" and not resolved_profile.is_relative_to(profiles_root):
+            skipped.append(
+                {
+                    "route": candidate.to_audit_dict(),
+                    "reason": "Nous delegation requires a named Hermes profile home",
+                }
+            )
+            continue
+        return candidate, skipped
+    raise RuntimeError("No delegated route is structurally runnable for the selected Hermes profile.")
+
+
 def _safe_text(value: str) -> str:
     redacted = op.redact_output(value or "")
     if len(redacted) <= MAX_OUTPUT_CHARS:
@@ -1295,7 +1323,19 @@ def _worker(task_id: str) -> None:
         _require_task_authority(task)
         resolved = _resolve_task_routing(task)
         profile_home = op.resolve_profile_home(str(task.get("profile", "default")), HERMES_ROOT)
-        route = resolved.primary
+        route, preflight_skips = _select_structurally_runnable_route(resolved, profile_home)
+        if preflight_skips:
+            task["routing_preflight_skips"] = preflight_skips
+            task["active_route"] = route.to_audit_dict()
+            task.setdefault("events", []).append(
+                {
+                    "at": _now(),
+                    "from": "starting",
+                    "to": "starting",
+                    "reason": "routing preflight skipped structurally incompatible route(s)",
+                }
+            )
+            _save(task)
         failed_routes: list[routing.RouteCandidate] = []
         alternates_used = 0
         while True:
@@ -1472,7 +1512,7 @@ def hermes_delegate_task_forecast(
             maximum_continuations=maximum_continuations,
             resume_from_checkpoint=resume_from_checkpoint,
             stop_on=stop_on,
-            authority_expires_at=policy.expires_at,
+            authority_expires_at=policy.expires_at if policy.session_id else None,
         )
         if long_horizon["enabled"] and not policy.session_id:
             raise PermissionError("Automatic long-horizon delegation requires an approved Operator Session.")
@@ -1628,7 +1668,7 @@ def hermes_delegate_task(
             maximum_continuations=maximum_continuations,
             resume_from_checkpoint=resume_from_checkpoint,
             stop_on=stop_on,
-            authority_expires_at=policy.expires_at,
+            authority_expires_at=policy.expires_at if policy.session_id else None,
         )
         if long_horizon["enabled"] and not policy.session_id:
             raise PermissionError("Automatic long-horizon delegation requires an approved Operator Session.")

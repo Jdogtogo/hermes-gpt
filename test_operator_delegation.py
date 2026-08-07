@@ -172,6 +172,25 @@ def test_prepare_ephemeral_nous_shared_dir_is_private_and_nous_only(monkeypatch,
     ) is None
 
 
+def test_select_structurally_runnable_route_skips_nous_for_default_profile(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(delegation, "HERMES_ROOT", hermes_root)
+    nous = delegation.routing.RouteCandidate(provider="nous", model="tencent/hy3:free")
+    nvidia = delegation.routing.RouteCandidate(provider="nvidia", model="test/model")
+    resolved = delegation.routing.ResolvedRouting(primary=nous, alternates=[nvidia])
+
+    selected, skipped = delegation._select_structurally_runnable_route(resolved, hermes_root)
+
+    assert selected == nvidia
+    assert skipped == [
+        {
+            "route": nous.to_audit_dict(),
+            "reason": "Nous delegation requires a named Hermes profile home",
+        }
+    ]
+
+
 def test_prepare_nous_profile_runtime_home_uses_exact_selected_profile(monkeypatch, tmp_path):
     hermes_root = tmp_path / "hermes"
     profile_home = hermes_root / "profiles" / "hy3-free-test"
@@ -1051,6 +1070,38 @@ def _long_horizon_task(tmp_path: Path, *, status: str = "timed_out") -> dict:
             "mode": "apply",
         },
     }
+
+
+def test_forecast_ignores_diagnostic_expiry_without_active_session(monkeypatch, tmp_path):
+    class StandingReadOnlyPolicy(FakePolicy):
+        level = "read_only"
+        apply_mode = "dry_run"
+        session_id = None
+        snapshot_hash = None
+        expires_at = 200
+        readable_roots = [tmp_path]
+        writable_roots = []
+        verbs = {"filesystem": ["read"]}
+
+        def require_level(self, level):
+            assert level == "read_only"
+
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", StandingReadOnlyPolicy)
+    monkeypatch.setattr(delegation.op, "validate_profile_name", lambda value: value)
+    monkeypatch.setattr(delegation, "_now", lambda: 1000)
+
+    result = json.loads(
+        delegation.hermes_delegate_task_forecast(
+            workdir=str(tmp_path),
+            mode="plan",
+            timeout=600,
+            total_task_window=600,
+        )
+    )
+
+    assert result["granted"] is True
+    assert result["authority"]["session_id"] is None
+    assert result["authority"]["long_horizon"]["envelope_deadline"] == 1600
 
 
 def test_long_horizon_accepts_eight_hour_envelope(monkeypatch, tmp_path):
