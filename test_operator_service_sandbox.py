@@ -11,8 +11,11 @@ ROOT = Path(__file__).resolve().parent
 DROP_IN = ROOT / "examples" / "hermes-gpt-chatgpt-operator-write-roots.conf"
 
 
-def _decode_systemd_path(value: str) -> str:
-    return value.replace("\\x20", " ")
+def _parse_systemd_path(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1]
+    return text
 
 
 def _read_write_paths() -> set[str]:
@@ -23,13 +26,26 @@ def _read_write_paths() -> set[str]:
             continue
         value = line.split("=", 1)[1].strip()
         if value:
-            paths.add(_decode_systemd_path(value))
+            paths.add(_parse_systemd_path(value))
     return paths
 
 
 def _is_covered(root: str, allowed: set[str]) -> bool:
     candidate = Path(root)
     return any(candidate == Path(parent) or Path(parent) in candidate.parents for parent in allowed)
+
+
+def test_tax_calculator_path_uses_quoted_literal_space():
+    text = DROP_IN.read_text(encoding="utf-8")
+    assert 'ReadWritePaths="/mnt/c/Dev/Tax Calculator"' in text
+    assert "Tax\\x20Calculator" not in text
+    assert "/mnt/c/Dev/Tax Calculator" in _read_write_paths()
+
+
+def test_immutable_release_paths_are_not_writable():
+    allowed = _read_write_paths()
+    assert not _is_covered("/home/jfroh/.hermes/releases/v018-live", allowed)
+    assert not _is_covered("/home/jfroh/.hermes/releases/v019", allowed)
 
 
 def test_operator_service_drop_in_covers_all_active_policy_writable_roots():
