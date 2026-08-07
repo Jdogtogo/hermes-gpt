@@ -309,6 +309,17 @@ def test_paid_route_is_always_rejected(tmp_path):
     assert all("paid route rejected" in item.reason for item in resolved.excluded)
 
 
+def test_paid_planner_glm52_openrouter_route_is_rejected(tmp_path):
+    """The real planner profile model must never pass the free-only gate."""
+    with pytest.raises(routing.RoutingError) as exc:
+        _resolve(
+            tmp_path,
+            profile_config={"model": {"provider": "openrouter", "model": "z-ai/glm-5.2"}},
+            control=_control(require_qualified_primary=True),
+        )
+    assert "not explicitly proven free" in str(exc.value)
+
+
 def test_unprobed_route_is_rejected(tmp_path):
     """A model with no current qualification record cannot be an alternate."""
     resolved = _resolve(
