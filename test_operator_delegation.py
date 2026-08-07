@@ -815,6 +815,57 @@ def test_require_task_authority_rejects_expired_envelope(monkeypatch, tmp_path):
         raise AssertionError("expired delegated authority should be rejected")
 
 
+def test_require_task_authority_accepts_active_standing_authority_without_expiry(monkeypatch, tmp_path):
+    class StandingPolicy(FakePolicy):
+        session_status = "standing"
+        session_id = "sa_test"
+        expires_at = None
+
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", StandingPolicy)
+    task = {
+        "profile": "default",
+        "workdir": str(tmp_path),
+        "mode": "apply",
+        "authority": {
+            "authority_kind": "standing",
+            "session_id": "sa_test",
+            "snapshot_hash": "snapshot",
+            "expires_at": None,
+            "profile": "default",
+            "workdir": str(tmp_path),
+            "mode": "apply",
+        },
+    }
+
+    delegation._require_task_authority(task)
+
+
+def test_require_task_authority_rejects_inactive_standing_authority(monkeypatch, tmp_path):
+    class InactiveStandingPolicy(FakePolicy):
+        session_status = "read_only"
+        session_id = "sa_test"
+        expires_at = None
+
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", InactiveStandingPolicy)
+    task = {
+        "profile": "default",
+        "workdir": str(tmp_path),
+        "mode": "apply",
+        "authority": {
+            "authority_kind": "standing",
+            "session_id": "sa_test",
+            "snapshot_hash": "snapshot",
+            "expires_at": None,
+            "profile": "default",
+            "workdir": str(tmp_path),
+            "mode": "apply",
+        },
+    }
+
+    with pytest.raises(PermissionError, match="standing authority is no longer active"):
+        delegation._require_task_authority(task)
+
+
 def test_result_redacts_and_returns_terminal_output(monkeypatch, tmp_path):
     monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
     task_id = "dt_" + "b" * 32

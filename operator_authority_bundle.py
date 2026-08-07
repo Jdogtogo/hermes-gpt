@@ -468,23 +468,35 @@ def create_authority_bundle(
     )
 
     canonical = json.dumps(bundle.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    lock_claimed = False
+    if risk_factors.single_writer_verified and risk_factors.writable_roots:
+        from operator_worktree_lock import claim_writer_locks
 
-    with _connect(root) as conn:
-        _initialize_bundle_db(conn)
-        conn.execute(
-            """INSERT INTO authority_bundles
-               (bundle_id, canonical_json, created_at, policy_template,
-                policy_template_hash, policy_template_version, risk_factors_hash, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'active')""",
-            (
-                bid, canonical, current,
-                bundle.policy_template,
-                bundle.policy_template_hash,
-                bundle.policy_template_version,
-                bundle.risk_factors_hash,
-            ),
-        )
-        _write_active_pointer(bid, root=root)
+        claim_writer_locks(bid, risk_factors.writable_roots, root=root, now=current)
+        lock_claimed = True
+    try:
+        with _connect(root) as conn:
+            _initialize_bundle_db(conn)
+            conn.execute(
+                """INSERT INTO authority_bundles
+                   (bundle_id, canonical_json, created_at, policy_template,
+                    policy_template_hash, policy_template_version, risk_factors_hash, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'active')""",
+                (
+                    bid, canonical, current,
+                    bundle.policy_template,
+                    bundle.policy_template_hash,
+                    bundle.policy_template_version,
+                    bundle.risk_factors_hash,
+                ),
+            )
+            _write_active_pointer(bid, root=root)
+    except Exception:
+        if lock_claimed:
+            from operator_worktree_lock import release_writer_locks
+
+            release_writer_locks(bid, risk_factors.writable_roots, root=root)
+        raise
 
     return bundle
 
@@ -612,6 +624,10 @@ def revoke_authority_bundle(
             "UPDATE authority_bundles SET canonical_json = ?, status = 'revoked' WHERE bundle_id = ?",
             (canonical, bundle_id),
         )
+    if bundle.approved_risk_factors.single_writer_verified and bundle.approved_risk_factors.writable_roots:
+        from operator_worktree_lock import release_writer_locks
+
+        release_writer_locks(bundle_id, bundle.approved_risk_factors.writable_roots, root=root)
 
     return True
 
@@ -723,6 +739,10 @@ def complete_authority_bundle(
             "UPDATE authority_bundles SET canonical_json = ?, status = 'completed' WHERE bundle_id = ?",
             (canonical, bundle_id),
         )
+    if bundle.approved_risk_factors.single_writer_verified and bundle.approved_risk_factors.writable_roots:
+        from operator_worktree_lock import release_writer_locks
+
+        release_writer_locks(bundle_id, bundle.approved_risk_factors.writable_roots, root=root)
 
     return True
 
@@ -773,6 +793,12 @@ def check_authority_bundle_validity(
         return False, "Containment weakened or is no longer verified"
     if current_risk_factors.compute_hash() != bundle.risk_factors_hash:
         return False, "Approved scope or immutable risk facts changed"
+    if current_risk_factors.single_writer_verified and current_risk_factors.writable_roots:
+        from operator_worktree_lock import assert_writer_locks
+        try:
+            assert_writer_locks(bundle.bundle_id, current_risk_factors.writable_roots)
+        except ValueError:
+            return False, "Single-writer ownership is missing or held by another authority"
 
     return True, None
 

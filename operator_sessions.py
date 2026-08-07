@@ -342,6 +342,40 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
             paths=True,
         ),
         "verbs": normalized_verbs,
+        # Risk and containment facts are part of the immutable approval
+        # snapshot.  Unknown or omitted facts fail closed to False/none.
+        "authority_mode": (
+            "standing" if str(policy.get("authority_mode") or "session").strip().lower() == "standing"
+            else "session"
+        ),
+        "standing_authority_eligible": bool(policy.get("standing_authority_eligible", False)),
+        "containment_strength": str(policy.get("containment_strength") or "none"),
+        "containment_verified": bool(policy.get("containment_verified", False)),
+        "bounded_roots_verified": bool(policy.get("bounded_roots_verified", False)),
+        "branch_guard_verified": bool(policy.get("branch_guard_verified", False)),
+        "baseline_guard_verified": bool(policy.get("baseline_guard_verified", False)),
+        "single_writer_verified": bool(policy.get("single_writer_verified", False)),
+        "untracked_delete_protected": bool(policy.get("untracked_delete_protected", False)),
+        "version_controlled_rollback": bool(policy.get("version_controlled_rollback", False)),
+        "deliverable_verification_required": bool(
+            policy.get("deliverable_verification_required", False)
+        ),
+        "deliverable_verification_verified": bool(
+            policy.get("deliverable_verification_verified", False)
+        ),
+        "data_sensitivity": str(policy.get("data_sensitivity") or "public"),
+        "production_effect": str(policy.get("production_effect") or "none"),
+        "paid_route_change": str(policy.get("paid_route_change") or "none"),
+        "has_secret_access": bool(policy.get("has_secret_access", False)),
+        "has_credential_access": bool(policy.get("has_credential_access", False)),
+        "has_client_identifiable_data": bool(
+            policy.get("has_client_identifiable_data", False)
+        ),
+        "has_financial_data": bool(policy.get("has_financial_data", False)),
+        "has_external_communication": bool(
+            policy.get("has_external_communication", False)
+        ),
+        "has_deployment": bool(policy.get("has_deployment", False)),
     }
 
 
@@ -828,9 +862,64 @@ def approve_session_request(
             )
         policy["policy_template"] = template_name
         duration = int(row["requested_duration_seconds"])
+        authority_mode = str(policy.get("authority_mode") or "session").strip().lower()
+        from operator_risk import (
+            RiskClass,
+            classify_risk,
+            compute_risk_factors_from_session,
+            risk_based_authority_enabled,
+        )
+
+        normalized = normalize_policy(policy)
+        factor_snapshot = dict(normalized)
+        factor_snapshot["snapshot_hash"] = snapshot_hash(normalized)
+        approval_risk_factors = compute_risk_factors_from_session(
+            factor_snapshot, template_baseline=normalized
+        )
+        approval_risk_decision = classify_risk(approval_risk_factors)
+        standing_plan: tuple[Any, Any] | None = None
+        if authority_mode == "standing":
+            # Local approval is the material decision point. Validate the exact,
+            # normalized immutable snapshot before minting either authority.
+            if not risk_based_authority_enabled():
+                raise PermissionError(
+                    "Risk-based standing authority is disabled by the local operator configuration."
+                )
+            if (
+                not normalized.get("standing_authority_eligible", False)
+                or approval_risk_decision.risk_class != RiskClass.LOW
+                or approval_risk_decision.tier != 1
+                or not approval_risk_decision.standing_authority_eligible
+            ):
+                raise PermissionError(
+                    "Standing authority approval refused: the resolved policy is not contained Tier 1 LOW-risk "
+                    f"and standing-eligible ({approval_risk_decision.summary()})."
+                )
+            standing_plan = (approval_risk_factors, approval_risk_decision)
     # create_session opens its own connection; keep it outside the block
     # above so a same-thread nested SQLite write never deadlocks.
     record = create_session(policy, duration_seconds=duration, root=root, now=current)
+    standing_authority_id: str | None = None
+    if standing_plan is not None:
+        try:
+            from operator_standing_authority import create_standing_authority
+
+            factors, decision = standing_plan
+            standing = create_standing_authority(
+                risk_factors=factors,
+                risk_decision=decision,
+                created_by=decided_by,
+                operational_deadline=record.expires_at,
+                operational_deadline_reason="bootstrap operator session watchdog",
+                root=root,
+                now=current,
+            )
+            standing_authority_id = standing.authority_id
+        except Exception:
+            # Fail atomically: a standing request must never silently degrade
+            # into an ordinary approved write session.
+            revoke_session(record.session_id, root=root, now=current)
+            raise
     # Update the live pointer so the already-running server picks this up on
     # its very next tool call — no restart needed.
     _write_active_pointer(record.session_id, root=root)
@@ -847,6 +936,19 @@ def approve_session_request(
             "snapshot_hash": record.snapshot_hash,
             "requested_duration_seconds": duration,
             "approved_duration_seconds": record.expires_at - record.created_at,
+            "authority_mode": authority_mode,
+            "standing_authority_id": standing_authority_id,
+            "policy_template": template_name,
+            "risk_class": approval_risk_decision.risk_class.value,
+            "risk_tier": approval_risk_decision.tier,
+            "risk_factors_hash": approval_risk_decision.factors_hash,
+            "writable_roots": [str(path) for path in approval_risk_factors.writable_roots],
+            "verbs": list(approval_risk_factors.verbs),
+            "allowed_branches": normalized.get("allowed_branches"),
+            "baseline_guard_verified": approval_risk_factors.baseline_guard_verified,
+            "authorization_expires_at": None if authority_mode == "standing" else record.expires_at,
+            "operational_deadline": record.expires_at if authority_mode == "standing" else None,
+            "approver": decided_by,
         },
     )
     return record

@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-MANIFEST_VERSION = "1.1.0"
+MANIFEST_VERSION = "1.2.0"
 EXPECTED_TOOL_COUNT = 41
 
 # Canonical public surface for the authenticated ChatGPT operator connector.
@@ -65,7 +65,7 @@ if len(CANONICAL_TOOL_NAMES) != EXPECTED_TOOL_COUNT:
 
 # Pinned after computing the canonical MCP input-schema payload. Intentional
 # public tool or schema changes must update both this digest and MANIFEST_VERSION.
-EXPECTED_SCHEMA_FINGERPRINT = "52dd2c0cac7d076f60c61bc683b4be576b445a31c8a2abf22249cfe5fd5326d7"
+EXPECTED_SCHEMA_FINGERPRINT = "a56765c778068ec2e61e9350d767ac77a176e45e1949342437d79fb2cb11e241"
 
 
 def _canonicalize(value: Any) -> Any:

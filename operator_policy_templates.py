@@ -29,6 +29,56 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": None,  # any branch within the sandbox repo
         "baseline_required": False,
     },
+    "hermes-contained-maintenance-standing": {
+        "active": True,
+        "description": (
+            "Durable standing authority for contained, reversible maintenance in the "
+            "dedicated maintenance worktree. No network, services, deployment, deletion, "
+            "credentials, client data, financial data, force operations, or external communication."
+        ),
+        "standing_authority_eligible": True,
+        "risk_tier": 1,
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default", "hy3-free-test", "nvidia-live-test"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-contained-maintenance"
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-contained-maintenance"
+            ],
+            "egress_hosts": [],
+            "service_units": [],
+            "verbs": {
+                "filesystem": ["read", "edit"],
+                "git": ["commit"],
+                "tests": ["run"],
+            },
+            "containment_strength": "container",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "branch_guard_verified": True,
+            "baseline_guard_verified": True,
+            "single_writer_verified": True,
+            "untracked_delete_protected": True,
+            "version_controlled_rollback": True,
+            "deliverable_verification_required": True,
+            "deliverable_verification_verified": False,
+            "data_sensitivity": "internal",
+            "production_effect": "none",
+            "paid_route_change": "none",
+            "has_secret_access": False,
+            "has_credential_access": False,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": False,
+            "has_deployment": False,
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": ["standing-maintenance"],
+        "baseline_required": True,
+    },
     "hermes-gpt-operator-maintenance": {
         "active": True,
         "description": "Maintenance access to the operator profile's own source worktree.",
@@ -88,7 +138,6 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             ],
             "writable_roots": [
                 "/home/jfroh/.hermes/worktrees/routing-v019-main",
-                "/home/jfroh/.hermes/releases/v019",
                 "/home/jfroh/.hermes/ops-brain/projects/mission-control.md",
                 "/home/jfroh/.hermes/ops-brain/projects/hermes-stabilization-sprint.md",
                 "/home/jfroh/.hermes/ops-brain/evidence/routing-v019-promotion-2026-08-06.md",

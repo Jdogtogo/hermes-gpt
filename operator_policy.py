@@ -605,6 +605,51 @@ def path_under_allowed(path: str | os.PathLike[str], allowed: list[Path]) -> boo
 # ---------------------------------------------------------------------------
 
 
+def _resolve_standing_policy_snapshot() -> tuple[Any | None, dict[str, Any] | None, str | None, str | None]:
+    """Resolve a valid standing authority into the current local template.
+
+    The standing record never stores caller-supplied raw authority. Each use
+    re-resolves the named local template, normalizes and hashes it, recomputes
+    risk, and compares every immutable fact with the human-approved record.
+    """
+    try:
+        if not operator_sessions.session_deployment_configured():
+            return None, None, None, None
+        from operator_policy_templates import resolve_template
+        from operator_risk import compute_risk_factors_from_session, risk_based_authority_enabled
+        from operator_standing_authority import (
+            check_standing_authority_validity,
+            get_active_standing_authority,
+        )
+
+        if not risk_based_authority_enabled():
+            return None, None, None, "risk-based standing authority is disabled"
+        standing = get_active_standing_authority()
+        if standing is None:
+            return None, None, None, None
+        resolved = resolve_template(standing.policy_template)
+        if not resolved.get("standing_authority_eligible", False):
+            return standing, None, None, "policy template is no longer standing-authority eligible"
+        snapshot = dict(resolved["policy"])
+        snapshot["allowed_branches"] = resolved.get("allowed_branches")
+        snapshot["policy_template"] = standing.policy_template
+        snapshot["authority_mode"] = "standing"
+        snapshot["standing_authority_eligible"] = True
+        normalized = operator_sessions.normalize_policy(snapshot)
+        current_hash = operator_sessions.snapshot_hash(normalized)
+        factor_snapshot = dict(normalized)
+        factor_snapshot["snapshot_hash"] = current_hash
+        factors = compute_risk_factors_from_session(
+            factor_snapshot, template_baseline=normalized
+        )
+        valid, reason = check_standing_authority_validity(standing, factors)
+        if not valid:
+            return standing, None, current_hash, reason
+        return standing, normalized, current_hash, None
+    except Exception as exc:
+        return None, None, None, f"standing authority could not be resolved: {exc.__class__.__name__}"
+
+
 class OperatorPolicy:
     """Snapshot of the operator policy at call time.
 
@@ -719,6 +764,70 @@ class OperatorPolicy:
             self.policy_template = snapshot.get("policy_template") or None
             self.expires_at = session.expires_at
             return
+
+        standing, standing_snapshot, standing_hash, standing_failure = _resolve_standing_policy_snapshot()
+        if standing is not None and standing_snapshot is not None:
+            snapshot = standing_snapshot
+            self.enabled = True
+            raw_level = str(snapshot.get("level") or "workspace").strip().lower()
+            self.level = raw_level if raw_level in LEVELS else "workspace"
+            raw_mode = str(snapshot.get("apply_mode") or "direct").strip().lower()
+            self.apply_mode = raw_mode if raw_mode in {"dry_run", "direct"} else "direct"
+            snapshot_allowed_profiles = snapshot.get("allowed_profiles")
+            if isinstance(snapshot_allowed_profiles, list):
+                normalized_profiles: list[str] = []
+                if "*" in snapshot_allowed_profiles:
+                    normalized_profiles = ["*"]
+                else:
+                    for item in snapshot_allowed_profiles:
+                        try:
+                            canonical = validate_profile_name(str(item))
+                        except ValueError:
+                            continue
+                        if canonical not in normalized_profiles:
+                            normalized_profiles.append(canonical)
+                self.allowed_profiles = normalized_profiles
+                self.profile_allowlist_source = "standing_policy_snapshot"
+                self.session_allowed_profiles = list(normalized_profiles)
+            else:
+                self.allowed_profiles = []
+                self.profile_allowlist_source = "standing_policy_snapshot"
+                self.session_allowed_profiles = []
+            self.process_allowed_profiles = parse_allowed_profiles(
+                os.environ.get(OPERATOR_ALLOWED_PROFILES_ENV)
+            )
+            self.readable_roots = [Path(p) for p in snapshot.get("readable_roots", [])]
+            self.writable_roots = [Path(p) for p in snapshot.get("writable_roots", [])]
+            self.path_authority_source = "standing_policy_snapshot"
+            self.allowed_paths = sorted(
+                {*self.readable_roots, *self.writable_roots}, key=lambda p: str(p)
+            )
+            self.egress_hosts = list(snapshot.get("egress_hosts", []))
+            self.git_remotes = list(snapshot.get("git_remotes", []))
+            self.service_units = list(snapshot.get("service_units", []))
+            raw_branches = snapshot.get("allowed_branches")
+            self.allowed_branches = list(raw_branches) if isinstance(raw_branches, list) else None
+            self.verbs = dict(snapshot.get("verbs", {}))
+            self.denied_paths = [Path(p) for p in snapshot.get("hard_denied_paths", [])]
+            self.owner_ack = ""
+            self.owner_mode_ready = False
+            self.mutation_allowed = (
+                self.apply_mode == "direct" and level_rank(self.level) >= level_rank("workspace")
+            )
+            self.session_id = standing.authority_id
+            self.snapshot_hash = standing_hash
+            self.policy_template = standing.policy_template
+            self.expires_at = None
+            self.session_status = "standing"
+            self.session_failure_reason = None
+            self.pointed_session_id = standing.authority_id
+            self.session_approved_at = standing.created_at
+            return
+        if standing is not None and standing_failure:
+            self.session_status = "standing_invalid"
+            self.session_failure_reason = standing_failure
+            self.pointed_session_id = standing.authority_id
+            self.session_approved_at = standing.created_at
 
         self.enabled = env_truthy(OPERATOR_ENABLED_ENV)
         raw_level = os.environ.get(OPERATOR_LEVEL_ENV, "read_only").strip().lower()

@@ -288,6 +288,8 @@ def create_standing_authority(
 
     if not risk_decision.standing_authority_eligible:
         raise StandingAuthorityError("Risk decision indicates standing authority not eligible")
+    if risk_decision.factors_hash != risk_factors.compute_hash():
+        raise StandingAuthorityError("Risk decision does not match supplied risk factors")
 
     current = int(time.time() if now is None else now)
     aid = authority_id or f"sa_{secrets.token_urlsafe(24)}"
@@ -307,23 +309,35 @@ def create_standing_authority(
     )
 
     canonical = json.dumps(authority.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    lock_claimed = False
+    if risk_factors.single_writer_verified and risk_factors.writable_roots:
+        from operator_worktree_lock import claim_writer_locks
 
-    with _connect(root) as conn:
-        _initialize_standing_db(conn)
-        conn.execute(
-            """INSERT INTO standing_authorities
-               (authority_id, canonical_json, created_at, policy_template,
-                policy_template_hash, policy_template_version, risk_factors_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                aid, canonical, current,
-                authority.policy_template,
-                authority.policy_template_hash,
-                authority.policy_template_version,
-                authority.risk_factors_hash,
-            ),
-        )
-        _write_active_pointer(aid, root=root)
+        claim_writer_locks(aid, risk_factors.writable_roots, root=root, now=current)
+        lock_claimed = True
+    try:
+        with _connect(root) as conn:
+            _initialize_standing_db(conn)
+            conn.execute(
+                """INSERT INTO standing_authorities
+                   (authority_id, canonical_json, created_at, policy_template,
+                    policy_template_hash, policy_template_version, risk_factors_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    aid, canonical, current,
+                    authority.policy_template,
+                    authority.policy_template_hash,
+                    authority.policy_template_version,
+                    authority.risk_factors_hash,
+                ),
+            )
+            _write_active_pointer(aid, root=root)
+    except Exception:
+        if lock_claimed:
+            from operator_worktree_lock import release_writer_locks
+
+            release_writer_locks(aid, risk_factors.writable_roots, root=root)
+        raise
 
     return authority
 
@@ -451,6 +465,14 @@ def revoke_standing_authority(
             "UPDATE standing_authorities SET canonical_json = ? WHERE authority_id = ?",
             (canonical, authority_id),
         )
+    if auth.approved_risk_factors.single_writer_verified and auth.approved_risk_factors.writable_roots:
+        from operator_worktree_lock import release_writer_locks
+
+        release_writer_locks(
+            authority_id,
+            auth.approved_risk_factors.writable_roots,
+            root=root,
+        )
 
     return True
 
@@ -496,6 +518,12 @@ def check_standing_authority_validity(
         return False, "Containment weakened or is no longer verified"
     if current_risk_factors.compute_hash() != authority.risk_factors_hash:
         return False, "Approved scope or immutable risk facts changed"
+    if current_risk_factors.single_writer_verified and current_risk_factors.writable_roots:
+        from operator_worktree_lock import assert_writer_locks
+        try:
+            assert_writer_locks(authority.authority_id, current_risk_factors.writable_roots)
+        except ValueError:
+            return False, "Single-writer ownership is missing or held by another authority"
 
     # All checks passed - authorization remains valid
     # Operational deadline is checked separately (watchdog)

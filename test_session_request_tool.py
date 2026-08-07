@@ -57,7 +57,12 @@ def test_request_returns_resolved_policy_not_just_template_name(isolated_session
     # The returned/stored/approver-shown snapshot carries the template's branch
     # restriction alongside its policy block, so the human approver sees it and
     # OperatorPolicy can enforce it at commit time.
-    expected = {**tmpl["policy"], "allowed_branches": tmpl["allowed_branches"]}
+    expected = {
+        **tmpl["policy"],
+        "allowed_branches": tmpl["allowed_branches"],
+        "authority_mode": "session",
+        "standing_authority_eligible": False,
+    }
     assert out["resolved_policy"] == expected
     assert out["resolved_policy"]["allowed_branches"] == [
         "codex/operator-session-chatgpt-20260713"
@@ -123,12 +128,32 @@ def test_requested_duration_capped_by_template_max(isolated_session_root, audit_
     assert out["requested_duration_seconds"] <= template["max_duration_seconds"]
 
 
+def test_approval_audit_records_risk_and_scope_evidence(isolated_session_root, audit_override):
+    out = json.loads(server.hermes_operator_session_request(
+        policy_template="sandbox", requested_duration_minutes=10, reason="audit evidence",
+    ))
+    assert out["success"] is True
+    op_sessions.approve_session_request(
+        out["request_id"], decided_by="telegram:test", root=isolated_session_root
+    )
+    records = [json.loads(line) for line in audit_override.read_text(encoding="utf-8").splitlines()]
+    approval = next(record for record in records if record.get("tool") == "session_approval")
+    text = json.dumps(approval, sort_keys=True)
+    assert '"risk_class"' in text
+    assert '"risk_tier"' in text
+    assert '"risk_factors_hash"' in text
+    assert '"policy_template": "sandbox"' in text
+    assert '"approver": "telegram:test"' in text
+
+
 def test_cannot_submit_raw_roots_or_policy_json(isolated_session_root, audit_override):
     """The tool signature has no roots/verbs/policy parameter at all -- there
     is no channel through which a remote caller could smuggle one in."""
     import inspect
     sig = inspect.signature(server.hermes_operator_session_request)
-    assert set(sig.parameters) == {"policy_template", "requested_duration_minutes", "reason"}
+    assert set(sig.parameters) == {
+        "policy_template", "requested_duration_minutes", "reason", "authority_mode"
+    }
 
 
 def test_notify_failure_never_breaks_the_tool(isolated_session_root, audit_override, monkeypatch):

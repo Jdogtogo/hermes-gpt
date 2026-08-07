@@ -24,6 +24,7 @@ import operator_bridge as op_bridge
 import operator_auth as op_auth
 import operator_sessions as op_sessions
 import operator_policy_templates as op_templates
+import operator_risk as op_risk
 import operator_delegation as op_delegation
 import operator_antigravity_tax as op_antigravity_tax
 import operator_antigravity_dispatch as op_antigravity_dispatch
@@ -749,11 +750,34 @@ def hermes_operator_session_status() -> str:
                 },
                 indent=2,
             )
-        record = op_sessions.load_session(policy.session_id)
         oauth_subject, oauth_client_id = op_policy.current_oauth_identity()
+        if policy.session_status == "standing":
+            return json.dumps(
+                {
+                    "success": True,
+                    "authority_kind": "standing",
+                    "standing_authority_id": policy.session_id,
+                    "snapshot_hash": policy.snapshot_hash,
+                    "issued_at": policy.session_approved_at,
+                    "expires_at": None,
+                    "approval_state": "approved",
+                    "level": policy.level,
+                    "apply_mode": policy.apply_mode,
+                    "readable_roots": [str(p) for p in policy.readable_roots],
+                    "writable_roots": [str(p) for p in policy.writable_roots],
+                    "verbs": policy.verbs,
+                    "oauth_subject": oauth_subject,
+                    "oauth_client_id": oauth_client_id,
+                    "owner_mode_ready": False,
+                    "revocation": "local standing-authority revoke",
+                },
+                indent=2,
+            )
+        record = op_sessions.load_session(policy.session_id)
         return json.dumps(
             {
                 "success": True,
+                "authority_kind": "session",
                 "session_id": policy.session_id,
                 "snapshot_hash": policy.snapshot_hash,
                 "issued_at": record.created_at,
@@ -791,6 +815,11 @@ def hermes_operator_session_request_extension(minutes: int = 30) -> str:
         policy = op_policy.OperatorPolicy()
         if not policy.session_id:
             raise PermissionError("No active Operator Session is configured.")
+        if policy.session_status == "standing":
+            raise ValueError(
+                "Standing authority has no authorization expiry and cannot be extended; "
+                "set a separate operational watchdog deadline instead."
+            )
         seconds = max(
             60,
             min(int(minutes) * 60, op_sessions.GLOBAL_MAX_SESSION_DURATION_SECONDS),
@@ -863,6 +892,7 @@ def hermes_operator_session_request(
     policy_template: str,
     requested_duration_minutes: int = 60,
     reason: str = "",
+    authority_mode: str = "session",
 ) -> str:
     """Request a new Operator Session. This never creates authority by
     itself — it only ever records a pending request carrying the fully
@@ -874,6 +904,13 @@ def hermes_operator_session_request(
         if not reason or not reason.strip():
             raise ValueError("reason is required.")
         resolved = op_templates.resolve_template(policy_template)
+        mode = str(authority_mode or "session").strip().lower()
+        if mode not in {"session", "standing"}:
+            raise ValueError("authority_mode must be 'session' or 'standing'.")
+        if mode == "standing" and not resolved.get("standing_authority_eligible", False):
+            raise PermissionError(
+                f"Policy template {policy_template!r} is not eligible for standing authority."
+            )
         # Carry the template's branch restriction into the policy snapshot so it
         # is shown to the human approver, stored immutably in the approved
         # session, and enforced at commit time by OperatorPolicy.require_branch.
@@ -882,6 +919,44 @@ def hermes_operator_session_request(
         # "any branch within the granted roots".
         policy_snapshot = dict(resolved["policy"])
         policy_snapshot["allowed_branches"] = resolved.get("allowed_branches")
+        policy_snapshot["authority_mode"] = mode
+        policy_snapshot["standing_authority_eligible"] = bool(
+            resolved.get("standing_authority_eligible", False)
+        )
+        risk_policy_snapshot = dict(policy_snapshot)
+        risk_policy_snapshot["policy_template"] = policy_template
+        normalized = op_sessions.normalize_policy(risk_policy_snapshot)
+        factor_snapshot = dict(normalized)
+        factor_snapshot["snapshot_hash"] = op_sessions.snapshot_hash(normalized)
+        risk_factors = op_risk.compute_risk_factors_from_session(
+            factor_snapshot, template_baseline=normalized
+        )
+        risk_decision = op_risk.classify_risk(risk_factors)
+        approval_forecast = {
+            "risk_class": risk_decision.risk_class.value,
+            "tier": risk_decision.tier,
+            "standing_authority_eligible": risk_decision.standing_authority_eligible,
+            "authority_bundle_eligible": risk_decision.authority_bundle_eligible,
+            "requires_human_approval": risk_decision.requires_human_approval,
+            "factors_hash": risk_decision.factors_hash,
+            "reasons": [
+                {
+                    "factor": item.factor,
+                    "detail": item.detail,
+                    "severity": item.severity.value,
+                }
+                for item in risk_decision.reasons
+            ],
+        }
+        if mode == "standing" and (
+            risk_decision.risk_class != op_risk.RiskClass.LOW
+            or risk_decision.tier != 1
+            or not risk_decision.standing_authority_eligible
+        ):
+            raise PermissionError(
+                "Standing authority request refused before approval: the resolved policy must be "
+                f"contained Tier 1 LOW risk ({risk_decision.summary()})."
+            )
         requested_seconds = max(60, int(requested_duration_minutes) * 60)
         capped_seconds = min(requested_seconds, resolved["max_duration_seconds"])
         request_id = op_sessions.request_session(
@@ -901,6 +976,10 @@ def hermes_operator_session_request(
                 "request_id": request_id,
                 "policy_template": policy_template,
                 "requested_duration_seconds": capped_seconds,
+                "authority_mode": mode,
+                "risk_class": approval_forecast["risk_class"],
+                "risk_tier": approval_forecast["tier"],
+                "risk_factors_hash": approval_forecast["factors_hash"],
             },
         )
         _notify_pending_request(
@@ -911,6 +990,8 @@ def hermes_operator_session_request(
                 "policy_template": policy_template,
                 "resolved_policy": policy_snapshot,
                 "requested_duration_seconds": capped_seconds,
+                "authority_mode": mode,
+                "approval_forecast": approval_forecast,
                 "reason": reason.strip(),
             },
         )
@@ -921,8 +1002,15 @@ def hermes_operator_session_request(
                 "policy_template": policy_template,
                 "resolved_policy": policy_snapshot,
                 "requested_duration_seconds": capped_seconds,
+                "authority_mode": mode,
+                "approval_forecast": approval_forecast,
                 "status": "pending",
-                "note": "Requires local (Telegram or localhost) approval before any session is created.",
+                "note": (
+                    "Requires local (Telegram or localhost) approval. Standing mode creates "
+                    "a revocable, policy-bound LOW-risk authority plus a short operational session."
+                    if mode == "standing"
+                    else "Requires local (Telegram or localhost) approval before any session is created."
+                ),
             },
             indent=2,
         )
@@ -955,7 +1043,18 @@ def hermes_operator_session_revoke(session_id: str = "") -> str:
         target = (session_id or policy.session_id or "").strip()
         if not target:
             raise ValueError("session_id is required.")
-        changed = op_sessions.revoke_session(target)
+        if policy.session_status == "standing" or target.startswith("sa_"):
+            from operator_standing_authority import revoke_standing_authority
+
+            changed = revoke_standing_authority(
+                target,
+                revoked_by="hermes_operator_session_revoke",
+                reason="emergency/local operator revoke",
+            )
+            authority_kind = "standing"
+        else:
+            changed = op_sessions.revoke_session(target)
+            authority_kind = "session"
         op_policy.audit_record(
             tool="hermes_operator_session_revoke",
             level=policy.level,
@@ -963,10 +1062,22 @@ def hermes_operator_session_revoke(session_id: str = "") -> str:
             dry_run=False,
             success=True,
             changed=changed,
-            summary="revoked operator session" if changed else "operator session was already revoked or missing",
-            extra={"target_session_id": target},
+            summary=(
+                f"revoked operator {authority_kind} authority"
+                if changed
+                else f"operator {authority_kind} authority was already revoked or missing"
+            ),
+            extra={"target_authority_id": target, "authority_kind": authority_kind},
         )
-        return json.dumps({"success": True, "revoked": changed, "session_id": target}, indent=2)
+        return json.dumps(
+            {
+                "success": True,
+                "revoked": changed,
+                "authority_id": target,
+                "authority_kind": authority_kind,
+            },
+            indent=2,
+        )
     except Exception as exc:
         return json.dumps(
             op_policy.error_from_exception(

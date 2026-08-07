@@ -898,6 +898,7 @@ def _capture_authority_envelope(
 ) -> dict[str, Any]:
     """Capture the immutable, non-secret authority contract for one task."""
     return {
+        "authority_kind": "standing" if getattr(policy, "session_status", "active") == "standing" else "session",
         "session_id": policy.session_id,
         "snapshot_hash": policy.snapshot_hash,
         "expires_at": policy.expires_at,
@@ -928,10 +929,15 @@ def _require_task_authority(task: dict[str, Any]) -> None:
     if policy.session_id != authority.get("session_id"):
         raise PermissionError("originating Operator Session is no longer active")
     if policy.snapshot_hash != authority.get("snapshot_hash"):
-        raise PermissionError("Operator Session authority snapshot changed")
-    expires_at = int(authority.get("expires_at") or 0)
-    if not expires_at or _now() >= expires_at:
-        raise PermissionError("originating Operator Session expired")
+        raise PermissionError("Operator authority snapshot changed")
+    authority_kind = str(authority.get("authority_kind") or "session")
+    if authority_kind == "standing":
+        if getattr(policy, "session_status", "active") != "standing":
+            raise PermissionError("originating standing authority is no longer active")
+    else:
+        expires_at = int(authority.get("expires_at") or 0)
+        if not expires_at or _now() >= expires_at:
+            raise PermissionError("originating Operator Session expired")
     profile = str(authority.get("profile") or task.get("profile") or "default")
     workdir = _resolve_workdir(str(authority.get("workdir") or task.get("workdir") or ""))
     mode = str(authority.get("mode") or task.get("mode") or "read_only")

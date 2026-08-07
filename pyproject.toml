@@ -42,6 +42,10 @@ py-modules = [
   "operator_agent",
   "operator_auth",
   "operator_sessions",
+  "operator_risk",
+  "operator_standing_authority",
+  "operator_authority_bundle",
+  "operator_worktree_lock",
   "bridge_worker",
   "auth_bootstrap",
 ]

@@ -294,8 +294,9 @@ class RiskDecision:
 
     @property
     def tier(self) -> int | None:
+        if self.risk_class == RiskClass.LOW:
+            return 1 if any(reason.factor == "contained_maintenance" for reason in self.reasons) else 0
         return {
-            RiskClass.LOW: 0,
             RiskClass.MATERIAL: 2,
             RiskClass.HIGH: 3,
             RiskClass.PROHIBITED: None,

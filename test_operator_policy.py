@@ -73,6 +73,9 @@ def _clear_operator_envs(monkeypatch):
         op.OPERATOR_ALLOWED_PATHS_ENV,
         op.OPERATOR_DENIED_PATHS_ENV,
         op.OWNER_ACK_ENV,
+        op.operator_sessions.SESSION_ROOT_ENV,
+        op.operator_sessions.ACTIVE_SESSION_ID_ENV,
+        "HERMES_GPT_RISK_BASED_AUTHORITY_ENABLED",
     ]:
         monkeypatch.delenv(name, raising=False)
 

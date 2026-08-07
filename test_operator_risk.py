@@ -61,6 +61,7 @@ class TestTierZeroAndTierOne:
         )
         decision = op_risk.classify_risk(factors)
         assert decision.risk_class == op_risk.RiskClass.LOW
+        assert decision.tier == 0
         assert decision.standing_authority_eligible is True
         assert decision.requires_human_approval is False
 
@@ -81,6 +82,7 @@ class TestTierZeroAndTierOne:
     def test_fully_contained_reversible_maintenance_is_low_tier_one(self):
         decision = op_risk.classify_risk(tier1_factors())
         assert decision.risk_class == op_risk.RiskClass.LOW
+        assert decision.tier == 1
         assert decision.standing_authority_eligible is True
         assert any("Contained reversible" in reason.detail for reason in decision.reasons)
 
