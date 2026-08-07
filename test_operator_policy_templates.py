@@ -58,7 +58,6 @@ def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
         "gemini-live-test",
         "ollama-live-test",
         "gemini-flash",
-        "planner-glm52",
         "coder-deepseek-v4-pro",
         "coder-deepseek-v4-flash",
         "worker-nemotron-super",

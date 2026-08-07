@@ -166,7 +166,6 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
                 "gemini-live-test",
                 "ollama-live-test",
                 "gemini-flash",
-                "planner-glm52",
                 "coder-deepseek-v4-pro",
                 "coder-deepseek-v4-flash",
                 "worker-nemotron-super",
