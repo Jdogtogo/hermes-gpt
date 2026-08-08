@@ -688,17 +688,24 @@ class OperatorPolicy:
         "session_approved_at",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, authority_preference: str = "effective") -> None:
         # Single authoritative resolution path: both status tools and every
-        # mutation guard construct OperatorPolicy(), and OperatorPolicy derives
-        # session authority exclusively from resolve_effective_authority() --
-        # so what status REPORTS and what guards ENFORCE cannot diverge.
+        # mutation guard construct OperatorPolicy(). ``authority_preference``
+        # is internal-only and allows operation-level resolvers to materialise
+        # the already-approved standing authority independently of an unrelated
+        # active Operator Session. Public/default behavior remains ``effective``.
+        if authority_preference not in {"effective", "standing"}:
+            raise ValueError("authority_preference must be 'effective' or 'standing'.")
         authority = operator_sessions.resolve_effective_authority()
         self.session_status = authority.status
         self.session_failure_reason = authority.failure_reason
         self.pointed_session_id = authority.pointed_session_id
         self.session_approved_at = authority.approved_at
-        session = operator_sessions.active_session() if authority.is_active else None
+        session = (
+            operator_sessions.active_session()
+            if authority_preference == "effective" and authority.is_active
+            else None
+        )
         if session is not None:
             snapshot = session.policy
             self.enabled = True

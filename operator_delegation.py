@@ -953,15 +953,21 @@ def _capture_authority_envelope(
 def _require_task_authority(task: dict[str, Any]) -> None:
     """Fail closed when current authority no longer matches the task envelope."""
     authority = task.get("authority") or {}
-    policy = op.OperatorPolicy()
+    authority_kind = str(authority.get("authority_kind") or "session")
+    try:
+        policy = op.OperatorPolicy(
+            authority_preference="standing" if authority_kind == "standing" else "effective"
+        )
+    except TypeError:
+        policy = op.OperatorPolicy()
     policy.require_enabled()
     if bool(authority.get("allow_web")):
         policy.require_verb("network", "web")
     if policy.session_id != authority.get("session_id"):
-        raise PermissionError("originating Operator Session is no longer active")
+        label = "standing authority" if authority_kind == "standing" else "Operator Session"
+        raise PermissionError(f"originating {label} is no longer active")
     if policy.snapshot_hash != authority.get("snapshot_hash"):
         raise PermissionError("Operator authority snapshot changed")
-    authority_kind = str(authority.get("authority_kind") or "session")
     if authority_kind == "standing":
         if getattr(policy, "session_status", "active") != "standing":
             raise PermissionError("originating standing authority is no longer active")
@@ -1478,6 +1484,78 @@ def _worker(task_id: str) -> None:
                 pass
 
 
+def _delegation_policy_candidate_error(
+    policy: op.OperatorPolicy,
+    *,
+    profile: str,
+    workdir: Path,
+    mode: str,
+    allow_web: bool,
+) -> str | None:
+    """Return None only when one authority snapshot fully covers the task.
+
+    This deliberately evaluates the complete delegation contract against one
+    policy candidate. Permissions from standing authority and an active session
+    are never unioned or mixed.
+    """
+    try:
+        policy.require_enabled()
+        policy.require_profile(profile, Path.home() / ".hermes")
+        policy.require_read_path(workdir)
+        if allow_web:
+            policy.require_verb("network", "web")
+        if mode == "apply":
+            policy.require_level("workspace")
+            policy.require_mutation(dry_run=False)
+            policy.require_write_path(workdir)
+            policy.require_verb("filesystem", "edit")
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
+def _select_delegation_policy(
+    *,
+    profile: str,
+    workdir: Path,
+    mode: str,
+    allow_web: bool,
+) -> op.OperatorPolicy:
+    """Choose one complete authority for a delegation, least privilege first."""
+    candidates: list[op.OperatorPolicy] = []
+    try:
+        standing = op.OperatorPolicy(authority_preference="standing")
+    except TypeError:
+        # Backward-compatible with older policy doubles/integrations that do
+        # not yet expose the internal authority_preference constructor arg.
+        standing = None
+    if standing is not None and standing.path_authority_source == "standing_policy_snapshot":
+        candidates.append(standing)
+
+    effective = op.OperatorPolicy()
+    if not candidates or effective.session_id != candidates[0].session_id:
+        candidates.append(effective)
+
+    denials: list[str] = []
+    for candidate in candidates:
+        error = _delegation_policy_candidate_error(
+            candidate,
+            profile=profile,
+            workdir=workdir,
+            mode=mode,
+            allow_web=allow_web,
+        )
+        if error is None:
+            return candidate
+        source = getattr(candidate, "path_authority_source", "effective_policy")
+        denials.append(f"{source}: {error}")
+
+    raise PermissionError(
+        "No single approved authority fully covers this delegated task; "
+        "standing and session permissions are not composable. " + " | ".join(denials)
+    )
+
+
 def hermes_delegate_task_forecast(
     workdir: str,
     mode: str = "apply",
@@ -1518,10 +1596,14 @@ def hermes_delegate_task_forecast(
         if normalized_mode == "apply" and allow_web:
             raise PermissionError("allow_web is disabled for apply delegation.")
 
-        policy = op.OperatorPolicy()
-        policy.require_enabled()
-        if allow_web:
-            policy.require_verb("network", "web")
+        canonical_profile = op.validate_profile_name(profile)
+        resolved = _resolve_workdir(workdir)
+        policy = _select_delegation_policy(
+            profile=canonical_profile,
+            workdir=resolved,
+            mode=normalized_mode,
+            allow_web=bool(allow_web),
+        )
         long_horizon = _normalize_long_horizon(
             timeout=timeout,
             worker_slice_timeout=worker_slice_timeout,
@@ -1531,6 +1613,8 @@ def hermes_delegate_task_forecast(
             stop_on=stop_on,
             authority_expires_at=policy.expires_at if policy.session_id else None,
         )
+        if long_horizon["enabled"] and getattr(policy, "path_authority_source", "") == "standing_policy_snapshot":
+            raise PermissionError("Automatic long-horizon delegation requires a bounded Operator Session, not standing authority.")
         if long_horizon["enabled"] and not policy.session_id:
             raise PermissionError("Automatic long-horizon delegation requires an approved Operator Session.")
         seconds = int(long_horizon["worker_slice_timeout"])
@@ -1545,9 +1629,6 @@ def hermes_delegate_task_forecast(
                 "envelope_deadline": long_horizon["envelope_deadline"],
             }
         )
-
-        canonical_profile = op.validate_profile_name(profile)
-        resolved = _resolve_workdir(workdir)
         route = _antigravity_route(
             profile=canonical_profile,
             workdir=resolved,
@@ -1674,10 +1755,14 @@ def hermes_delegate_task(
         if normalized_mode == "apply" and allow_web:
             raise PermissionError("allow_web is disabled for apply delegation.")
 
-        policy = op.OperatorPolicy()
-        policy.require_enabled()
-        if allow_web:
-            policy.require_verb("network", "web")
+        canonical_profile = op.validate_profile_name(profile)
+        resolved = _resolve_workdir(workdir)
+        policy = _select_delegation_policy(
+            profile=canonical_profile,
+            workdir=resolved,
+            mode=normalized_mode,
+            allow_web=bool(allow_web),
+        )
         long_horizon = _normalize_long_horizon(
             timeout=timeout,
             worker_slice_timeout=worker_slice_timeout,
@@ -1687,12 +1772,11 @@ def hermes_delegate_task(
             stop_on=stop_on,
             authority_expires_at=policy.expires_at if policy.session_id else None,
         )
+        if long_horizon["enabled"] and getattr(policy, "path_authority_source", "") == "standing_policy_snapshot":
+            raise PermissionError("Automatic long-horizon delegation requires a bounded Operator Session, not standing authority.")
         if long_horizon["enabled"] and not policy.session_id:
             raise PermissionError("Automatic long-horizon delegation requires an approved Operator Session.")
         seconds = int(long_horizon["worker_slice_timeout"])
-
-        canonical_profile = op.validate_profile_name(profile)
-        resolved = _resolve_workdir(workdir)
         route = _antigravity_route(
             profile=canonical_profile,
             workdir=resolved,
