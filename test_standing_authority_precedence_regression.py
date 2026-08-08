@@ -156,6 +156,31 @@ def test_standing_revalidation_ignores_unrelated_session_replacement(precedence_
         op_delegation._require_task_authority(task)
 
 
+def test_request_defaults_to_standing_for_standing_eligible_template(precedence_env):
+    root, _, _ = precedence_env
+    response = json.loads(
+        server.hermes_operator_session_request(
+            policy_template="hermes-contained-maintenance-standing",
+            requested_duration_minutes=30,
+            reason="auto standing regression",
+        )
+    )
+    assert response["success"] is True
+    assert response["authority_mode"] == "standing"
+
+
+def test_request_defaults_to_session_for_nonstanding_template(precedence_env):
+    response = json.loads(
+        server.hermes_operator_session_request(
+            policy_template="hermes-canonical-preservation-integration",
+            requested_duration_minutes=30,
+            reason="auto session regression",
+        )
+    )
+    assert response["success"] is True
+    assert response["authority_mode"] == "session"
+
+
 def test_public_tool_manifest_remains_41_tools():
     assert operator_manifest.EXPECTED_TOOL_COUNT == 41
     assert len(operator_manifest.CANONICAL_TOOL_NAMES) == 41
