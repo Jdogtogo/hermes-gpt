@@ -35,6 +35,60 @@ def test_canonical_preservation_integration_is_read_only_on_canonical_and_releas
     assert all(not root.startswith("/home/jfroh/.hermes/releases/") for root in policy["writable_roots"])
 
 
+def test_mission_control_standing_is_narrow_and_non_client():
+    resolved = templates.resolve_template("hermes-mission-control-standing")
+    policy = resolved["policy"]
+    expected_readable = [
+        "/home/jfroh/.hermes/ops-brain/projects/mission-control.md",
+        "/home/jfroh/.hermes/ops-brain/projects/hermes-stabilization-sprint.md",
+        "/home/jfroh/.hermes/ops-brain/projects/hermes-approval-framework.md",
+        "/home/jfroh/.hermes/ops-brain/projects/handover-task-packet-template.md",
+        "/home/jfroh/.hermes/ops-brain/runbooks/mission-control-operating-model.md",
+        "/home/jfroh/.hermes/ops-brain/SCHEMA.md",
+        "/home/jfroh/.hermes/ops-brain/DESIGN.md",
+    ]
+    expected_writable = [
+        "/home/jfroh/.hermes/ops-brain/projects/mission-control.md",
+        "/home/jfroh/.hermes/ops-brain/projects/hermes-stabilization-sprint.md",
+    ]
+
+    assert resolved["active"] is True
+    assert resolved["standing_authority_eligible"] is True
+    assert resolved["risk_tier"] == 1
+    assert resolved["allowed_branches"] is None
+    assert resolved["baseline_required"] is False
+    assert policy["allowed_profiles"] == ["default"]
+    assert policy["readable_roots"] == expected_readable
+    assert policy["writable_roots"] == expected_writable
+    assert "/home/jfroh/.hermes/ops-brain" not in policy["readable_roots"]
+    assert "/home/jfroh/.hermes/ops-brain" not in policy["writable_roots"]
+    assert not any("jb-mailbox" in root for root in policy["readable_roots"] + policy["writable_roots"])
+    assert policy["egress_hosts"] == []
+    assert policy["service_units"] == []
+    assert policy["verbs"] == {"filesystem": ["read", "edit"]}
+    assert "git" not in policy["verbs"]
+    assert "tests" not in policy["verbs"]
+    assert "services" not in policy["verbs"]
+    assert "/home/jfroh/.hermes/ops-brain/.env" in policy["hard_denied_paths"]
+    assert "/home/jfroh/.hermes/ops-brain/**/.git/config" in policy["hard_denied_paths"]
+    assert policy["containment_strength"] == "container"
+    assert policy["containment_verified"] is True
+    assert policy["bounded_roots_verified"] is True
+    assert policy["branch_guard_verified"] is True
+    assert policy["baseline_guard_verified"] is True
+    assert policy["single_writer_verified"] is True
+    assert policy["untracked_delete_protected"] is True
+    assert policy["version_controlled_rollback"] is True
+    assert policy["deliverable_verification_required"] is True
+    assert policy["data_sensitivity"] == "internal"
+    assert policy["has_secret_access"] is False
+    assert policy["has_credential_access"] is False
+    assert policy["has_client_identifiable_data"] is False
+    assert policy["has_financial_data"] is False
+    assert policy["has_external_communication"] is False
+    assert policy["has_deployment"] is False
+
+
 def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
     resolved = templates.resolve_template("hermes-gpt-operator-maintenance")
     policy = resolved["policy"]

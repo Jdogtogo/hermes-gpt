@@ -66,6 +66,33 @@ def test_noneligible_template_cannot_request_standing(standing_env):
     assert op_sessions.list_pending_session_requests(root=standing_env) == []
 
 
+def test_mission_control_template_requests_low_risk_standing(standing_env):
+    response = json.loads(
+        server.hermes_operator_session_request(
+            policy_template="hermes-mission-control-standing",
+            requested_duration_minutes=30,
+            reason="routine mission control synchronization",
+            authority_mode="standing",
+        )
+    )
+    assert response["success"] is True
+    assert response["authority_mode"] == "standing"
+    assert response["approval_forecast"]["risk_class"] == "low"
+    assert response["approval_forecast"]["tier"] == 1
+    assert response["approval_forecast"]["standing_authority_eligible"] is True
+    assert response["approval_forecast"]["requires_human_approval"] is False
+    policy = response["resolved_policy"]
+    assert policy["allowed_profiles"] == ["default"]
+    assert policy["writable_roots"] == [
+        "/home/jfroh/.hermes/ops-brain/projects/mission-control.md",
+        "/home/jfroh/.hermes/ops-brain/projects/hermes-stabilization-sprint.md",
+    ]
+    assert policy["egress_hosts"] == []
+    assert policy["service_units"] == []
+    assert policy["verbs"] == {"filesystem": ["read", "edit"]}
+    assert len(op_sessions.list_pending_session_requests(root=standing_env)) == 1
+
+
 def test_approval_creates_session_and_persisted_standing_authority(standing_env):
     _, record = _request_and_approve_standing(standing_env)
     assert record.approval_state == "approved"
