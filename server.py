@@ -904,7 +904,11 @@ def hermes_operator_session_request(
         if not reason or not reason.strip():
             raise ValueError("reason is required.")
         resolved = op_templates.resolve_template(policy_template)
-        mode = str(authority_mode or "session").strip().lower()
+        mode = (
+            "standing"
+            if resolved.get("standing_authority_eligible", False)
+            else str(authority_mode or "session").strip().lower()
+        )
         if mode not in {"session", "standing"}:
             raise ValueError("authority_mode must be 'session' or 'standing'.")
         if mode == "standing" and not resolved.get("standing_authority_eligible", False):

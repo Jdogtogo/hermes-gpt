@@ -91,7 +91,7 @@ def test_expired_bootstrap_session_falls_back_to_standing_authority(standing_env
     assert policy.level == "workspace"
     assert policy.apply_mode == "direct"
     assert policy.mutation_allowed is True
-    assert policy.allowed_branches == ["standing-maintenance"]
+    assert policy.allowed_branches == ["codex/operator-session-chatgpt-20260713"]
     assert policy.egress_hosts == []
     assert policy.service_units == []
 

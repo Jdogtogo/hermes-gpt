@@ -43,10 +43,10 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "apply_mode": "direct",
             "allowed_profiles": ["default", "hy3-free-test", "nvidia-live-test"],
             "readable_roots": [
-                "/home/jfroh/.hermes/worktrees/hermes-contained-maintenance"
+                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt/standing-maintenance-clean"
             ],
             "writable_roots": [
-                "/home/jfroh/.hermes/worktrees/hermes-contained-maintenance"
+                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt/standing-maintenance-clean"
             ],
             "egress_hosts": [],
             "service_units": [],
@@ -76,7 +76,7 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "has_deployment": False,
         },
         "max_duration_seconds": _FOUR_HOURS,
-        "allowed_branches": ["standing-maintenance"],
+        "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
         "baseline_required": True,
     },
     "hermes-canonical-preservation-integration": {
