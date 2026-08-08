@@ -892,7 +892,7 @@ def hermes_operator_session_request(
     policy_template: str,
     requested_duration_minutes: int = 60,
     reason: str = "",
-    authority_mode: str = "auto",
+    authority_mode: str = "session",
 ) -> str:
     """Request a new Operator Session. This never creates authority by
     itself — it only ever records a pending request carrying the fully
@@ -904,11 +904,9 @@ def hermes_operator_session_request(
         if not reason or not reason.strip():
             raise ValueError("reason is required.")
         resolved = op_templates.resolve_template(policy_template)
-        mode = str(authority_mode or "auto").strip().lower()
-        if mode == "auto":
-            mode = "standing" if resolved.get("standing_authority_eligible", False) else "session"
+        mode = str(authority_mode or "session").strip().lower()
         if mode not in {"session", "standing"}:
-            raise ValueError("authority_mode must be 'auto', 'session', or 'standing'.")
+            raise ValueError("authority_mode must be 'session' or 'standing'.")
         if mode == "standing" and not resolved.get("standing_authority_eligible", False):
             raise PermissionError(
                 f"Policy template {policy_template!r} is not eligible for standing authority."
