@@ -89,6 +89,35 @@ def test_mission_control_standing_is_narrow_and_non_client():
     assert policy["has_deployment"] is False
 
 
+def test_governed_kanban_standing_is_single_board_only():
+    resolved = templates.resolve_template("hermes-governed-kanban-standing")
+    policy = resolved["policy"]
+    board = "/home/jfroh/.hermes/kanban/boards/hermes-stabilization"
+
+    assert resolved["active"] is True
+    assert resolved["standing_authority_eligible"] is True
+    assert resolved["risk_tier"] == 1
+    assert resolved["allowed_branches"] is None
+    assert policy["readable_roots"] == [board]
+    assert policy["writable_roots"] == [board]
+    assert "/home/jfroh/.hermes/kanban.db" not in policy["readable_roots"]
+    assert "/home/jfroh/.hermes/kanban.db" not in policy["writable_roots"]
+    assert "/home/jfroh/.hermes/kanban.db" in policy["hard_denied_paths"]
+    assert "/home/jfroh/.hermes/kanban/current" in policy["hard_denied_paths"]
+    assert policy["egress_hosts"] == []
+    assert policy["service_units"] == []
+    assert policy["verbs"] == {"filesystem": ["read", "edit"]}
+    assert policy["containment_strength"] == "container"
+    assert policy["bounded_roots_verified"] is True
+    assert policy["single_writer_verified"] is True
+    assert policy["has_secret_access"] is False
+    assert policy["has_credential_access"] is False
+    assert policy["has_client_identifiable_data"] is False
+    assert policy["has_financial_data"] is False
+    assert policy["has_external_communication"] is False
+    assert policy["has_deployment"] is False
+
+
 def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
     resolved = templates.resolve_template("hermes-gpt-operator-maintenance")
     policy = resolved["policy"]

@@ -149,6 +149,72 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": None,
         "baseline_required": False,
     },
+    "hermes-governed-kanban-standing": {
+        "active": True,
+        "description": (
+            "Durable low-risk standing authority for the dedicated Hermes Stabilization "
+            "Kanban board only. It may read and edit that named board directory but cannot "
+            "touch the default kanban.db, other boards, services, network, repositories, "
+            "credentials, client/financial data, releases, or runtime authority state."
+        ),
+        "standing_authority_eligible": True,
+        "risk_tier": 1,
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/kanban/boards/hermes-stabilization"
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/kanban/boards/hermes-stabilization"
+            ],
+            "egress_hosts": [],
+            "service_units": [],
+            "hard_denied_paths": [
+                "/home/jfroh/.hermes/kanban.db",
+                "/home/jfroh/.hermes/kanban/current",
+                "/home/jfroh/.hermes/.env",
+                "/home/jfroh/.hermes/.env.*",
+                "/home/jfroh/.hermes/auth",
+                "/home/jfroh/.hermes/auth.json",
+                "/home/jfroh/.hermes/credentials",
+                "/home/jfroh/.hermes/**/credentials",
+                "/home/jfroh/.hermes/**/API keys",
+                "/home/jfroh/.hermes/**/OAuth tokens",
+                "/home/jfroh/.hermes/**/authentication databases",
+                "/home/jfroh/.hermes/**/secret stores",
+                "/home/jfroh/.hermes/**/private keys",
+                "/home/jfroh/.hermes/**/SSH material",
+                "/home/jfroh/.hermes/**/runtime session databases",
+                "/home/jfroh/.hermes/**/operator approval databases",
+                "/home/jfroh/.hermes/**/operator policy/session state",
+            ],
+            "verbs": {"filesystem": ["read", "edit"]},
+            "containment_strength": "container",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "branch_guard_verified": True,
+            "baseline_guard_verified": True,
+            "single_writer_verified": True,
+            "untracked_delete_protected": True,
+            "version_controlled_rollback": True,
+            "deliverable_verification_required": True,
+            "deliverable_verification_verified": False,
+            "data_sensitivity": "internal",
+            "production_effect": "none",
+            "paid_route_change": "none",
+            "has_secret_access": False,
+            "has_credential_access": False,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": False,
+            "has_deployment": False,
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": None,
+        "baseline_required": False,
+    },
     "hermes-canonical-preservation-integration": {
         "active": True,
         "description": (

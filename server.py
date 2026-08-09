@@ -26,6 +26,7 @@ import operator_sessions as op_sessions
 import operator_policy_templates as op_templates
 import operator_risk as op_risk
 import operator_delegation as op_delegation
+import operator_governed_kanban as op_governed_kanban
 import operator_antigravity_tax as op_antigravity_tax
 import operator_antigravity_dispatch as op_antigravity_dispatch
 import dcr_compat
@@ -689,6 +690,7 @@ def hermes_operator_status() -> str:
             "registered_operator_tools": registered,
             "registered_tool_count": len(registered),
             "public_manifest": dict(REGISTERED_MANIFEST_VALIDATION),
+            "governed_kanban": op_governed_kanban.status_snapshot(),
             "audit_log_path": str(op_policy.audit_log_path()),
         }
         return json.dumps(result, indent=2)
@@ -2011,6 +2013,8 @@ def build_server(
     if provider is not None:
         op_auth.register_login_routes(server, provider)
     register_tools(server, include_bridge=bridge_requested, profile=profile)
+    if profile == CHATGPT_OPERATOR_PROFILE:
+        op_governed_kanban.start_dispatcher()
     return server
 
 
