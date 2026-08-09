@@ -1204,7 +1204,18 @@ def _run_worker_process(
         _PROCESSES[task_id] = process
         current = _load(task_id)
         _transition(current, "running", reason="provider process started")
+        # Per-attempt outcome fields must describe the process that is currently
+        # running. During bounded cross-provider recovery the task object is
+        # reused, so retaining the previous attempt's rc/stdout/stderr makes a
+        # live alternate look terminal (for example: status=running with
+        # returncode=0 from the failed predecessor attempt).
         current["pid"] = process.pid
+        current["returncode"] = None
+        current["stdout"] = ""
+        current["stderr"] = ""
+        current["outcome_reason"] = ""
+        current["failure_category"] = None
+        current["provider_error_category"] = None
         _write_checkpoint(current, reason="provider process started")
         _save(current)
         _record_mission_control(current, event="running")

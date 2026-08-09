@@ -853,3 +853,56 @@ def test_delegate_forecast_wrapper_passes_long_horizon_fields(monkeypatch, tmp_p
     assert captured["worker_slice_timeout"] == 3600
     assert captured["maximum_continuations"] == 8
     assert captured["resume_from_checkpoint"] is True
+
+
+def test_ops_brain_query_uses_only_narrow_policy_readable_roots(monkeypatch, tmp_path):
+    hermes_root = tmp_path / ".hermes"
+    ops_brain = hermes_root / "ops-brain"
+    projects = ops_brain / "projects"
+    projects.mkdir(parents=True)
+    allowed = projects / "mission-control.md"
+    allowed.write_text(
+        "---\n"
+        "name: Mission Control\n"
+        "type: project\n"
+        "status: Completed\n"
+        "priority: 1\n"
+        "next_action: Fix the next bounded issue\n"
+        "blocked_by: []\n"
+        "---\n\n# Mission Control\n",
+        encoding="utf-8",
+    )
+    # This document is deliberately outside the authority snapshot and contains
+    # malformed YAML. A policy-scoped query must never open or parse it.
+    (projects / "client-financial-private.md").write_text(
+        "---\nname: [unterminated\n---\n",
+        encoding="utf-8",
+    )
+
+    class NarrowPolicy:
+        readable_roots = [allowed]
+        allowed_paths = []
+
+        def require_level(self, level):
+            assert level == "read_only"
+
+        def denies_path(self, path):
+            return False
+
+        def require_read_path(self, path):
+            if not op_policy.path_under_allowed(path, self.readable_roots):
+                raise PermissionError("outside narrow readable roots")
+
+    monkeypatch.setattr(server.op_policy, "OperatorPolicy", NarrowPolicy)
+    monkeypatch.setattr(server, "_hermes_root_for_operator", lambda: hermes_root)
+
+    status = json.loads(server.hermes_ops_brain_query("status", "Mission Control", 5))
+    assert status["scope"] == "operator_policy_readable_roots"
+    assert status["count"] == 1
+    assert status["items"][0]["path"] == "projects/mission-control.md"
+    assert status["items"][0]["status"] == "Completed"
+
+    listed = json.loads(server.hermes_ops_brain_query("projects", limit=10))
+    assert listed["count"] == 1
+    assert [item["name"] for item in listed["items"]] == ["Mission Control"]
+    assert "client-financial-private" not in json.dumps(listed)

@@ -1662,13 +1662,137 @@ def bridge_write_adjudication(command_id: str, verdict: str, root: str | None = 
     return op_bridge.bridge_write_adjudication(command_id=command_id, verdict=verdict, root=root)
 
 
-def hermes_ops_brain_query(command: str, keyword: str = "", limit: int = 5) -> str:
-    """Run the read-only OpsBrain Markdown query prototype.
+def _ops_brain_frontmatter(path: Path) -> dict[str, Any]:
+    """Read YAML frontmatter from one policy-authorized Markdown document."""
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    import yaml
 
-    This is a narrow wrapper around ~/.hermes/ops-brain/tools/ops_brain_query.py.
-    It does not use a shell, does not create an index, and does not inspect
-    runtime/session databases. It only reads OpsBrain Markdown through the
-    committed query prototype.
+    payload = yaml.safe_load(parts[1]) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _policy_scoped_ops_brain_docs(policy: op_policy.OperatorPolicy, ops_brain: Path) -> list[Path]:
+    """Return only Markdown documents covered by the current read authority.
+
+    A narrow standing authority may intentionally grant selected project files
+    without granting the whole OpsBrain directory. In that case the query tool
+    must not reject the authority merely because the parent directory is not an
+    allowed root, and it must not scan files outside the approved snapshot.
+    """
+    roots = policy.readable_roots or policy.allowed_paths
+    documents: set[Path] = set()
+    for raw_root in roots:
+        root = Path(raw_root).expanduser().resolve(strict=False)
+        if not op_policy.path_under_allowed(root, [ops_brain]):
+            continue
+        if root.is_file():
+            if root.suffix.lower() == ".md" and not policy.denies_path(root):
+                documents.add(root)
+            continue
+        if root.is_dir():
+            for candidate in root.rglob("*.md"):
+                resolved = candidate.resolve(strict=False)
+                try:
+                    policy.require_read_path(resolved)
+                except PermissionError:
+                    continue
+                documents.add(resolved)
+    return sorted(documents, key=lambda item: str(item))
+
+
+def _scoped_ops_brain_query(
+    policy: op_policy.OperatorPolicy,
+    ops_brain: Path,
+    command: str,
+    keyword: str,
+    limit: int,
+) -> str:
+    """Query only documents explicitly readable under a narrow policy snapshot."""
+    docs = _policy_scoped_ops_brain_docs(policy, ops_brain)
+    records: list[tuple[Path, dict[str, Any]]] = []
+    for path in docs:
+        policy.require_read_path(path)
+        try:
+            records.append((path, _ops_brain_frontmatter(path)))
+        except (OSError, ValueError):
+            continue
+
+    key = (keyword or "").strip().lower()
+
+    def identity(path: Path, data: dict[str, Any]) -> str:
+        rel = str(path.relative_to(ops_brain)).lower()
+        name = str(data.get("name") or "").lower()
+        return " ".join((name, path.stem.lower(), rel))
+
+    if command in {"status", "evidence", "linked"}:
+        if not key:
+            return f"OpsBrain query command {command!r} requires keyword."
+        records = [(path, data) for path, data in records if key in identity(path, data)]
+
+    items: list[dict[str, Any]] = []
+    for path, data in records:
+        rel = str(path.relative_to(ops_brain))
+        base = {"path": rel, "name": data.get("name") or path.stem}
+        if command == "status":
+            base.update(
+                {
+                    "type": data.get("type"),
+                    "status": data.get("status"),
+                    "priority": data.get("priority"),
+                    "next_action": data.get("next_action"),
+                    "blocked_by": data.get("blocked_by") or [],
+                    "health": data.get("health"),
+                }
+            )
+        elif command == "evidence":
+            base["evidence"] = data.get("evidence") or []
+        elif command == "linked":
+            base["related"] = data.get("related") or []
+        elif command == "blockers":
+            blockers = data.get("blocked_by") or []
+            if not blockers:
+                continue
+            base["blocked_by"] = blockers
+        elif command == "next-actions":
+            actions = data.get("next_actions") or data.get("next_action")
+            if not actions:
+                continue
+            base["next_actions"] = actions
+        elif command == "projects":
+            if data.get("type") != "project" and "projects" not in path.parts:
+                continue
+            base["status"] = data.get("status")
+        elif command == "runbooks":
+            if data.get("type") != "runbook" and "runbooks" not in path.parts:
+                continue
+        items.append(base)
+        if len(items) >= limit:
+            break
+
+    return json.dumps(
+        {
+            "scope": "operator_policy_readable_roots",
+            "command": command,
+            "count": len(items),
+            "items": items,
+        },
+        indent=2,
+    )
+
+
+def hermes_ops_brain_query(command: str, keyword: str = "", limit: int = 5) -> str:
+    """Run a read-only OpsBrain query within the current authority snapshot.
+
+    When the policy grants the complete OpsBrain root, this uses the committed
+    query prototype unchanged. When the policy grants only selected Markdown
+    documents, it uses a policy-scoped frontmatter query and never scans beyond
+    those readable roots. No shell, index mutation, runtime/session database, or
+    write path is involved.
     """
     try:
         policy = op_policy.OperatorPolicy()
@@ -1677,20 +1801,27 @@ def hermes_ops_brain_query(command: str, keyword: str = "", limit: int = 5) -> s
         if hermes_root is None:
             return "OpsBrain query unavailable: Hermes root could not be resolved."
         ops_brain = hermes_root / "ops-brain"
-        if op_policy.is_denied_path(ops_brain):
-            return "OpsBrain query unavailable: OpsBrain path is denied by policy."
-        if not op_policy.path_under_allowed(ops_brain, policy.allowed_paths):
-            return "OpsBrain query unavailable: OpsBrain path is not in HERMES_GPT_OPERATOR_ALLOWED_PATHS."
-        script = ops_brain / "tools" / "ops_brain_query.py"
-        if not script.is_file():
-            return f"OpsBrain query unavailable: missing {script}."
 
         cmd = (command or "").strip()
         allowed = {"status", "evidence", "linked", "blockers", "next-actions", "projects", "runbooks"}
         if cmd not in allowed:
             return "Unsupported OpsBrain query command. Allowed: " + ", ".join(sorted(allowed))
-
         lim = max(1, min(int(limit or 5), 20))
+
+        try:
+            policy.require_read_path(ops_brain)
+            full_root_allowed = True
+        except PermissionError:
+            full_root_allowed = False
+
+        if not full_root_allowed:
+            return _scoped_ops_brain_query(policy, ops_brain, cmd, keyword, lim)
+
+        script = ops_brain / "tools" / "ops_brain_query.py"
+        policy.require_read_path(script)
+        if not script.is_file():
+            return f"OpsBrain query unavailable: missing {script}."
+
         argv: list[str] = [cmd]
         if cmd in {"status", "evidence", "linked"}:
             key = (keyword or "").strip()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -1617,6 +1618,72 @@ def test_worker_uses_selected_nous_profile_and_keeps_file_root_confined(monkeypa
     assert Path(observed["SHARED_AUTH_DIR"]) == shared_dir
     assert not shared_dir.exists()
     assert auth_path.read_text(encoding="utf-8") == before_auth
+
+
+def test_provider_attempt_start_clears_previous_attempt_outcome(monkeypatch, tmp_path):
+    """A recovered alternate must not expose the predecessor's terminal fields."""
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(delegation, "_write_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(delegation, "_record_mission_control", lambda *args, **kwargs: None)
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    task_id = "dt_" + "a" * 32
+    task = {
+        "task_id": task_id,
+        "status": "running",
+        "argv": ["fake-worker"],
+        "workdir": str(workdir),
+        "timeout": 30,
+        "pid": None,
+        "returncode": 0,
+        "stdout": "previous attempt output",
+        "stderr": "previous attempt stderr",
+        "outcome_reason": "previous attempt failed",
+        "failure_category": "evidence_failure",
+        "provider_error_category": "rate_limit",
+        "events": [],
+    }
+    delegation._save(task)
+    observed = {}
+
+    class FakeProcess:
+        pid = 4242
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            current = delegation._load(task_id)
+            observed.update(
+                {
+                    "status": current["status"],
+                    "pid": current["pid"],
+                    "returncode": current["returncode"],
+                    "stdout": current["stdout"],
+                    "stderr": current["stderr"],
+                    "outcome_reason": current["outcome_reason"],
+                    "failure_category": current["failure_category"],
+                    "provider_error_category": current["provider_error_category"],
+                }
+            )
+            return "current attempt output", ""
+
+    monkeypatch.setattr(delegation.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    rc, stdout, stderr, authority_failure = delegation._run_worker_process(task_id, task, os.environ.copy())
+
+    assert rc == 0
+    assert stdout == "current attempt output"
+    assert stderr == ""
+    assert authority_failure == ""
+    assert observed == {
+        "status": "running",
+        "pid": 4242,
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "outcome_reason": "",
+        "failure_category": None,
+        "provider_error_category": None,
+    }
 
 
 def test_empty_response_triggers_exactly_one_cross_provider_alternate(monkeypatch, tmp_path):
