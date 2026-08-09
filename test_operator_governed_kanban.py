@@ -269,6 +269,23 @@ def test_forecast_denial_blocks_instead_of_bypassing_authority(monkeypatch):
     assert blocked[0].block_kind == "capability"
 
 
+def test_latest_block_reason_reads_canonical_block_event_payload():
+    task = SimpleNamespace(id="t_event", block_reason=None)
+
+    class EventConn:
+        def execute(self, sql, params):
+            assert "kind = 'blocked'" in sql
+            assert params == ("t_event",)
+
+            class Cursor:
+                def fetchone(self):
+                    return (json.dumps({"reason": "originating standing authority is no longer active", "kind": "transient"}),)
+
+            return Cursor()
+
+    assert gk._latest_block_reason(EventConn(), task) == "originating standing authority is no longer active"
+
+
 def test_recover_fixed_authority_block_retries_once_and_preserves_real_boundaries(monkeypatch):
     kb = FakeKanban()
     _reset_state(monkeypatch, kb)

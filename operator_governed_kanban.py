@@ -335,6 +335,25 @@ def _queue_ready_task(kb: Any, conn: Any, task: Any) -> None:
     kb.add_comment(conn, task.id, CREATED_BY, f"governed-delegation-task-id={delegated_id}")
 
 
+def _latest_block_reason(conn: Any, task: Any) -> str:
+    """Return the canonical most-recent blocked reason for a Kanban task."""
+    direct = str(getattr(task, "block_reason", "") or "")
+    if direct:
+        return direct
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+            (task.id,),
+        ).fetchone()
+        if row is None:
+            return ""
+        raw = row[0] if not hasattr(row, "keys") else row["payload"]
+        payload = json.loads(str(raw or "{}"))
+        return str(payload.get("reason") or "") if isinstance(payload, dict) else ""
+    except Exception:
+        return ""
+
+
 def _recover_fixed_authority_blocks(kb: Any, conn: Any) -> None:
     """Retry only cards blocked by the now-fixed standing-pointer bug.
 
@@ -346,7 +365,7 @@ def _recover_fixed_authority_blocks(kb: Any, conn: Any) -> None:
     for task in kb.list_tasks(conn, assignee=ASSIGNEE, status="blocked", limit=20):
         if _decode_packet(getattr(task, "body", None)) is None:
             continue
-        reason = str(getattr(task, "block_reason", "") or "")
+        reason = _latest_block_reason(conn, task)
         if "originating standing authority is no longer active" not in reason:
             continue
         comments = kb.list_comments(conn, task.id)
