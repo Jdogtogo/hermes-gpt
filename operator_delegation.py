@@ -24,6 +24,7 @@ from typing import Any
 import yaml
 
 import operator_policy as op
+import operator_standing_authority as op_standing
 import operator_antigravity as op_antigravity
 import operator_antigravity_tax as op_antigravity_tax
 import operator_routing as routing
@@ -1525,6 +1526,86 @@ def _delegation_policy_candidate_error(
         return str(exc)
 
 
+def _policy_privilege_score(policy: op.OperatorPolicy) -> tuple[int, ...]:
+    """Return a deterministic least-privilege score for a complete authority.
+
+    Lower is narrower. The score deliberately penalizes capabilities unrelated
+    to normal workspace delegation before considering path breadth. It is only
+    used *after* a candidate independently covers the entire task, so it never
+    combines or infers missing permissions from another grant.
+    """
+    verb_count = sum(len(actions) for actions in policy.verbs.values())
+    external_capability_count = (
+        len(policy.egress_hosts)
+        + len(policy.git_remotes)
+        + len(policy.service_units)
+    )
+    profiles = list(policy.allowed_profiles)
+    wildcard_profile = 1 if "*" in profiles else 0
+    profile_count = len(profiles) if "*" not in profiles else 10_000
+    roots = [*policy.readable_roots, *policy.writable_roots]
+    root_count = len(roots)
+    # Deeper roots are normally narrower; use the negative depth only as a
+    # deterministic tie-break after capability/root counts.
+    root_depth = sum(len(Path(root).parts) for root in roots)
+    return (
+        external_capability_count,
+        verb_count,
+        wildcard_profile,
+        profile_count,
+        len(policy.writable_roots),
+        len(policy.readable_roots),
+        root_count,
+        -root_depth,
+    )
+
+
+def _standing_delegation_candidates() -> list[op.OperatorPolicy]:
+    """Materialize every currently valid stored standing authority separately."""
+    candidates: list[op.OperatorPolicy] = []
+    seen: set[str] = set()
+    try:
+        authorities = op_standing.list_standing_authorities()
+    except Exception:
+        authorities = []
+
+    for authority in authorities:
+        authority_id = str(getattr(authority, "authority_id", "") or "")
+        if not authority_id or authority_id in seen:
+            continue
+        try:
+            policy = op.OperatorPolicy(
+                authority_preference="standing",
+                standing_authority_id=authority_id,
+            )
+        except TypeError:
+            # Older policy doubles/integrations do not expose specific standing
+            # authority materialisation. The legacy active-pointer fallback
+            # below preserves compatibility for those callers.
+            continue
+        if (
+            policy.path_authority_source == "standing_policy_snapshot"
+            and policy.session_id == authority_id
+        ):
+            candidates.append(policy)
+            seen.add(authority_id)
+
+    # Preserve compatibility with installations that have only the historical
+    # active standing pointer or whose authority registry cannot be enumerated.
+    try:
+        active = op.OperatorPolicy(authority_preference="standing")
+    except TypeError:
+        active = None
+    if (
+        active is not None
+        and active.path_authority_source == "standing_policy_snapshot"
+        and active.session_id
+        and active.session_id not in seen
+    ):
+        candidates.append(active)
+    return candidates
+
+
 def _select_delegation_policy(
     *,
     profile: str,
@@ -1532,23 +1613,15 @@ def _select_delegation_policy(
     mode: str,
     allow_web: bool,
 ) -> op.OperatorPolicy:
-    """Choose one complete authority for a delegation, least privilege first."""
-    candidates: list[op.OperatorPolicy] = []
-    try:
-        standing = op.OperatorPolicy(authority_preference="standing")
-    except TypeError:
-        # Backward-compatible with older policy doubles/integrations that do
-        # not yet expose the internal authority_preference constructor arg.
-        standing = None
-    if standing is not None and standing.path_authority_source == "standing_policy_snapshot":
-        candidates.append(standing)
+    """Choose one complete authority for a delegation, least privilege first.
 
-    effective = op.OperatorPolicy()
-    if not candidates or effective.session_id != candidates[0].session_id:
-        candidates.append(effective)
-
+    All stored standing authorities are evaluated independently. A matching
+    standing grant is preferred over a bounded active session, and multiple
+    grants are never unioned or composed.
+    """
     denials: list[str] = []
-    for candidate in candidates:
+    eligible_standing: list[op.OperatorPolicy] = []
+    for candidate in _standing_delegation_candidates():
         error = _delegation_policy_candidate_error(
             candidate,
             profile=profile,
@@ -1557,9 +1630,25 @@ def _select_delegation_policy(
             allow_web=allow_web,
         )
         if error is None:
-            return candidate
-        source = getattr(candidate, "path_authority_source", "effective_policy")
-        denials.append(f"{source}: {error}")
+            eligible_standing.append(candidate)
+        else:
+            denials.append(f"standing:{candidate.session_id}: {error}")
+
+    if eligible_standing:
+        return min(eligible_standing, key=_policy_privilege_score)
+
+    effective = op.OperatorPolicy()
+    error = _delegation_policy_candidate_error(
+        effective,
+        profile=profile,
+        workdir=workdir,
+        mode=mode,
+        allow_web=allow_web,
+    )
+    if error is None:
+        return effective
+    source = getattr(effective, "path_authority_source", "effective_policy")
+    denials.append(f"{source}:{effective.session_id or 'none'}: {error}")
 
     raise PermissionError(
         "No single approved authority fully covers this delegated task; "

@@ -59,6 +59,191 @@ class WebPolicy(FakePolicy):
         assert (resource, verb) in {("filesystem", "edit"), ("network", "web")}
 
 
+def _multi_authority_policy_class(registry):
+    class MultiAuthorityPolicy:
+        enabled = True
+        level = "workspace"
+        apply_mode = "direct"
+        snapshot_hash = "snapshot"
+        expires_at = None
+        path_authority_source = "standing_policy_snapshot"
+        profile_allowlist_source = "standing_policy_snapshot"
+        session_allowed_profiles = ["default"]
+        process_allowed_profiles = ["default"]
+        owner_mode_ready = False
+        mutation_allowed = True
+        policy_template = "test-standing"
+        session_status = "standing"
+        session_failure_reason = None
+        pointed_session_id = None
+        session_approved_at = 1
+        denied_paths = []
+        allowed_branches = None
+
+        def __init__(self, *, authority_preference="effective", standing_authority_id=None):
+            key = standing_authority_id if authority_preference == "standing" else "effective"
+            if key is None:
+                key = "active"
+            data = registry[key]
+            self.session_id = data["session_id"]
+            self.readable_roots = [Path(p) for p in data.get("readable_roots", [])]
+            self.writable_roots = [Path(p) for p in data.get("writable_roots", [])]
+            self.allowed_paths = sorted(
+                {*self.readable_roots, *self.writable_roots}, key=lambda p: str(p)
+            )
+            self.verbs = data.get("verbs", {"filesystem": ["edit"]})
+            self.allowed_profiles = data.get("allowed_profiles", ["default"])
+            self.egress_hosts = data.get("egress_hosts", [])
+            self.git_remotes = data.get("git_remotes", [])
+            self.service_units = data.get("service_units", [])
+            self.path_authority_source = data.get(
+                "path_authority_source", "standing_policy_snapshot"
+            )
+            self.expires_at = data.get("expires_at")
+
+        @staticmethod
+        def _under(path, roots):
+            resolved = Path(path).resolve(strict=False)
+            for root in roots:
+                try:
+                    resolved.relative_to(Path(root).resolve(strict=False))
+                    return True
+                except ValueError:
+                    pass
+            return False
+
+        def require_enabled(self):
+            return None
+
+        def require_profile(self, profile, hermes_root):
+            if profile not in self.allowed_profiles and "*" not in self.allowed_profiles:
+                raise PermissionError("profile denied")
+
+        def require_read_path(self, path):
+            if not self._under(path, self.readable_roots):
+                raise PermissionError("read path denied")
+
+        def require_write_path(self, path):
+            if not self._under(path, self.writable_roots):
+                raise PermissionError("write path denied")
+
+        def require_level(self, level):
+            if level != "workspace":
+                raise PermissionError("level denied")
+
+        def require_mutation(self, dry_run):
+            if dry_run or self.apply_mode != "direct":
+                raise PermissionError("mutation denied")
+
+        def require_verb(self, resource, verb):
+            if verb not in self.verbs.get(resource, []):
+                raise PermissionError(f"verb denied: {resource}:{verb}")
+
+    return MultiAuthorityPolicy
+
+
+def test_multi_standing_resolver_selects_narrowest_complete_authority(monkeypatch, tmp_path):
+    workdir = tmp_path / "maintenance" / "specific"
+    workdir.mkdir(parents=True)
+    registry = {
+        "sa_broad": {
+            "session_id": "sa_broad",
+            "readable_roots": [tmp_path],
+            "writable_roots": [tmp_path],
+            "verbs": {"filesystem": ["read", "edit"], "git": ["commit"]},
+            "allowed_profiles": ["default", "backend-eng"],
+        },
+        "sa_narrow": {
+            "session_id": "sa_narrow",
+            "readable_roots": [workdir],
+            "writable_roots": [workdir],
+            "verbs": {"filesystem": ["edit"]},
+            "allowed_profiles": ["default"],
+        },
+        "active": {
+            "session_id": "sa_broad",
+            "readable_roots": [tmp_path],
+            "writable_roots": [tmp_path],
+            "verbs": {"filesystem": ["read", "edit"], "git": ["commit"]},
+            "allowed_profiles": ["default", "backend-eng"],
+        },
+        "effective": {
+            "session_id": "ops_session",
+            "readable_roots": [tmp_path],
+            "writable_roots": [tmp_path],
+            "verbs": {"filesystem": ["edit"], "services": ["restart"]},
+            "allowed_profiles": ["default"],
+            "path_authority_source": "session_snapshot",
+            "expires_at": 9999999999,
+        },
+    }
+    policy_cls = _multi_authority_policy_class(registry)
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", policy_cls)
+    monkeypatch.setattr(
+        delegation.op_standing,
+        "list_standing_authorities",
+        lambda: [
+            type("Authority", (), {"authority_id": "sa_broad"})(),
+            type("Authority", (), {"authority_id": "sa_narrow"})(),
+        ],
+    )
+
+    selected = delegation._select_delegation_policy(
+        profile="default", workdir=workdir, mode="apply", allow_web=False
+    )
+
+    assert selected.session_id == "sa_narrow"
+    assert selected.path_authority_source == "standing_policy_snapshot"
+
+
+def test_multi_standing_resolver_never_composes_partial_grants(monkeypatch, tmp_path):
+    workdir = tmp_path / "maintenance"
+    workdir.mkdir()
+    registry = {
+        "sa_read": {
+            "session_id": "sa_read",
+            "readable_roots": [workdir],
+            "writable_roots": [],
+            "verbs": {"filesystem": ["read"]},
+        },
+        "sa_write": {
+            "session_id": "sa_write",
+            "readable_roots": [],
+            "writable_roots": [workdir],
+            "verbs": {"filesystem": ["edit"]},
+        },
+        "active": {
+            "session_id": "sa_read",
+            "readable_roots": [workdir],
+            "writable_roots": [],
+            "verbs": {"filesystem": ["read"]},
+        },
+        "effective": {
+            "session_id": "ops_insufficient",
+            "readable_roots": [],
+            "writable_roots": [],
+            "verbs": {},
+            "path_authority_source": "session_snapshot",
+            "expires_at": 9999999999,
+        },
+    }
+    policy_cls = _multi_authority_policy_class(registry)
+    monkeypatch.setattr(delegation.op, "OperatorPolicy", policy_cls)
+    monkeypatch.setattr(
+        delegation.op_standing,
+        "list_standing_authorities",
+        lambda: [
+            type("Authority", (), {"authority_id": "sa_read"})(),
+            type("Authority", (), {"authority_id": "sa_write"})(),
+        ],
+    )
+
+    with pytest.raises(PermissionError, match="not composable"):
+        delegation._select_delegation_policy(
+            profile="default", workdir=workdir, mode="apply", allow_web=False
+        )
+
+
 def test_apply_delegation_is_durable_and_excludes_terminal_web_and_skills(monkeypatch, tmp_path):
     monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
     monkeypatch.setattr(delegation.op, "OperatorPolicy", FakePolicy)

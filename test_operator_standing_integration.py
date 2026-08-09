@@ -123,6 +123,49 @@ def test_expired_bootstrap_session_falls_back_to_standing_authority(standing_env
     assert policy.service_units == []
 
 
+def test_specific_standing_authority_materializes_without_changing_active_pointer(standing_env):
+    _request_and_approve_standing(standing_env, now=1_000)
+    contained = next(
+        authority
+        for authority in op_standing.list_standing_authorities(root=standing_env)
+        if authority.policy_template == "hermes-contained-maintenance-standing"
+    )
+
+    response = json.loads(
+        server.hermes_operator_session_request(
+            policy_template="hermes-mission-control-standing",
+            requested_duration_minutes=30,
+            reason="second standing authority for independent resolution",
+            authority_mode="standing",
+        )
+    )
+    assert response["success"] is True
+    op_sessions.approve_session_request(
+        response["request_id"],
+        decided_by="telegram:12345",
+        root=standing_env,
+        now=1_001,
+    )
+    mission = next(
+        authority
+        for authority in op_standing.list_standing_authorities(root=standing_env)
+        if authority.policy_template == "hermes-mission-control-standing"
+    )
+
+    active = op_policy.OperatorPolicy(authority_preference="standing")
+    selected = op_policy.OperatorPolicy(
+        authority_preference="standing",
+        standing_authority_id=contained.authority_id,
+    )
+
+    assert active.session_id == mission.authority_id
+    assert active.policy_template == "hermes-mission-control-standing"
+    assert selected.session_id == contained.authority_id
+    assert selected.policy_template == "hermes-contained-maintenance-standing"
+    assert selected.path_authority_source == "standing_policy_snapshot"
+    assert selected.writable_roots != active.writable_roots
+
+
 def test_status_reports_standing_without_adding_a_tool(standing_env):
     _request_and_approve_standing(standing_env, now=1_000)
     status = json.loads(server.hermes_operator_session_status())

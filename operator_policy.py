@@ -605,8 +605,16 @@ def path_under_allowed(path: str | os.PathLike[str], allowed: list[Path]) -> boo
 # ---------------------------------------------------------------------------
 
 
-def _resolve_standing_policy_snapshot() -> tuple[Any | None, dict[str, Any] | None, str | None, str | None]:
-    """Resolve a valid standing authority into the current local template.
+def _resolve_standing_policy_snapshot(
+    authority_id: str | None = None,
+) -> tuple[Any | None, dict[str, Any] | None, str | None, str | None]:
+    """Resolve one valid standing authority into the current local template.
+
+    With no ``authority_id`` this preserves the historical active-pointer
+    behavior used by public/effective policy resolution. Internal operation
+    brokers may supply an already-stored authority id so multiple independent
+    standing grants can be evaluated without changing the active pointer or
+    combining permissions.
 
     The standing record never stores caller-supplied raw authority. Each use
     re-resolves the named local template, normalizes and hashes it, recomputes
@@ -620,13 +628,20 @@ def _resolve_standing_policy_snapshot() -> tuple[Any | None, dict[str, Any] | No
         from operator_standing_authority import (
             check_standing_authority_validity,
             get_active_standing_authority,
+            load_standing_authority,
         )
 
         if not risk_based_authority_enabled():
             return None, None, None, "risk-based standing authority is disabled"
-        standing = get_active_standing_authority()
+        standing = (
+            load_standing_authority(authority_id)
+            if authority_id
+            else get_active_standing_authority()
+        )
         if standing is None:
             return None, None, None, None
+        if standing.is_revoked():
+            return standing, None, None, "standing authority is revoked"
         resolved = resolve_template(standing.policy_template)
         if not resolved.get("standing_authority_eligible", False):
             return standing, None, None, "policy template is no longer standing-authority eligible"
@@ -688,14 +703,23 @@ class OperatorPolicy:
         "session_approved_at",
     )
 
-    def __init__(self, *, authority_preference: str = "effective") -> None:
+    def __init__(
+        self,
+        *,
+        authority_preference: str = "effective",
+        standing_authority_id: str | None = None,
+    ) -> None:
         # Single authoritative resolution path: both status tools and every
         # mutation guard construct OperatorPolicy(). ``authority_preference``
-        # is internal-only and allows operation-level resolvers to materialise
-        # the already-approved standing authority independently of an unrelated
-        # active Operator Session. Public/default behavior remains ``effective``.
+        # and ``standing_authority_id`` are internal-only controls for operation-
+        # level brokers. They allow one already-approved standing authority to
+        # be materialised independently of an unrelated active Operator Session
+        # without changing the public active pointer or combining permissions.
+        # Public/default behavior remains ``effective``.
         if authority_preference not in {"effective", "standing"}:
             raise ValueError("authority_preference must be 'effective' or 'standing'.")
+        if standing_authority_id is not None and authority_preference != "standing":
+            raise ValueError("standing_authority_id requires authority_preference='standing'.")
         authority = operator_sessions.resolve_effective_authority()
         self.session_status = authority.status
         self.session_failure_reason = authority.failure_reason
@@ -772,7 +796,9 @@ class OperatorPolicy:
             self.expires_at = session.expires_at
             return
 
-        standing, standing_snapshot, standing_hash, standing_failure = _resolve_standing_policy_snapshot()
+        standing, standing_snapshot, standing_hash, standing_failure = _resolve_standing_policy_snapshot(
+            standing_authority_id
+        )
         if standing is not None and standing_snapshot is not None:
             snapshot = standing_snapshot
             self.enabled = True
