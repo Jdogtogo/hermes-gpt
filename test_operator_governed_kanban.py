@@ -46,6 +46,7 @@ class FakeKanban:
     def __init__(self):
         self.tasks = {}
         self.comments = {}
+        self.task_links = []
         self.created_board = None
         self.counter = 0
 
@@ -339,6 +340,7 @@ def test_seed_sync_normalizes_delegate_todo_to_ready_without_unblocking_boundari
     boundary = next(task for task in kb.tasks.values() if gk._decode_packet(task.body) is None)
     delegate.status = "todo"
     boundary.status = "blocked"
+    kb.task_links.append(("t_stale_parent", delegate.id))
 
     delegate_item = next(item for item in gk.SEED_TASKS if item["kind"] == "delegate" and item["title"] == delegate.title)
     boundary_item = next(item for item in gk.SEED_TASKS if item["kind"] == "boundary" and item["title"] == boundary.title)
@@ -349,6 +351,7 @@ def test_seed_sync_normalizes_delegate_todo_to_ready_without_unblocking_boundari
 
     assert delegate.status == "ready"
     assert boundary.status == "blocked"
+    assert kb.task_links == []
     assert any(
         comment.body == "governed-seed-todo-normalized=v1"
         for comment in kb.comments[delegate.id]

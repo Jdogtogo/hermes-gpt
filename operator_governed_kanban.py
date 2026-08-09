@@ -245,6 +245,15 @@ def _sync_seed_record(kb: Any, conn: Any, task_id: str, item: dict[str, Any], bo
     task = kb.get_task(conn, task_id) if hasattr(kb, "get_task") else getattr(conn, "kb", None).tasks.get(task_id)
     if task is None:
         return
+    if item["kind"] == "delegate":
+        # Canonical governed seed delegate cards have no parent dependencies.
+        # Older persisted versions may retain task_links from previous schemas;
+        # remove only inbound links for this exact seeded delegate ID.
+        if hasattr(conn, "kb") and hasattr(conn.kb, "task_links"):
+            conn.kb.task_links = [link for link in conn.kb.task_links if link[1] != task_id]
+        elif not (hasattr(conn, "kb") and hasattr(conn.kb, "tasks")):
+            with kb.write_txn(conn):
+                conn.execute("DELETE FROM task_links WHERE child_id = ?", (task_id,))
     if item["kind"] == "delegate" and task.status == "todo":
         if hasattr(conn, "kb") and hasattr(conn.kb, "tasks"):
             task.status = "ready"
