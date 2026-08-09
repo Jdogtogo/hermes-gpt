@@ -335,6 +335,27 @@ def _queue_ready_task(kb: Any, conn: Any, task: Any) -> None:
     kb.add_comment(conn, task.id, CREATED_BY, f"governed-delegation-task-id={delegated_id}")
 
 
+def _recover_fixed_authority_blocks(kb: Any, conn: Any) -> None:
+    """Retry only cards blocked by the now-fixed standing-pointer bug.
+
+    This is intentionally not a generic transient/capability auto-unblocker.
+    It recognizes one historical failure signature, retries each matching card
+    at most once, and leaves all genuine approval/material boundaries blocked.
+    """
+    retry_marker = "governed-fixed-authority-retry=v1"
+    for task in kb.list_tasks(conn, assignee=ASSIGNEE, status="blocked", limit=20):
+        if _decode_packet(getattr(task, "body", None)) is None:
+            continue
+        reason = str(getattr(task, "block_reason", "") or "")
+        if "originating standing authority is no longer active" not in reason:
+            continue
+        comments = kb.list_comments(conn, task.id)
+        if any(str(getattr(comment, "body", "") or "") == retry_marker for comment in comments):
+            continue
+        if kb.unblock_task(conn, task.id):
+            kb.add_comment(conn, task.id, CREATED_BY, retry_marker)
+
+
 def _reconcile_running_task(kb: Any, conn: Any, task: Any) -> None:
     comments = kb.list_comments(conn, task.id)
     delegated_id = _delegation_marker(comments)
@@ -395,6 +416,7 @@ def dispatch_once() -> dict[str, Any]:
         seeded = _ensure_board_and_seed(kb, policy)
         conn = kb.connect(board=BOARD_SLUG)
         try:
+            _recover_fixed_authority_blocks(kb, conn)
             for task in kb.list_tasks(conn, assignee=ASSIGNEE, status="running", limit=10):
                 _reconcile_running_task(kb, conn, task)
             # One new claim per tick keeps execution serial and makes each card's

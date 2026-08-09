@@ -117,6 +117,13 @@ class FakeKanban:
         self.tasks[task_id].block_kind = kind
         return True
 
+    def unblock_task(self, conn, task_id):
+        task = self.tasks[task_id]
+        if task.status != "blocked":
+            return False
+        task.status = "ready"
+        return True
+
 
 def _reset_state(monkeypatch, kb):
     monkeypatch.setattr(gk, "_KANBAN_MODULE_OVERRIDE", kb)
@@ -260,3 +267,47 @@ def test_forecast_denial_blocks_instead_of_bypassing_authority(monkeypatch):
     assert blocked
     assert "Approval required" in blocked[0].block_reason
     assert blocked[0].block_kind == "capability"
+
+
+def test_recover_fixed_authority_block_retries_once_and_preserves_real_boundaries(monkeypatch):
+    kb = FakeKanban()
+    _reset_state(monkeypatch, kb)
+    gk._ensure_board_and_seed(kb, FakePolicy())
+
+    delegate_tasks = [
+        task for task in kb.tasks.values() if gk._decode_packet(task.body) is not None
+    ]
+    assert len(delegate_tasks) == 2
+    retryable = delegate_tasks[0]
+    other_blocked = delegate_tasks[1]
+    retryable.status = "blocked"
+    retryable.block_reason = "originating standing authority is no longer active"
+    retryable.block_kind = "transient"
+    other_blocked.status = "blocked"
+    other_blocked.block_reason = "Approval required: bounded approval required"
+    other_blocked.block_kind = "capability"
+
+    boundary_tasks = [
+        task for task in kb.tasks.values() if gk._decode_packet(task.body) is None
+    ]
+    assert boundary_tasks
+    assert all(task.status == "blocked" for task in boundary_tasks)
+
+    conn = kb.connect(board=gk.BOARD_SLUG)
+    gk._recover_fixed_authority_blocks(kb, conn)
+    conn.close()
+
+    assert retryable.status == "ready"
+    assert other_blocked.status == "blocked"
+    assert all(task.status == "blocked" for task in boundary_tasks)
+    assert any(
+        comment.body == "governed-fixed-authority-retry=v1"
+        for comment in kb.comments[retryable.id]
+    )
+
+    retryable.status = "blocked"
+    retryable.block_reason = "originating standing authority is no longer active"
+    conn = kb.connect(board=gk.BOARD_SLUG)
+    gk._recover_fixed_authority_blocks(kb, conn)
+    conn.close()
+    assert retryable.status == "blocked"
