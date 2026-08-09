@@ -318,7 +318,7 @@ def test_recover_fixed_authority_block_retries_once_and_preserves_real_boundarie
     assert other_blocked.status == "blocked"
     assert all(task.status == "blocked" for task in boundary_tasks)
     assert any(
-        comment.body == "governed-fixed-authority-retry=v1"
+        comment.body == "governed-fixed-authority-retry=v2"
         for comment in kb.comments[retryable.id]
     )
 

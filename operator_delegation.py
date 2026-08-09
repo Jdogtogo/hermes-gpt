@@ -958,7 +958,7 @@ def _require_task_authority(task: dict[str, Any]) -> None:
     try:
         policy = op.OperatorPolicy(
             authority_preference="standing" if authority_kind == "standing" else "effective",
-            authority_id=(
+            standing_authority_id=(
                 str(authority.get("session_id"))
                 if authority_kind == "standing" and authority.get("session_id")
                 else None

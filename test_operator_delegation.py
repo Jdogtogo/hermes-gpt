@@ -1028,9 +1028,9 @@ def test_require_task_authority_accepts_active_standing_authority_without_expiry
         session_id = "sa_test"
         expires_at = None
 
-        def __init__(self, *, authority_preference="effective", authority_id=None):
+        def __init__(self, *, authority_preference="effective", standing_authority_id=None):
             captured["authority_preference"] = authority_preference
-            captured["authority_id"] = authority_id
+            captured["standing_authority_id"] = standing_authority_id
 
     monkeypatch.setattr(delegation.op, "OperatorPolicy", StandingPolicy)
     task = {
@@ -1049,7 +1049,10 @@ def test_require_task_authority_accepts_active_standing_authority_without_expiry
     }
 
     delegation._require_task_authority(task)
-    assert captured == {"authority_preference": "standing", "authority_id": "sa_test"}
+    assert captured == {
+        "authority_preference": "standing",
+        "standing_authority_id": "sa_test",
+    }
 
 
 def test_require_task_authority_rejects_inactive_standing_authority(monkeypatch, tmp_path):

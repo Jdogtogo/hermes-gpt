@@ -361,7 +361,7 @@ def _recover_fixed_authority_blocks(kb: Any, conn: Any) -> None:
     It recognizes one historical failure signature, retries each matching card
     at most once, and leaves all genuine approval/material boundaries blocked.
     """
-    retry_marker = "governed-fixed-authority-retry=v1"
+    retry_marker = "governed-fixed-authority-retry=v2"
     for task in kb.list_tasks(conn, assignee=ASSIGNEE, status="blocked", limit=20):
         if _decode_packet(getattr(task, "body", None)) is None:
             continue
