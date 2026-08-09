@@ -218,6 +218,62 @@ def _delegation_marker(comments: list[Any]) -> str | None:
     return None
 
 
+def _sync_seed_record(kb: Any, conn: Any, task_id: str, item: dict[str, Any], body: str) -> None:
+    """Refresh one known governed seed card without replacing its durable ID/history."""
+    workspace_path = str(CLEAN_MAINTENANCE_WORKTREE) if item["kind"] == "delegate" else None
+    # Unit-test fake path; production uses the same SQL shape as Hermes' dashboard updater.
+    if hasattr(conn, "kb") and hasattr(conn.kb, "tasks"):
+        task = conn.kb.tasks.get(task_id)
+        if task is not None:
+            task.title = item["title"]
+            task.body = body
+            task.assignee = ASSIGNEE
+            task.priority = int(item["priority"])
+            task.workspace_path = workspace_path
+    else:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET title = ?, body = ?, assignee = ?, priority = ?, "
+                "workspace_kind = 'dir', workspace_path = ? WHERE id = ?",
+                (item["title"], body, ASSIGNEE, int(item["priority"]), workspace_path, task_id),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'edited', ?, ?)",
+                (task_id, json.dumps({"source": CREATED_BY, "seed_schema": 1}), int(time.time())),
+            )
+
+    task = kb.get_task(conn, task_id) if hasattr(kb, "get_task") else getattr(conn, "kb", None).tasks.get(task_id)
+    if task is None:
+        return
+    if item["kind"] == "delegate" and task.status in {"blocked", "archived"}:
+        reason = _latest_block_reason(conn, task)
+        known_stale = (
+            task.status == "archived"
+            or "controller-governed card has no valid governed delegation packet" in reason
+            or "originating standing authority is no longer active" in reason
+        )
+        marker = "governed-seed-migration=v1"
+        comments = kb.list_comments(conn, task_id)
+        already = any(str(getattr(c, "body", "") or "") == marker for c in comments)
+        if known_stale and not already:
+            if task.status == "blocked":
+                kb.unblock_task(conn, task_id)
+            else:
+                if hasattr(conn, "kb") and hasattr(conn.kb, "tasks"):
+                    task.status = "ready"
+                    task.started_at = None
+                else:
+                    with kb.write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET status='ready', started_at=NULL, completed_at=NULL, "
+                            "claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?",
+                            (task_id,),
+                        )
+            kb.add_comment(conn, task_id, CREATED_BY, marker)
+    elif item["kind"] == "boundary" and task.status != "blocked":
+        kb.block_task(conn, task_id, reason=str(item["reason"]), kind="capability")
+
+
 def _ensure_board_and_seed(kb: Any, policy: op_policy.OperatorPolicy) -> list[str]:
     policy.require_write_path(BOARD_ROOT)
     kb.create_board(
@@ -256,6 +312,7 @@ def _ensure_board_and_seed(kb: Any, policy: op_policy.OperatorPolicy) -> list[st
                 initial_status=initial_status,
                 board=BOARD_SLUG,
             )
+            _sync_seed_record(kb, conn, task_id, item, body)
             ids.append(task_id)
             if item["kind"] == "boundary":
                 existing = kb.list_comments(conn, task_id)
@@ -354,6 +411,45 @@ def _latest_block_reason(conn: Any, task: Any) -> str:
         return ""
 
 
+def _seeded_task_diagnostics(kb: Any, conn: Any) -> list[dict[str, Any]]:
+    """Return safe board-state diagnostics for the fixed governed seed cards."""
+    rows: list[dict[str, Any]] = []
+    seeded_keys = {str(item["key"]) for item in SEED_TASKS}
+    for task in kb.list_tasks(conn, assignee=ASSIGNEE, limit=20):
+        if str(getattr(task, "idempotency_key", "") or "") not in seeded_keys:
+            continue
+        latest_kind = ""
+        latest_payload: dict[str, Any] = {}
+        try:
+            event = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            if event is not None:
+                if hasattr(event, "keys"):
+                    latest_kind = str(event["kind"] or "")
+                    raw_payload = event["payload"]
+                else:
+                    latest_kind = str(event[0] or "")
+                    raw_payload = event[1]
+                parsed = json.loads(str(raw_payload or "{}"))
+                if isinstance(parsed, dict):
+                    latest_payload = parsed
+        except Exception:
+            pass
+        rows.append(
+            {
+                "task_id": str(task.id),
+                "title": str(getattr(task, "title", "") or ""),
+                "status": str(getattr(task, "status", "") or ""),
+                "latest_event_kind": latest_kind,
+                "latest_reason": str(latest_payload.get("reason") or "")[:500],
+                "latest_summary": str(latest_payload.get("summary") or "")[:500],
+            }
+        )
+    return rows
+
+
 def _recover_fixed_authority_blocks(kb: Any, conn: Any) -> None:
     """Retry only cards blocked by the now-fixed standing-pointer bug.
 
@@ -446,6 +542,7 @@ def dispatch_once() -> dict[str, Any]:
             counts: dict[str, int] = {}
             for status in ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"):
                 counts[status] = len(kb.list_tasks(conn, assignee=ASSIGNEE, status=status))
+            diagnostics = _seeded_task_diagnostics(kb, conn)
         finally:
             conn.close()
         with _LOCK:
@@ -456,6 +553,7 @@ def dispatch_once() -> dict[str, Any]:
                     "last_error": None,
                     "counts": counts,
                     "seeded_task_ids": seeded,
+                    "tasks": diagnostics,
                 }
             )
     except Exception as exc:
