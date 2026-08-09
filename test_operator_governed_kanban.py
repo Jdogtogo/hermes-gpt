@@ -328,3 +328,28 @@ def test_recover_fixed_authority_block_retries_once_and_preserves_real_boundarie
     gk._recover_fixed_authority_blocks(kb, conn)
     conn.close()
     assert retryable.status == "blocked"
+
+
+def test_seed_sync_normalizes_delegate_todo_to_ready_without_unblocking_boundaries(monkeypatch):
+    kb = FakeKanban()
+    _reset_state(monkeypatch, kb)
+    ids = gk._ensure_board_and_seed(kb, FakePolicy())
+
+    delegate = next(task for task in kb.tasks.values() if gk._decode_packet(task.body) is not None)
+    boundary = next(task for task in kb.tasks.values() if gk._decode_packet(task.body) is None)
+    delegate.status = "todo"
+    boundary.status = "blocked"
+
+    delegate_item = next(item for item in gk.SEED_TASKS if item["kind"] == "delegate" and item["title"] == delegate.title)
+    boundary_item = next(item for item in gk.SEED_TASKS if item["kind"] == "boundary" and item["title"] == boundary.title)
+    conn = kb.connect(board=gk.BOARD_SLUG)
+    gk._sync_seed_record(kb, conn, delegate.id, delegate_item, gk._encode_packet(delegate_item["packet"]))
+    gk._sync_seed_record(kb, conn, boundary.id, boundary_item, str(boundary_item["reason"]))
+    conn.close()
+
+    assert delegate.status == "ready"
+    assert boundary.status == "blocked"
+    assert any(
+        comment.body == "governed-seed-todo-normalized=v1"
+        for comment in kb.comments[delegate.id]
+    )

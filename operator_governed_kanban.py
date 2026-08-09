@@ -245,7 +245,19 @@ def _sync_seed_record(kb: Any, conn: Any, task_id: str, item: dict[str, Any], bo
     task = kb.get_task(conn, task_id) if hasattr(kb, "get_task") else getattr(conn, "kb", None).tasks.get(task_id)
     if task is None:
         return
-    if item["kind"] == "delegate" and task.status in {"blocked", "archived"}:
+    if item["kind"] == "delegate" and task.status == "todo":
+        if hasattr(conn, "kb") and hasattr(conn.kb, "tasks"):
+            task.status = "ready"
+            task.started_at = None
+        else:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='ready', started_at=NULL, completed_at=NULL, "
+                    "claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?",
+                    (task_id,),
+                )
+        kb.add_comment(conn, task_id, CREATED_BY, "governed-seed-todo-normalized=v1")
+    elif item["kind"] == "delegate" and task.status in {"blocked", "archived"}:
         reason = _latest_block_reason(conn, task)
         known_stale = (
             task.status == "archived"
