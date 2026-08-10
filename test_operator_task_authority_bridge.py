@@ -7,6 +7,7 @@ operating as a parallel authority system.
 """
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import operator_policy as op
 import operator_policy_templates as templates
 import operator_sessions as sessions
 import operator_task_authority as tba
+import server
 
 
 @pytest.fixture
@@ -136,6 +138,29 @@ def test_completion_invalidates_task_without_falling_back_to_live_session(sessio
     assert closed.is_active is False
     assert closed.status == "task_bound_inactive"
     assert "completed" in (closed.failure_reason or "")
+
+
+def test_controller_completion_surface_invalidates_task_and_requires_fresh_request(session_env):
+    now = int(time.time())
+    request_id = _request(session_env, task="bridge-controller-complete", now=now)
+    sessions.approve_session_request(request_id, root=session_env, now=now + 1)
+
+    response = json.loads(server.hermes_operator_task_complete())
+    assert response["success"] is True
+    assert response["completed"] is True
+    assert response["logical_task_id"] == "bridge-controller-complete"
+    assert response["task_authority"]["task_state"] == "completed"
+    assert response["task_authority"]["valid"] is False
+
+    closed = sessions.resolve_effective_authority(now=now + 2)
+    assert closed.is_active is False
+    assert closed.status == "task_bound_inactive"
+    assert "completed" in (closed.failure_reason or "")
+
+    replacement = _request(session_env, task="bridge-controller-complete", now=now + 3)
+    assert replacement != request_id
+    replacement_info = sessions.session_request_info(replacement, root=session_env)
+    assert replacement_info["status"] == "pending"
 
 
 def test_source_session_revoke_revokes_task_authority(session_env):

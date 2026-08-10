@@ -23,6 +23,7 @@ import operator_manifest as op_manifest
 import operator_bridge as op_bridge
 import operator_auth as op_auth
 import operator_sessions as op_sessions
+import operator_task_authority as op_task_authority
 import operator_policy_templates as op_templates
 import operator_risk as op_risk
 import operator_delegation as op_delegation
@@ -1175,6 +1176,63 @@ def hermes_operator_session_revoke(session_id: str = "") -> str:
         )
 
 
+def hermes_operator_task_complete() -> str:
+    """Complete the currently active logical task and invalidate its authority."""
+    try:
+        policy = op_policy.OperatorPolicy()
+        task_id = (policy.logical_task_id or "").strip()
+        if policy.authority_kind != "task_bound" or policy.session_status != "task_bound" or not task_id:
+            raise PermissionError(
+                "Task completion requires an active task-bound Operator authority."
+            )
+
+        before = op_task_authority.task_status(task_id, root=op_sessions.session_root())
+        if not before.get("valid") or before.get("task_state") != "active":
+            raise PermissionError(
+                f"Logical task {task_id!r} is not active and cannot be completed."
+            )
+
+        op_task_authority.complete_task(
+            task_id,
+            actor="hermes_operator_task_complete",
+            root=op_sessions.session_root(),
+        )
+        after = op_task_authority.task_status(task_id, root=op_sessions.session_root())
+        op_policy.audit_record(
+            tool="hermes_operator_task_complete",
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=True,
+            changed=True,
+            summary="completed logical task and invalidated task-bound authority",
+            extra={
+                "logical_task_id": task_id,
+                "task_state": after.get("task_state"),
+                "task_authority_valid": after.get("valid"),
+            },
+        )
+        return json.dumps(
+            {
+                "success": True,
+                "completed": True,
+                "logical_task_id": task_id,
+                "task_authority": after,
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="OPERATOR_TASK_COMPLETE_ERROR",
+                suggested_action="Use this tool only while the intended logical task has active task-bound authority.",
+            ),
+            indent=2,
+        )
+
+
 def hermes_operator_doctor(profile: str = "default") -> str:
     """Run a read-only health check across operator surfaces."""
     return op_diagnostics.hermes_operator_doctor(
@@ -2125,6 +2183,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_operator_session_request,
         hermes_operator_session_request_extension,
         hermes_operator_session_revoke,
+        hermes_operator_task_complete,
         hermes_operator_audit_tail,
         hermes_operator_doctor,
         hermes_operator_snapshot,

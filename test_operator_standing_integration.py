@@ -173,8 +173,8 @@ def test_status_reports_standing_without_adding_a_tool(standing_env):
     assert status["authority_kind"] == "standing"
     assert status["standing_authority_id"].startswith("sa_")
     assert status["expires_at"] is None
-    assert operator_manifest.EXPECTED_TOOL_COUNT == 41
-    assert len(operator_manifest.CANONICAL_TOOL_NAMES) == 41
+    assert operator_manifest.EXPECTED_TOOL_COUNT == 42
+    assert len(operator_manifest.CANONICAL_TOOL_NAMES) == 42
     assert not any("standing_authority" in name for name in operator_manifest.CANONICAL_TOOL_NAMES)
 
 

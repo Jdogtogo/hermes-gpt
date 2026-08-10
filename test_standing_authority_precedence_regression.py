@@ -182,5 +182,5 @@ def test_request_defaults_to_session_for_nonstanding_template(precedence_env):
 
 
 def test_public_tool_manifest_remains_41_tools():
-    assert operator_manifest.EXPECTED_TOOL_COUNT == 41
-    assert len(operator_manifest.CANONICAL_TOOL_NAMES) == 41
+    assert operator_manifest.EXPECTED_TOOL_COUNT == 42
+    assert len(operator_manifest.CANONICAL_TOOL_NAMES) == 42
