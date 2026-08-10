@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import operator_policy as op
+import operator_standing_authority as op_standing
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,107 @@ def _backup_file(path: Path) -> Path | None:
         return bak
     except OSError:
         return None
+
+
+def _workspace_policy_score(policy: op.OperatorPolicy) -> tuple[int, ...]:
+    """Deterministic least-privilege score for one complete authority grant."""
+    verbs = getattr(policy, "verbs", {}) or {}
+    verb_count = sum(len(actions) for actions in verbs.values())
+    external = (
+        len(getattr(policy, "egress_hosts", []) or [])
+        + len(getattr(policy, "git_remotes", []) or [])
+        + len(getattr(policy, "service_units", []) or [])
+    )
+    profiles = list(getattr(policy, "allowed_profiles", []) or [])
+    wildcard = 1 if "*" in profiles else 0
+    profile_count = len(profiles) if "*" not in profiles else 10_000
+    readable = list(getattr(policy, "readable_roots", []) or [])
+    writable = list(getattr(policy, "writable_roots", []) or [])
+    roots = [*readable, *writable]
+    return (
+        external,
+        verb_count,
+        wildcard,
+        profile_count,
+        len(writable),
+        len(readable),
+        len(roots),
+        -sum(len(Path(item).parts) for item in roots),
+    )
+
+
+def _standing_workspace_candidates() -> list[op.OperatorPolicy]:
+    """Materialise valid standing grants independently; never union them."""
+    candidates: list[op.OperatorPolicy] = []
+    seen: set[str] = set()
+    try:
+        authorities = op_standing.list_standing_authorities()
+    except Exception:
+        authorities = []
+    for authority in authorities:
+        authority_id = str(getattr(authority, "authority_id", "") or "")
+        if not authority_id or authority_id in seen:
+            continue
+        try:
+            candidate = op.OperatorPolicy(
+                authority_preference="standing",
+                standing_authority_id=authority_id,
+            )
+        except Exception:
+            continue
+        if (
+            getattr(candidate, "path_authority_source", "") == "standing_policy_snapshot"
+            and candidate.session_id == authority_id
+        ):
+            candidates.append(candidate)
+            seen.add(authority_id)
+    try:
+        active = op.OperatorPolicy(authority_preference="standing")
+    except Exception:
+        active = None
+    if (
+        active is not None
+        and getattr(active, "path_authority_source", "") == "standing_policy_snapshot"
+        and active.session_id
+        and active.session_id not in seen
+    ):
+        candidates.append(active)
+    return candidates
+
+
+def _select_workspace_operation_policy(validate) -> op.OperatorPolicy:
+    """Choose one complete authority that covers this direct operation.
+
+    The current effective task/session and every stored standing authority are
+    evaluated independently. The least-privilege sufficient candidate wins.
+    Capabilities are never unioned across authorities.
+    """
+    candidates: list[op.OperatorPolicy] = []
+    first_error: Exception | None = None
+    try:
+        effective = op.OperatorPolicy()
+        try:
+            validate(effective)
+            candidates.append(effective)
+        except Exception as exc:
+            first_error = exc
+    except Exception as exc:
+        first_error = exc
+
+    for candidate in _standing_workspace_candidates():
+        try:
+            validate(candidate)
+            candidates.append(candidate)
+        except Exception:
+            continue
+
+    if not candidates:
+        if first_error is not None:
+            raise first_error
+        raise PermissionError(
+            "No single approved authority completely covers this workspace operation."
+        )
+    return min(candidates, key=_workspace_policy_score)
 
 
 def _split_command_argv(command: str) -> list[str]:
@@ -698,8 +800,9 @@ def hermes_workspace_read(
 ) -> str:
     """Read a file. Read-only but applies operator path policy (deny secrets)."""
     try:
-        policy = op.OperatorPolicy()
-        policy.require_read_path(path)
+        policy = _select_workspace_operation_policy(
+            lambda candidate: candidate.require_read_path(path)
+        )
         p = op._normalize_path(path)
         if not p.exists() or not p.is_file():
             raise FileNotFoundError(f"File not found: {path}")
@@ -737,9 +840,11 @@ def hermes_workspace_patch(
     dry_run: bool = True,
 ) -> str:
     try:
-        policy = op.OperatorPolicy()
-        policy.require_level("workspace")
-        policy.require_workspace_path(path)
+        def _validate(candidate):
+            candidate.require_level("workspace")
+            candidate.require_workspace_path(path)
+
+        policy = _select_workspace_operation_policy(_validate)
         if not old_string:
             raise ValueError("old_string is required.")
         if new_string is None:
@@ -830,9 +935,11 @@ def hermes_workspace_write_file(
     dry_run: bool = True,
 ) -> str:
     try:
-        policy = op.OperatorPolicy()
-        policy.require_level("workspace")
-        policy.require_workspace_path(path)
+        def _validate(candidate):
+            candidate.require_level("workspace")
+            candidate.require_workspace_path(path)
+
+        policy = _select_workspace_operation_policy(_validate)
         if content is None:
             raise ValueError("content is required.")
 
@@ -1089,8 +1196,6 @@ def hermes_workspace_run_test(
     runner=None,
 ) -> str:
     try:
-        policy = op.OperatorPolicy()
-        policy.require_level("workspace")
         if not command or not command.strip():
             raise ValueError("command is required.")
 
@@ -1107,12 +1212,14 @@ def hermes_workspace_run_test(
             raise PermissionError(reason)
         execution_argv = _resolve_test_argv(argv)
 
-        # workdir policy: must be under an allowed_path if any are set.
-        if workdir:
-            if policy.allowed_paths and not op.path_under_allowed(workdir, policy.allowed_paths):
+        def _validate(candidate):
+            candidate.require_level("workspace")
+            if workdir and candidate.allowed_paths and not op.path_under_allowed(workdir, candidate.allowed_paths):
                 raise PermissionError(
                     f"workdir {workdir!r} is not under any allowed path."
                 )
+
+        policy = _select_workspace_operation_policy(_validate)
 
         if policy.effective_dry_run(dry_run):
             plan = {
@@ -1777,18 +1884,23 @@ def hermes_workspace_exec(
     resolved_workdir: Path | None = None
     capped_timeout = max(1, min(int(timeout), 600))
     try:
-        policy = op.OperatorPolicy()
-        policy.require_level("workspace")
-        if policy.session_id is None:
-            raise PermissionError("An active approved Operator Session is required.")
-        policy.require_verb("tests", "run")
         if not workdir:
             raise ValueError("workdir is required.")
         resolved_workdir = Path(workdir).expanduser().resolve(strict=True)
         if not resolved_workdir.is_dir():
             raise NotADirectoryError("workdir must be an existing directory.")
-        policy.require_read_path(resolved_workdir)
-        policy.require_write_path(resolved_workdir)
+
+        def _validate(candidate):
+            candidate.require_level("workspace")
+            if candidate.session_id is None:
+                raise PermissionError("An active approved Operator Session or standing authority is required.")
+            candidate.require_verb("tests", "run")
+            candidate.require_read_path(resolved_workdir)
+            candidate.require_write_path(resolved_workdir)
+            if not dry_run:
+                candidate.require_mutation(False)
+
+        policy = _select_workspace_operation_policy(_validate)
         workspace_root = _workspace_exec_root(policy, resolved_workdir)
         safe_argv = _validate_workspace_exec_argv(
             argv,
@@ -1947,10 +2059,11 @@ def _git(argv: list[str], workdir: str, runner=None) -> tuple[int, str, str]:
 
 def hermes_git_status(workdir: str, runner=None) -> str:
     try:
-        policy = op.OperatorPolicy()
         if not workdir:
             raise ValueError("workdir is required.")
-        policy.require_read_path(workdir)
+        policy = _select_workspace_operation_policy(
+            lambda candidate: candidate.require_read_path(workdir)
+        )
         rc, out, err = _git(["status", "--porcelain=v1"], workdir, runner=runner)
         result = {
             "success": rc == 0,
@@ -1978,10 +2091,11 @@ def hermes_git_diff(
     runner=None,
 ) -> str:
     try:
-        policy = op.OperatorPolicy()
         if not workdir:
             raise ValueError("workdir is required.")
-        policy.require_read_path(workdir)
+        policy = _select_workspace_operation_policy(
+            lambda candidate: candidate.require_read_path(workdir)
+        )
         argv: list[str] = ["diff"]
         if stat:
             argv.append("--stat")
@@ -2028,13 +2142,17 @@ def hermes_workspace_git_commit(
     is not the repository's own toplevel.
     """
     try:
-        policy = op.OperatorPolicy()
         if not workdir:
             raise ValueError("workdir is required.")
-        if not policy.session_id:
-            raise PermissionError("hermes_workspace_git_commit requires an active Operator Session.")
-        policy.require_write_path(workdir)
-        policy.require_verb("git", "commit")
+
+        def _validate(candidate):
+            if not candidate.session_id:
+                raise PermissionError("hermes_workspace_git_commit requires an active Operator Session or standing authority.")
+            candidate.require_write_path(workdir)
+            candidate.require_verb("git", "commit")
+            candidate.require_branch(expected_branch)
+
+        policy = _select_workspace_operation_policy(_validate)
         if not allowed_files:
             raise ValueError("allowed_files must list at least one path.")
         if not message or not message.strip():
