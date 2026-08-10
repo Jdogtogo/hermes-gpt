@@ -249,9 +249,9 @@ def test_missing_primary_raises(tmp_path):
 def test_canonical_provider_order_is_the_accepted_policy():
     assert routing.CANONICAL_PROVIDER_ORDER == (
         "nvidia",
+        "nous",
         "openrouter",
         "gemini",
-        "nous",
         "ollama",
     )
 
@@ -259,10 +259,10 @@ def test_canonical_provider_order_is_the_accepted_policy():
 @pytest.mark.parametrize(
     "earlier,later",
     [
-        (NVIDIA, OR_COHERE),   # NVIDIA precedes OpenRouter
-        (OR_COHERE, GEMINI),   # OpenRouter precedes Gemini
-        (GEMINI, NOUS),        # Gemini precedes Nous
-        (NOUS, OLLAMA),        # Nous precedes qualified Ollama
+        (NVIDIA, NOUS),        # NVIDIA direct first
+        (NOUS, OR_COHERE),     # Nous free before OpenRouter free
+        (OR_COHERE, GEMINI),   # OpenRouter free before rate-limited Gemini
+        (GEMINI, OLLAMA),      # Gemini before qualified local fallback
     ],
 )
 def test_canonical_priority_pairs(tmp_path, earlier, later):
@@ -383,6 +383,28 @@ def test_shipped_control_is_free_only_and_bounded():
     assert control.max_alternate_attempts == 3
     assert control.max_alternate_attempts <= routing.MAX_ALTERNATE_ATTEMPTS_CEILING
     assert control.provider_order == routing.CANONICAL_PROVIDER_ORDER
+
+
+def test_shipped_gemini_rate_limit_schema_is_machine_readable_without_invented_ceilings():
+    control = _shipped()
+    gemini = control.control_for("gemini")
+    assert gemini.rate_limit_requests_per_minute is None
+    assert gemini.rate_limit_tokens_per_minute is None
+    assert gemini.rate_limit_requests_per_day is None
+    assert gemini.rate_limit_on_429_cooldown_seconds == 300
+    assert gemini.rate_limit_quota_exhausted_cooldown_seconds == 3600
+    assert gemini.rate_limit_respect_retry_after is True
+    assert "until measured" in gemini.rate_limit_source.lower()
+    assert control.cooldown_seconds_for("gemini", routing.FailureClass.RATE_LIMIT, "HTTP 429") == 300
+    assert control.cooldown_seconds_for("gemini", routing.FailureClass.RATE_LIMIT, "RESOURCE_EXHAUSTED quota") == 3600
+    assert control.cooldown_seconds_for("gemini", routing.FailureClass.PROVIDER_UNAVAILABLE, "HTTP 503") == 0
+
+
+def test_shipped_control_qualifies_glm52_only_on_nvidia_direct():
+    control = _shipped()
+    nvidia = control.control_for("nvidia")
+    assert nvidia.qualifies_for_agent("z-ai/glm-5.2") is True
+    assert control.control_for("openrouter").qualifies_for_agent("z-ai/glm-5.2") is False
 
 
 def test_shipped_control_includes_qualified_agent_routes_but_excludes_direct_only_ollama(tmp_path):

@@ -93,15 +93,98 @@ SEED_TASKS: tuple[dict[str, Any], ...] = (
     },
     {
         "key": "hermes-stabilization-config-drift-review-v1",
-        "title": "Review routing and environment configuration drift",
-        "priority": 70,
+        "title": "Routing · Confirm free-first provider order",
+        "priority": 79,
         "kind": "boundary",
-        "reason": (
-            "Material configuration scope: review planner-glm52 in the process profile "
-            "allowlist and the stale Active-Pipeline environment hint under the existing "
-            "hermes-model-routing-migration policy. No autonomous standing grant covers "
-            "those live configuration roots."
-        ),
+        "reason": "Promote the approved order NVIDIA direct → Nous → OpenRouter free → Gemini direct → Ollama into live routing configuration.",
+        "approval_policy_template": "hermes-model-routing-migration",
+    },
+    {
+        "key": "hermes-routing-nvidia-glm52-v1",
+        "title": "Routing · Verify GLM 5.2 on NVIDIA direct",
+        "priority": 78,
+        "kind": "boundary",
+        "reason": "Verify z-ai/glm-5.2 remains a free NVIDIA-direct route and is not routed through paid OpenRouter.",
+        "approval_policy_template": "hermes-model-routing-migration",
+    },
+    {
+        "key": "hermes-routing-nous-hy3-v1",
+        "title": "Routing · Verify Nous HY3 free",
+        "priority": 77,
+        "kind": "boundary",
+        "reason": "Verify tencent/hy3:free remains qualified through Nous and stays ahead of OpenRouter and Gemini in fallback priority.",
+        "approval_policy_template": "hermes-model-routing-migration",
+    },
+    {
+        "key": "hermes-routing-openrouter-free-only-v1",
+        "title": "Routing · Verify OpenRouter is free-only",
+        "priority": 76,
+        "kind": "boundary",
+        "reason": "Confirm OpenRouter can only use explicitly free-qualified routes and cannot silently fall through to paid models.",
+        "approval_policy_template": "hermes-model-routing-migration",
+    },
+    {
+        "key": "hermes-routing-gemini-quota-schema-v1",
+        "title": "Routing · Verify Gemini quota schema",
+        "priority": 75,
+        "kind": "delegate",
+        "packet": {
+            "prompt": (
+                "Read operator_routing.py and routing_control.json only. Confirm Gemini has a machine-readable "
+                "rate-limit schema with unknown hard RPM/TPM/RPD ceilings left unset, a 300-second HTTP 429 "
+                "cooldown, a 3600-second quota-exhaustion cooldown, and Retry-After support recorded. Make no "
+                "changes. End with HERMES_GEMINI_RATE_LIMIT_SCHEMA_OK."
+            ),
+            "workdir": str(CLEAN_MAINTENANCE_WORKTREE),
+            "mode": "read_only",
+            "profile": "default",
+            "max_turns": 12,
+            "timeout": 600,
+            "allow_web": False,
+        },
+    },
+    {
+        "key": "hermes-routing-planner-glm52-v2",
+        "title": "Routing · Review stale planner-glm52 mapping",
+        "priority": 74,
+        "kind": "boundary",
+        "reason": "Inspect and remove or correct the stale planner-glm52 process-profile mapping without removing the valid NVIDIA-direct GLM 5.2 model route.",
+        "approval_policy_template": "hermes-model-routing-migration",
+    },
+    {
+        "key": "hermes-environment-active-pipeline-v1",
+        "title": "Environment · Review Active-Pipeline hint",
+        "priority": 73,
+        "kind": "boundary",
+        "reason": "Review the stale Active-Pipeline:Financial-Automation-V2 environment hint and change it only if live evidence confirms drift.",
+        "approval_policy_template": "hermes-model-routing-migration",
+    },
+    {
+        "key": "hermes-agents-antigravity-long-horizon-v1",
+        "title": "Agents · Confirm Antigravity long-horizon role",
+        "priority": 72,
+        "kind": "delegate",
+        "packet": {
+            "prompt": (
+                "Inspect the Antigravity and long-horizon delegation integration in this repository. Confirm how "
+                "Antigravity participates as a governed long-horizon agent/reviewer separate from the provider "
+                "fallback chain, identify any remaining integration gap, and make no changes. End with "
+                "HERMES_ANTIGRAVITY_LONG_HORIZON_REVIEW_OK."
+            ),
+            "workdir": str(CLEAN_MAINTENANCE_WORKTREE),
+            "mode": "read_only",
+            "profile": "default",
+            "max_turns": 20,
+            "timeout": 900,
+            "allow_web": False,
+        },
+    },
+    {
+        "key": "hermes-routing-final-smoke-v1",
+        "title": "Routing · Run final live routing smoke",
+        "priority": 71,
+        "kind": "boundary",
+        "reason": "After approved configuration changes, run live free-route smoke tests and record final provider/model evidence.",
         "approval_policy_template": "hermes-model-routing-migration",
     },
     {

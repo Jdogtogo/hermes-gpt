@@ -35,9 +35,9 @@ import yaml
 #: accepted policy and is not re-derived from configuration file ordering.
 CANONICAL_PROVIDER_ORDER: tuple[str, ...] = (
     "nvidia",
+    "nous",
     "openrouter",
     "gemini",
-    "nous",
     "ollama",
 )
 
@@ -179,6 +179,13 @@ class ProviderControl:
     agent_qualified_models: tuple[str, ...] = ()
     agent_qualification_explicit: bool = False
     direct_inference_models: tuple[str, ...] = ()
+    rate_limit_requests_per_minute: int | None = None
+    rate_limit_tokens_per_minute: int | None = None
+    rate_limit_requests_per_day: int | None = None
+    rate_limit_on_429_cooldown_seconds: int = 0
+    rate_limit_quota_exhausted_cooldown_seconds: int = 0
+    rate_limit_respect_retry_after: bool = True
+    rate_limit_source: str = ""
     evidence_ref: str = ""
 
     def qualifies(self, model: str) -> bool:
@@ -210,6 +217,16 @@ class RoutingControl:
 
     def control_for(self, lane: str) -> ProviderControl:
         return self.providers.get(lane, ProviderControl(lane=lane))
+
+    def cooldown_seconds_for(self, lane: str, failure: FailureClass, reason: str = "") -> int:
+        """Return the configured response-driven cooldown for one provider failure."""
+        control = self.control_for(normalise_provider(lane))
+        if failure is not FailureClass.RATE_LIMIT:
+            return 0
+        text = str(reason or "").lower()
+        if "quota" in text or "resource_exhausted" in text:
+            return control.rate_limit_quota_exhausted_cooldown_seconds
+        return control.rate_limit_on_429_cooldown_seconds
 
     def qualified_routes(self) -> list["RouteCandidate"]:
         """Every currently qualified, non-quarantined route, canonically ordered."""
@@ -263,6 +280,17 @@ def load_routing_control(path: Path | None = None) -> RoutingControl:
         models = value.get("qualified_models") or []
         agent_models = value["agent_qualified_models"] if "agent_qualified_models" in value else models
         direct_models = value["direct_inference_models"] if "direct_inference_models" in value else models
+        rate_limits = value.get("rate_limits") if isinstance(value.get("rate_limits"), dict) else {}
+
+        def _optional_nonnegative_int(key: str) -> int | None:
+            raw_value = rate_limits.get(key)
+            if raw_value is None:
+                return None
+            try:
+                return max(0, int(raw_value))
+            except (TypeError, ValueError):
+                return None
+
         providers[lane] = ProviderControl(
             lane=lane,
             eligible=bool(value.get("eligible", False)),
@@ -273,6 +301,13 @@ def load_routing_control(path: Path | None = None) -> RoutingControl:
             agent_qualified_models=tuple(str(item) for item in (agent_models or []) if str(item).strip()),
             agent_qualification_explicit="agent_qualified_models" in value,
             direct_inference_models=tuple(str(item) for item in (direct_models or []) if str(item).strip()),
+            rate_limit_requests_per_minute=_optional_nonnegative_int("requests_per_minute"),
+            rate_limit_tokens_per_minute=_optional_nonnegative_int("tokens_per_minute"),
+            rate_limit_requests_per_day=_optional_nonnegative_int("requests_per_day"),
+            rate_limit_on_429_cooldown_seconds=_optional_nonnegative_int("on_429_cooldown_seconds") or 0,
+            rate_limit_quota_exhausted_cooldown_seconds=_optional_nonnegative_int("quota_exhausted_cooldown_seconds") or 0,
+            rate_limit_respect_retry_after=bool(rate_limits.get("respect_retry_after", True)),
+            rate_limit_source=str(rate_limits.get("source") or ""),
             evidence_ref=str(value.get("evidence_ref") or ""),
         )
 
