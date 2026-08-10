@@ -1123,10 +1123,63 @@ def hermes_operator_session_request(
 
 
 def hermes_operator_session_revoke(session_id: str = "") -> str:
-    """Revoke the active Operator Session or an explicitly supplied session id."""
+    """Revoke an authority, or complete ``task:<logical_task_id>`` for stale clients."""
     try:
+        explicit_target = (session_id or "").strip()
+        if explicit_target.startswith("task:"):
+            task_id = explicit_target.removeprefix("task:").strip()
+            if not task_id:
+                raise ValueError("task:<logical_task_id> requires a non-empty logical task id.")
+            policy = op_policy.OperatorPolicy(logical_task_id=task_id)
+            if (
+                policy.authority_kind != "task_bound"
+                or policy.session_status != "task_bound"
+                or policy.logical_task_id != task_id
+            ):
+                raise PermissionError(
+                    "Task completion requires active task-bound authority for the named logical task."
+                )
+            before = op_task_authority.task_status(task_id, root=op_sessions.session_root())
+            if not before.get("valid") or before.get("task_state") != "active":
+                raise PermissionError(
+                    f"Logical task {task_id!r} is not active and cannot be completed."
+                )
+            op_task_authority.complete_task(
+                task_id,
+                actor="hermes_operator_session_revoke:task-compat",
+                root=op_sessions.session_root(),
+            )
+            after = op_task_authority.task_status(task_id, root=op_sessions.session_root())
+            op_policy.audit_record(
+                tool="hermes_operator_session_revoke",
+                level=policy.level,
+                apply_mode=policy.apply_mode,
+                dry_run=False,
+                success=True,
+                changed=True,
+                summary="completed logical task via stale-client compatibility selector",
+                extra={
+                    "logical_task_id": task_id,
+                    "authority_kind": "task_bound",
+                    "action": "complete",
+                    "task_state": after.get("task_state"),
+                    "task_authority_valid": after.get("valid"),
+                },
+            )
+            return json.dumps(
+                {
+                    "success": True,
+                    "completed": True,
+                    "logical_task_id": task_id,
+                    "authority_kind": "task_bound",
+                    "task_authority": after,
+                    "compatibility_path": True,
+                },
+                indent=2,
+            )
+
         policy = op_policy.OperatorPolicy()
-        target = (session_id or policy.session_id or "").strip()
+        target = (explicit_target or policy.session_id or "").strip()
         if not target:
             raise ValueError("session_id is required.")
         if policy.session_status == "standing" or target.startswith("sa_"):

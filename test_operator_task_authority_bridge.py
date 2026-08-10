@@ -163,6 +163,25 @@ def test_controller_completion_surface_invalidates_task_and_requires_fresh_reque
     assert replacement_info["status"] == "pending"
 
 
+def test_stale_client_revoke_transport_can_complete_named_active_task(session_env):
+    now = int(time.time())
+    request_id = _request(session_env, task="bridge-compat-complete", now=now)
+    sessions.approve_session_request(request_id, root=session_env, now=now + 1)
+
+    response = json.loads(
+        server.hermes_operator_session_revoke("task:bridge-compat-complete")
+    )
+    assert response["success"] is True
+    assert response["completed"] is True
+    assert response["compatibility_path"] is True
+    assert response["task_authority"]["task_state"] == "completed"
+    assert response["task_authority"]["valid"] is False
+
+    closed = sessions.resolve_effective_authority(now=now + 2)
+    assert closed.is_active is False
+    assert closed.status == "task_bound_inactive"
+
+
 def test_source_session_revoke_revokes_task_authority(session_env):
     now = int(time.time())
     request_id = _request(session_env, task="bridge-revoke", now=now)
