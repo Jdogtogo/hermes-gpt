@@ -403,10 +403,10 @@ def hermes_operator_service_restart(
         # with the authority actually being enforced.
         policy = op.OperatorPolicy()
         policy.require_level("workspace")
-        if policy.session_status != "active" or policy.session_id is None:
+        if policy.session_status not in {"active", "task_bound"} or policy.session_id is None:
             state = policy.session_status or "unknown"
             raise PermissionError(
-                "Operator service restart requires an active, approved Operator "
+                "Operator service restart requires an active, approved Operator or task-bound "
                 f"Session (current session state: {state!r})."
             )
         if policy.policy_template != _OPERATOR_SERVICE_RESTART_TEMPLATE:
@@ -570,10 +570,10 @@ def hermes_approval_web_service_restart(
         # with the authority actually being enforced.
         policy = op.OperatorPolicy()
         policy.require_level("workspace")
-        if policy.session_status != "active" or policy.session_id is None:
+        if policy.session_status not in {"active", "task_bound"} or policy.session_id is None:
             state = policy.session_status or "unknown"
             raise PermissionError(
-                "Approval web service restart requires an active, approved Operator "
+                "Approval web service restart requires an active, approved Operator or task-bound "
                 f"Session (current session state: {state!r})."
             )
         if policy.policy_template not in _APPROVAL_WEB_RESTART_TEMPLATES:

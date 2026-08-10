@@ -929,8 +929,13 @@ def _capture_authority_envelope(
     timeout: int,
 ) -> dict[str, Any]:
     """Capture the immutable, non-secret authority contract for one task."""
+    status = getattr(policy, "session_status", "active")
+    authority_kind = getattr(policy, "authority_kind", None) or (
+        "standing" if status == "standing" else "task_bound" if status == "task_bound" else "session"
+    )
     return {
-        "authority_kind": "standing" if getattr(policy, "session_status", "active") == "standing" else "session",
+        "authority_kind": authority_kind,
+        "logical_task_id": getattr(policy, "logical_task_id", None),
         "session_id": policy.session_id,
         "snapshot_hash": policy.snapshot_hash,
         "expires_at": policy.expires_at,
@@ -956,14 +961,20 @@ def _require_task_authority(task: dict[str, Any]) -> None:
     authority = task.get("authority") or {}
     authority_kind = str(authority.get("authority_kind") or "session")
     try:
-        policy = op.OperatorPolicy(
-            authority_preference="standing" if authority_kind == "standing" else "effective",
-            standing_authority_id=(
-                str(authority.get("session_id"))
-                if authority_kind == "standing" and authority.get("session_id")
-                else None
-            ),
-        )
+        if authority_kind == "task_bound":
+            logical_task_id = str(authority.get("logical_task_id") or "").strip()
+            if not logical_task_id:
+                raise PermissionError("delegated task has no logical task authority id")
+            policy = op.OperatorPolicy(logical_task_id=logical_task_id)
+        else:
+            policy = op.OperatorPolicy(
+                authority_preference="standing" if authority_kind == "standing" else "effective",
+                standing_authority_id=(
+                    str(authority.get("session_id"))
+                    if authority_kind == "standing" and authority.get("session_id")
+                    else None
+                ),
+            )
     except TypeError:
         policy = op.OperatorPolicy()
     policy.require_enabled()
@@ -977,6 +988,15 @@ def _require_task_authority(task: dict[str, Any]) -> None:
     if authority_kind == "standing":
         if getattr(policy, "session_status", "active") != "standing":
             raise PermissionError("originating standing authority is no longer active")
+    elif authority_kind == "task_bound":
+        expected_task_id = str(authority.get("logical_task_id") or "").strip()
+        if getattr(policy, "session_status", "") != "task_bound":
+            raise PermissionError("originating task-bound authority is no longer active")
+        if getattr(policy, "logical_task_id", None) != expected_task_id:
+            raise PermissionError("logical task authority identity changed")
+        hard_expires_at = int(authority.get("expires_at") or 0)
+        if not hard_expires_at or _now() >= hard_expires_at:
+            raise PermissionError("originating task authority reached its hard safety lifetime")
     else:
         expires_at = int(authority.get("expires_at") or 0)
         if not expires_at or _now() >= expires_at:
@@ -1625,6 +1645,25 @@ def _select_delegation_policy(
     grants are never unioned or composed.
     """
     denials: list[str] = []
+    effective = op.OperatorPolicy()
+
+    # A task-bound authority is the first candidate for work already inside
+    # that logical task. It is evaluated as one complete grant and is never
+    # unioned with standing/session capabilities.
+    if getattr(effective, "authority_kind", "session") == "task_bound":
+        error = _delegation_policy_candidate_error(
+            effective,
+            profile=profile,
+            workdir=workdir,
+            mode=mode,
+            allow_web=allow_web,
+        )
+        if error is None:
+            return effective
+        denials.append(
+            f"task_bound:{getattr(effective, 'logical_task_id', None) or 'none'}: {error}"
+        )
+
     eligible_standing: list[op.OperatorPolicy] = []
     for candidate in _standing_delegation_candidates():
         error = _delegation_policy_candidate_error(
@@ -1642,18 +1681,18 @@ def _select_delegation_policy(
     if eligible_standing:
         return min(eligible_standing, key=_policy_privilege_score)
 
-    effective = op.OperatorPolicy()
-    error = _delegation_policy_candidate_error(
-        effective,
-        profile=profile,
-        workdir=workdir,
-        mode=mode,
-        allow_web=allow_web,
-    )
-    if error is None:
-        return effective
-    source = getattr(effective, "path_authority_source", "effective_policy")
-    denials.append(f"{source}:{effective.session_id or 'none'}: {error}")
+    if getattr(effective, "authority_kind", "session") != "task_bound":
+        error = _delegation_policy_candidate_error(
+            effective,
+            profile=profile,
+            workdir=workdir,
+            mode=mode,
+            allow_web=allow_web,
+        )
+        if error is None:
+            return effective
+        source = getattr(effective, "path_authority_source", "effective_policy")
+        denials.append(f"{source}:{effective.session_id or 'none'}: {error}")
 
     raise PermissionError(
         "No single approved authority fully covers this delegated task; "

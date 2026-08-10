@@ -137,7 +137,7 @@ def test_localhost_break_glass_approval_binds_policy_template(session_root):
     assert record.policy["policy_template"] == MAINTENANCE
 
     policy = op.OperatorPolicy()
-    assert policy.session_status == "active"
+    assert policy.session_status == "task_bound"
     assert policy.session_id == record.session_id
     assert policy.policy_template == MAINTENANCE  # single authoritative source
 

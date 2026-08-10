@@ -701,6 +701,8 @@ class OperatorPolicy:
         "session_failure_reason",
         "pointed_session_id",
         "session_approved_at",
+        "authority_kind",
+        "logical_task_id",
     )
 
     def __init__(
@@ -708,6 +710,7 @@ class OperatorPolicy:
         *,
         authority_preference: str = "effective",
         standing_authority_id: str | None = None,
+        logical_task_id: str | None = None,
     ) -> None:
         # Single authoritative resolution path: both status tools and every
         # mutation guard construct OperatorPolicy(). ``authority_preference``
@@ -720,18 +723,25 @@ class OperatorPolicy:
             raise ValueError("authority_preference must be 'effective' or 'standing'.")
         if standing_authority_id is not None and authority_preference != "standing":
             raise ValueError("standing_authority_id requires authority_preference='standing'.")
-        authority = operator_sessions.resolve_effective_authority()
+        if logical_task_id is not None and authority_preference != "effective":
+            raise ValueError("logical_task_id is only valid with authority_preference='effective'.")
+        authority = operator_sessions.resolve_effective_authority(task_id=logical_task_id)
         self.session_status = authority.status
         self.session_failure_reason = authority.failure_reason
         self.pointed_session_id = authority.pointed_session_id
         self.session_approved_at = authority.approved_at
-        session = (
-            operator_sessions.active_session()
+        self.authority_kind = (
+            authority.authority_kind if authority_preference == "effective" else "standing"
+        )
+        self.logical_task_id = (
+            authority.logical_task_id if authority_preference == "effective" else None
+        )
+        snapshot = (
+            authority.policy_snapshot
             if authority_preference == "effective" and authority.is_active
             else None
         )
-        if session is not None:
-            snapshot = session.policy
+        if snapshot is not None:
             self.enabled = True
             raw_level = str(snapshot.get("level") or "workspace").strip().lower()
             self.level = raw_level if raw_level in LEVELS else "workspace"
@@ -786,14 +796,14 @@ class OperatorPolicy:
             self.owner_ack = ""
             self.owner_mode_ready = False
             self.mutation_allowed = self.apply_mode == "direct" and level_rank(self.level) >= level_rank("workspace")
-            self.session_id = session.session_id
-            self.snapshot_hash = session.snapshot_hash
+            self.session_id = authority.session_id
+            self.snapshot_hash = authority.snapshot_hash
             # Sourced from the SAME immutable snapshot as level/verbs/
             # service_units above, so template-scoped guards read exactly the
             # authority that is being enforced -- no second, independently
             # resolved lookup that could disagree.
             self.policy_template = snapshot.get("policy_template") or None
-            self.expires_at = session.expires_at
+            self.expires_at = authority.expires_at
             return
 
         standing, standing_snapshot, standing_hash, standing_failure = _resolve_standing_policy_snapshot(
@@ -855,6 +865,8 @@ class OperatorPolicy:
             self.session_failure_reason = None
             self.pointed_session_id = standing.authority_id
             self.session_approved_at = standing.created_at
+            self.authority_kind = "standing"
+            self.logical_task_id = None
             return
         if standing is not None and standing_failure:
             self.session_status = "standing_invalid"

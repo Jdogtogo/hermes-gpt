@@ -664,6 +664,26 @@ def hermes_operator_status() -> str:
         # hardcoded list, which reflected the default profile and omitted the
         # session tools while wrongly listing owner tools).
         registered = list(REGISTERED_TOOL_NAMES)
+        task_authority = {
+            "label": "TASK_AUTHORITY",
+            "logical_task_id": None,
+            "task_state": "none",
+            "approval_required": True,
+            "missing_capability": None,
+        }
+        if getattr(policy, "logical_task_id", None):
+            try:
+                import operator_task_authority as task_authority_module
+                task_authority = task_authority_module.task_status(policy.logical_task_id)
+                task_authority.setdefault("missing_capability", None)
+            except Exception as exc:
+                task_authority = {
+                    "label": "TASK_AUTHORITY",
+                    "logical_task_id": policy.logical_task_id,
+                    "task_state": "unknown",
+                    "approval_required": True,
+                    "missing_capability": f"task authority status unavailable: {exc.__class__.__name__}",
+                }
         result = {
             "success": True,
             "hermes_gpt_project_path": project_path,
@@ -687,6 +707,7 @@ def hermes_operator_status() -> str:
                 "failure_reason": policy.session_failure_reason,
                 "writable_roots": [str(p) for p in policy.writable_roots] if policy.session_id else [],
             },
+            "task_authority": task_authority,
             "registered_operator_tools": registered,
             "registered_tool_count": len(registered),
             "public_manifest": dict(REGISTERED_MANIFEST_VALIDATION),
@@ -753,6 +774,33 @@ def hermes_operator_session_status() -> str:
                 indent=2,
             )
         oauth_subject, oauth_client_id = op_policy.current_oauth_identity()
+        if policy.session_status == "task_bound":
+            import operator_task_authority as task_authority_module
+            task_state = task_authority_module.task_status(policy.logical_task_id)
+            task_state.setdefault("missing_capability", None)
+            return json.dumps(
+                {
+                    "success": True,
+                    "authority_kind": "task_bound",
+                    "logical_task_id": policy.logical_task_id,
+                    "session_id": policy.session_id,
+                    "snapshot_hash": policy.snapshot_hash,
+                    "issued_at": policy.session_approved_at,
+                    "expires_at": policy.expires_at,
+                    "approval_state": "approved",
+                    "level": policy.level,
+                    "apply_mode": policy.apply_mode,
+                    "readable_roots": [str(p) for p in policy.readable_roots],
+                    "writable_roots": [str(p) for p in policy.writable_roots],
+                    "verbs": policy.verbs,
+                    "task_authority": task_state,
+                    "oauth_subject": oauth_subject,
+                    "oauth_client_id": oauth_client_id,
+                    "owner_mode_ready": False,
+                    "revocation": "task completion/cancellation/revocation or source-session revoke",
+                },
+                indent=2,
+            )
         if policy.session_status == "standing":
             return json.dumps(
                 {
@@ -821,6 +869,11 @@ def hermes_operator_session_request_extension(minutes: int = 30) -> str:
             raise ValueError(
                 "Standing authority has no authorization expiry and cannot be extended; "
                 "set a separate operational watchdog deadline instead."
+            )
+        if policy.session_status == "task_bound":
+            raise ValueError(
+                "Task-bound authority follows the logical task lifecycle and cannot be extended "
+                "with a routine session extension; change task scope or request new authority instead."
             )
         seconds = max(
             60,
@@ -971,6 +1024,19 @@ def hermes_operator_session_request(
             requested_duration_seconds=capped_seconds,
             reason=reason.strip(),
         )
+        request_info = op_sessions.session_request_info(request_id)
+        request_status = str(request_info.get("status") or "pending")
+        logical_task_id = request_info.get("logical_task_id")
+        request_identity = request_info.get("request_identity")
+        already_authorized = False
+        if request_status == "approved" and logical_task_id:
+            try:
+                import operator_task_authority as task_authority_module
+                already_authorized = bool(
+                    task_authority_module.task_status(str(logical_task_id)).get("valid")
+                )
+            except Exception:
+                already_authorized = False
         op_policy.audit_record(
             tool="hermes_operator_session_request",
             level="none",
@@ -986,21 +1052,28 @@ def hermes_operator_session_request(
                 "risk_class": approval_forecast["risk_class"],
                 "risk_tier": approval_forecast["tier"],
                 "risk_factors_hash": approval_forecast["factors_hash"],
+                "logical_task_id": logical_task_id,
+                "request_identity": request_identity,
+                "request_status": request_status,
+                "already_authorized": already_authorized,
             },
         )
-        _notify_pending_request(
-            "session_creation",
-            request_id,
-            {
-                "request_id": request_id,
-                "policy_template": policy_template,
-                "resolved_policy": policy_snapshot,
-                "requested_duration_seconds": capped_seconds,
-                "authority_mode": mode,
-                "approval_forecast": approval_forecast,
-                "reason": reason.strip(),
-            },
-        )
+        if request_status == "pending":
+            _notify_pending_request(
+                "session_creation",
+                request_id,
+                {
+                    "request_id": request_id,
+                    "policy_template": policy_template,
+                    "resolved_policy": policy_snapshot,
+                    "requested_duration_seconds": capped_seconds,
+                    "authority_mode": mode,
+                    "approval_forecast": approval_forecast,
+                    "reason": reason.strip(),
+                    "logical_task_id": logical_task_id,
+                    "request_identity": request_identity,
+                },
+            )
         return json.dumps(
             {
                 "success": True,
@@ -1010,12 +1083,18 @@ def hermes_operator_session_request(
                 "requested_duration_seconds": capped_seconds,
                 "authority_mode": mode,
                 "approval_forecast": approval_forecast,
-                "status": "pending",
+                "logical_task_id": logical_task_id,
+                "request_identity": request_identity,
+                "status": "already_authorized" if already_authorized else request_status,
                 "note": (
-                    "Requires local (Telegram or localhost) approval. Standing mode creates "
-                    "a revocable, policy-bound LOW-risk authority plus a short operational session."
-                    if mode == "standing"
-                    else "Requires local (Telegram or localhost) approval before any session is created."
+                    "Equivalent approved task authority is already active; no new human approval was created."
+                    if already_authorized
+                    else (
+                        "Requires local (Telegram or localhost) approval. Standing mode creates "
+                        "a revocable, policy-bound LOW-risk authority plus a short operational session."
+                        if mode == "standing"
+                        else "Requires local (Telegram or localhost) approval before any authority is created."
+                    )
                 ),
             },
             indent=2,

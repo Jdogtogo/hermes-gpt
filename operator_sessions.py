@@ -100,6 +100,10 @@ class EffectiveAuthority:
     verbs: dict[str, Any]
     is_active: bool
     failure_reason: str | None   # human-readable, secret-free; None when active
+    authority_kind: str = "session"  # session | task_bound
+    logical_task_id: str | None = None
+    source_request_id: str | None = None
+    policy_snapshot: dict[str, Any] | None = None
 
 
 def _session_files_secure(root: Path) -> str | None:
@@ -137,7 +141,7 @@ def session_deployment_configured() -> bool:
     )
 
 
-def resolve_effective_authority(*, now: int | None = None) -> EffectiveAuthority:
+def resolve_effective_authority(*, now: int | None = None, task_id: str | None = None) -> EffectiveAuthority:
     """Resolve the runtime's effective operator authority from the
     authoritative session record (pointer file first, env id fallback),
     classifying every non-active outcome instead of collapsing them to None.
@@ -167,16 +171,32 @@ def resolve_effective_authority(*, now: int | None = None) -> EffectiveAuthority
         return _closed("malformed", None, f"Session root could not be resolved: {exc.__class__.__name__}.")
 
     sid = ""
-    try:
-        pointer_path = _active_pointer_path(root)
-        if pointer_path.is_file():
-            sid = pointer_path.read_text(encoding="utf-8").strip()
-    except Exception:
-        return _closed("malformed", None, "Active-session pointer exists but could not be read.")
-    if not sid:
-        sid = os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip()
-    if not sid:
-        return _closed("none_configured", None, "No operator session is configured for this deployment.")
+    if task_id:
+        try:
+            with _connect(root) as connection:
+                binding = connection.execute(
+                    "SELECT resulting_session_id FROM session_creation_requests "
+                    "WHERE logical_task_id = ? AND status = 'approved' "
+                    "AND resulting_session_id IS NOT NULL ORDER BY decided_at DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            if binding is not None:
+                sid = str(binding["resulting_session_id"] or "").strip()
+        except Exception as exc:
+            return _closed("malformed", None, f"Task binding could not be resolved: {exc.__class__.__name__}.")
+        if not sid:
+            return _closed("task_missing", None, f"No approved operator authority is bound to logical task {task_id!r}.")
+    else:
+        try:
+            pointer_path = _active_pointer_path(root)
+            if pointer_path.is_file():
+                sid = pointer_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return _closed("malformed", None, "Active-session pointer exists but could not be read.")
+        if not sid:
+            sid = os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip()
+        if not sid:
+            return _closed("none_configured", None, "No operator session is configured for this deployment.")
 
     perm_reason = _session_files_secure(root)
     if perm_reason is not None:
@@ -211,6 +231,93 @@ def resolve_effective_authority(*, now: int | None = None) -> EffectiveAuthority
             f"Operator session {sid!r} was revoked at {int(row['revoked_at'])}.",
             approved_at=created_at, expires_at=expires_at,
         )
+
+    # Task-Bound Authority v2: once an approved session request has minted a
+    # logical task authority, the task lifecycle becomes authoritative. The
+    # original immutable session snapshot remains the capability envelope, but
+    # the routine session wall-clock no longer tears authority down mid-task.
+    try:
+        with _connect(root) as connection:
+            binding = connection.execute(
+                "SELECT request_id, logical_task_id FROM session_creation_requests "
+                "WHERE resulting_session_id = ? AND status = 'approved' "
+                "AND logical_task_id IS NOT NULL ORDER BY decided_at DESC LIMIT 1",
+                (sid,),
+            ).fetchone()
+    except Exception as exc:
+        return _closed("malformed", sid, f"Task binding store could not be read: {exc.__class__.__name__}.")
+
+    if binding is not None and str(binding["logical_task_id"] or "").strip():
+        bound_task_id = str(binding["logical_task_id"]).strip()
+        if task_id and bound_task_id != task_id:
+            return _closed(
+                "task_mismatch", sid,
+                f"Operator session {sid!r} is bound to logical task {bound_task_id!r}, not {task_id!r}.",
+                approved_at=created_at, expires_at=expires_at,
+            )
+        try:
+            import operator_task_authority as task_authority
+            task_state = task_authority.task_status(bound_task_id, root=root, now=current)
+        except Exception as exc:
+            return _closed("malformed", sid, f"Task authority store could not be read: {exc.__class__.__name__}.")
+        if not bool(task_state.get("valid")):
+            reason = str(task_state.get("selection_reason") or task_state.get("task_state") or "inactive")
+            return _closed(
+                "task_bound_inactive", sid,
+                f"Logical task {bound_task_id!r} is no longer active: {reason}.",
+                approved_at=created_at,
+                expires_at=(int(task_state["hard_expires_at"]) if task_state.get("hard_expires_at") else None),
+            )
+        try:
+            snapshot = json.loads(str(row["canonical_json"]))
+            if not isinstance(snapshot, dict):
+                raise ValueError("snapshot is not an object")
+        except Exception:
+            return _closed(
+                "malformed", sid,
+                f"Operator session {sid!r} has a malformed policy snapshot.",
+                approved_at=created_at, expires_at=expires_at,
+            )
+        raw_level = str(snapshot.get("level") or "workspace").strip().lower()
+        level = raw_level if raw_level in _POLICY_LEVELS else "workspace"
+        raw_mode = str(snapshot.get("apply_mode") or "direct").strip().lower()
+        apply_mode = raw_mode if raw_mode in {"dry_run", "direct"} else "direct"
+        writable = [str(p) for p in snapshot.get("writable_roots", [])]
+        if level == "workspace" and not writable:
+            return _closed(
+                "malformed", sid,
+                f"Task-bound snapshot for {bound_task_id!r} grants workspace level but has no writable roots.",
+                approved_at=created_at,
+                expires_at=(int(task_state["hard_expires_at"]) if task_state.get("hard_expires_at") else None),
+            )
+        return EffectiveAuthority(
+            session_id=sid,
+            pointed_session_id=sid,
+            status="task_bound",
+            level=level,
+            apply_mode=apply_mode,
+            approved_at=created_at,
+            expires_at=int(task_state["hard_expires_at"]),
+            policy_template=(str(snapshot["policy_template"]) if snapshot.get("policy_template") else None),
+            snapshot_hash=str(row["snapshot_hash"]),
+            readable_roots=[str(p) for p in snapshot.get("readable_roots", [])],
+            writable_roots=writable,
+            verbs=dict(snapshot.get("verbs", {})),
+            is_active=True,
+            failure_reason=None,
+            authority_kind="task_bound",
+            logical_task_id=bound_task_id,
+            source_request_id=str(binding["request_id"]),
+            policy_snapshot=snapshot,
+        )
+
+    if task_id:
+        return _closed(
+            "task_missing", sid,
+            f"Operator session {sid!r} has no active Task-Bound Authority binding for {task_id!r}.",
+            approved_at=created_at, expires_at=expires_at,
+        )
+
     if expires_at < current:
         return _closed(
             "expired", sid,
@@ -257,6 +364,8 @@ def resolve_effective_authority(*, now: int | None = None) -> EffectiveAuthority
         verbs=dict(snapshot.get("verbs", {})),
         is_active=True,
         failure_reason=None,
+        authority_kind="session",
+        policy_snapshot=snapshot,
     )
 
 
@@ -440,6 +549,22 @@ def _connect(root: Path | None = None) -> sqlite3.Connection:
         connection.execute(
             "ALTER TABLE operator_sessions ADD COLUMN policy_max_duration_seconds INTEGER"
         )
+    request_columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(session_creation_requests)").fetchall()
+    }
+    if "logical_task_id" not in request_columns:
+        connection.execute("ALTER TABLE session_creation_requests ADD COLUMN logical_task_id TEXT")
+    if "request_identity" not in request_columns:
+        connection.execute("ALTER TABLE session_creation_requests ADD COLUMN request_identity TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_request_identity "
+        "ON session_creation_requests(request_identity, status)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_request_task "
+        "ON session_creation_requests(logical_task_id, status)"
+    )
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -604,11 +729,34 @@ def _audit_extension_request(
 
 def revoke_session(session_id: str, *, root: Path | None = None, now: int | None = None) -> bool:
     current = int(time.time() if now is None else now)
+    logical_task_id: str | None = None
     with _connect(root) as connection:
+        binding = connection.execute(
+            "SELECT logical_task_id FROM session_creation_requests "
+            "WHERE resulting_session_id = ? AND status = 'approved' "
+            "ORDER BY decided_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if binding is not None and binding["logical_task_id"]:
+            logical_task_id = str(binding["logical_task_id"])
         changed = connection.execute(
             "UPDATE operator_sessions SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL",
             (current, session_id),
         ).rowcount
+    if logical_task_id:
+        try:
+            import operator_task_authority as task_authority
+            status = task_authority.task_status(logical_task_id, root=root)
+            if status.get("task_state") not in {"revoked", "completed", "cancelled", "none"}:
+                task_authority.revoke_task(
+                    logical_task_id,
+                    actor="operator_session_revoke",
+                    root=root,
+                )
+        except Exception:
+            # Session revocation itself remains fail-safe and authoritative even
+            # if the auxiliary task audit store is unavailable.
+            pass
     return changed > 0
 
 
@@ -734,6 +882,133 @@ def deny_extension(
     return changed > 0
 
 
+def derive_logical_task_id(*, policy_template: str, resolved_policy: dict[str, Any], reason: str) -> str:
+    """Derive a stable logical task id without expanding the public MCP schema.
+
+    Callers may include ``[task:<stable-id>]`` in the reason for an explicit
+    work-package identity. Otherwise the first reason clause plus the exact
+    approved roots forms a deterministic compatibility identity.
+    """
+    import operator_task_authority as task_authority
+
+    compact_reason = " ".join(str(reason or "").split())
+    lower = compact_reason.lower()
+    marker = "[task:"
+    if marker in lower:
+        start = lower.index(marker) + len(marker)
+        end = compact_reason.find("]", start)
+        if end > start:
+            explicit = compact_reason[start:end].strip()
+            if explicit and all(ch.isalnum() or ch in "._:-" for ch in explicit):
+                return explicit
+    logical_name = compact_reason
+    for separator in (" — ", " - ", ". "):
+        if separator in logical_name:
+            logical_name = logical_name.split(separator, 1)[0].strip()
+            break
+    logical_name = logical_name or policy_template
+    normalized = normalize_policy({**resolved_policy, "policy_template": policy_template})
+    roots = normalized.get("writable_roots") or normalized.get("readable_roots") or []
+    root_key = "|".join(str(item) for item in roots)
+    return task_authority.make_task_id(f"{policy_template}:{logical_name}", worktree=root_key)
+
+
+def task_envelope_from_policy(*, policy_template: str, resolved_policy: dict[str, Any]):
+    import operator_task_authority as task_authority
+
+    normalized = normalize_policy({**resolved_policy, "policy_template": policy_template})
+    return task_authority.envelope_from_policy(
+        normalized,
+        task_class=f"operator:{policy_template}",
+    )
+
+
+def session_request_info(request_id: str, *, root: Path | None = None) -> dict[str, Any]:
+    with _connect(root) as connection:
+        row = connection.execute(
+            "SELECT request_id, policy_template, status, created_at, expires_at, decided_at, "
+            "resulting_session_id, logical_task_id, request_identity FROM session_creation_requests "
+            "WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    return dict(row) if row is not None else {}
+
+
+def bind_approved_session_request_to_task_authority(
+    request_id: str,
+    *,
+    root: Path | None = None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Upgrade one still-valid legacy approved session request into v2 task authority.
+
+    This does not create or approve a request. It is valid only for a request
+    already approved by a human through the existing approval path, and it
+    reuses that request's immutable session snapshot exactly. It exists so a
+    deployment can adopt Task-Bound Authority v2 without forcing duplicate
+    approval solely because the code was upgraded mid-task.
+    """
+    current = int(time.time() if now is None else now)
+    with _connect(root) as connection:
+        row = connection.execute(
+            "SELECT request_id, policy_template, resolved_policy_json, reason, status, "
+            "decided_by, resulting_session_id, logical_task_id, request_identity "
+            "FROM session_creation_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError("Session request does not exist or has expired.")
+    if str(row["status"]) != "approved":
+        raise PermissionError("Only an already human-approved session request can be task-bound.")
+    session_id = str(row["resulting_session_id"] or "").strip()
+    if not session_id:
+        raise PermissionError("Approved session request has no resulting session to bind.")
+
+    # load_session deliberately requires the source session still to be active.
+    # An expired/revoked legacy session cannot be resurrected by this migration.
+    record = load_session(session_id, root=root, now=current)
+    template_name = str(row["policy_template"] or "").strip()
+    if not template_name:
+        raise SessionPolicyInvariantError("Approved session request has no policy template.")
+    task_id = str(row["logical_task_id"] or "").strip() or derive_logical_task_id(
+        policy_template=template_name,
+        resolved_policy=record.policy,
+        reason=str(row["reason"] or ""),
+    )
+
+    import operator_task_authority as task_authority
+    envelope = task_authority.envelope_from_policy(
+        record.policy,
+        task_class=f"operator:{template_name}",
+    )
+    identity = task_authority.request_identity(task_id, envelope, template_name)
+    with _connect(root) as connection:
+        connection.execute(
+            "UPDATE session_creation_requests SET logical_task_id=?, request_identity=? "
+            "WHERE request_id=? AND status='approved'",
+            (task_id, identity, request_id),
+        )
+        connection.commit()
+    authority = task_authority.grant_external_approval(
+        task_id=task_id,
+        envelope=envelope,
+        policy_class=template_name,
+        source_id=request_id,
+        approved_by=f"upgrade:{str(row['decided_by'] or 'human-approved')}",
+        root=root,
+        now=current,
+    )
+    return {
+        "label": "TASK_AUTHORITY",
+        "logical_task_id": task_id,
+        "source_request_id": request_id,
+        "source_session_id": session_id,
+        "hard_expires_at": authority.hard_expires_at,
+        "request_identity": identity,
+        "migrated": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Session-creation requests (request-only; approval creates the session)
 # ---------------------------------------------------------------------------
@@ -757,26 +1032,69 @@ def request_session(
     request_id: str | None = None,
 ) -> str:
     current = int(time.time() if now is None else now)
-    rid = request_id or f"sr_{secrets.token_hex(4)}"
     expires_at = current + SESSION_REQUEST_TTL_SECONDS
+    task_id = derive_logical_task_id(
+        policy_template=policy_template,
+        resolved_policy=resolved_policy,
+        reason=reason,
+    )
+    import operator_task_authority as task_authority
+    envelope = task_envelope_from_policy(
+        policy_template=policy_template,
+        resolved_policy=resolved_policy,
+    )
+    identity = task_authority.request_identity(task_id, envelope, policy_template)
+
     superseded: list[tuple[str, str]] = []
     with _connect(root) as connection:
+        connection.execute(
+            "UPDATE session_creation_requests SET status='expired' "
+            "WHERE status='pending' AND expires_at < ?",
+            (current,),
+        )
+        equivalent = connection.execute(
+            "SELECT request_id, status, resulting_session_id FROM session_creation_requests "
+            "WHERE request_identity = ? AND status IN ('pending','approved') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (identity,),
+        ).fetchone()
+        if equivalent is not None:
+            existing_id = str(equivalent["request_id"])
+            if str(equivalent["status"]) == "pending":
+                return existing_id
+            try:
+                state = task_authority.task_status(task_id, root=root, now=current)
+            except Exception:
+                state = {}
+            if bool(state.get("valid")):
+                return existing_id
+
+        # Supersede only materially different pending requests for THIS logical
+        # task. Unrelated tasks may coexist; equivalent requests are reused.
         rows = connection.execute(
             "SELECT request_id, policy_template FROM session_creation_requests "
-            "WHERE status = 'pending' ORDER BY created_at, request_id"
+            "WHERE logical_task_id = ? AND status = 'pending' "
+            "AND (request_identity IS NULL OR request_identity <> ?) "
+            "ORDER BY created_at, request_id",
+            (task_id, identity),
         ).fetchall()
         superseded = [(str(row["request_id"]), str(row["policy_template"])) for row in rows]
         if superseded:
+            new_rid = request_id or f"sr_{secrets.token_hex(4)}"
             connection.execute(
                 "UPDATE session_creation_requests SET status = 'superseded', "
-                "decided_by = ?, decided_at = ? WHERE status = 'pending'",
-                (f"system:newer-request:{rid}", current),
+                "decided_by = ?, decided_at = ? WHERE logical_task_id = ? "
+                "AND status = 'pending' AND (request_identity IS NULL OR request_identity <> ?)",
+                (f"system:material-scope-change:{new_rid}", current, task_id, identity),
             )
+            rid = new_rid
+        else:
+            rid = request_id or f"sr_{secrets.token_hex(4)}"
         connection.execute(
             "INSERT INTO session_creation_requests"
             "(request_id, policy_template, resolved_policy_json, requested_duration_seconds, "
-            "reason, status, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            "reason, status, created_at, expires_at, logical_task_id, request_identity) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
             (
                 rid,
                 policy_template,
@@ -785,6 +1103,8 @@ def request_session(
                 reason,
                 current,
                 expires_at,
+                task_id,
+                identity,
             ),
         )
     for superseded_id, superseded_template in superseded:
@@ -792,10 +1112,12 @@ def request_session(
             request_id=superseded_id,
             request_type="session_creation",
             decision="superseded",
-            decided_by=f"system:newer-request:{rid}",
+            decided_by=f"system:material-scope-change:{rid}",
             extra={
                 "policy_template": superseded_template,
                 "superseded_by_request_id": rid,
+                "logical_task_id": task_id,
+                "supersede_reason": "material_scope_change",
             },
         )
     return rid
@@ -833,8 +1155,9 @@ def approve_session_request(
     current = int(time.time() if now is None else now)
     with _connect(root) as connection:
         row = connection.execute(
-            "SELECT policy_template, resolved_policy_json, requested_duration_seconds, "
-            "status, expires_at FROM session_creation_requests WHERE request_id = ?",
+            "SELECT policy_template, resolved_policy_json, requested_duration_seconds, reason, "
+            "status, expires_at, logical_task_id, request_identity "
+            "FROM session_creation_requests WHERE request_id = ?",
             (request_id,),
         ).fetchone()
         if row is None:
@@ -861,6 +1184,11 @@ def approve_session_request(
                 "refusing to approve an unbound operator session."
             )
         policy["policy_template"] = template_name
+        logical_task_id = str(row["logical_task_id"] or "").strip() or derive_logical_task_id(
+            policy_template=template_name,
+            resolved_policy=policy,
+            reason=str(row["reason"] or ""),
+        )
         duration = int(row["requested_duration_seconds"])
         authority_mode = str(policy.get("authority_mode") or "session").strip().lower()
         from operator_risk import (
@@ -920,6 +1248,40 @@ def approve_session_request(
             # into an ordinary approved write session.
             revoke_session(record.session_id, root=root, now=current)
             raise
+    # Bridge the already-approved immutable session snapshot into a durable
+    # task-bound lifecycle. This happens only AFTER the existing risk gate and
+    # human approval have succeeded; it cannot mint authority independently.
+    task_record = None
+    try:
+        import operator_task_authority as task_authority
+        task_record = task_authority.grant_external_approval(
+            task_id=logical_task_id,
+            envelope=task_authority.envelope_from_policy(
+                normalized,
+                task_class=f"operator:{template_name}",
+            ),
+            policy_class=template_name,
+            source_id=request_id,
+            approved_by=decided_by,
+            root=root,
+            now=current,
+        )
+    except Exception:
+        revoke_session(record.session_id, root=root, now=current)
+        if standing_authority_id:
+            try:
+                from operator_standing_authority import revoke_standing_authority
+                revoke_standing_authority(
+                    standing_authority_id,
+                    revoked_by="task-bound-authority-bridge",
+                    reason="task-bound grant failed atomically",
+                    root=root,
+                    now=current,
+                )
+            except Exception:
+                pass
+        raise
+
     # Update the live pointer so the already-running server picks this up on
     # its very next tool call — no restart needed.
     _write_active_pointer(record.session_id, root=root)
@@ -948,6 +1310,9 @@ def approve_session_request(
             "baseline_guard_verified": approval_risk_factors.baseline_guard_verified,
             "authorization_expires_at": None if authority_mode == "standing" else record.expires_at,
             "operational_deadline": record.expires_at if authority_mode == "standing" else None,
+            "logical_task_id": logical_task_id,
+            "task_authority_source_id": request_id,
+            "task_hard_expires_at": task_record.hard_expires_at if task_record is not None else None,
             "approver": decided_by,
         },
     )

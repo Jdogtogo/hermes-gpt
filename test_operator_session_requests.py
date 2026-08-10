@@ -57,45 +57,44 @@ def test_request_session_creates_no_authority(session_env):
     assert pending[0]["resolved_policy"] == resolved["policy"]
 
 
-def test_new_session_request_supersedes_older_pending_request(session_env, audit_override):
+def test_unrelated_session_requests_do_not_supersede_each_other(session_env, audit_override):
     sandbox = templates.resolve_template("sandbox")
     maintenance = templates.resolve_template("hermes-gpt-operator-maintenance")
-    old_request = sessions.request_session(
+    first = sessions.request_session(
         policy_template="sandbox",
         resolved_policy=sandbox["policy"],
         requested_duration_seconds=3600,
-        reason="old request",
+        reason="[task:unrelated-old] old request",
         root=session_env,
         now=2_000_000_000,
         request_id="sr_old",
     )
-    new_request = sessions.request_session(
+    second = sessions.request_session(
         policy_template="hermes-gpt-operator-maintenance",
         resolved_policy=maintenance["policy"],
         requested_duration_seconds=3600,
-        reason="new request",
+        reason="[task:unrelated-new] new request",
         root=session_env,
         now=2_000_000_001,
         request_id="sr_new",
     )
 
-    assert old_request == "sr_old"
-    assert new_request == "sr_new"
+    assert first == "sr_old"
+    assert second == "sr_new"
     pending = sessions.list_pending_session_requests(root=session_env)
-    assert [item["request_id"] for item in pending] == ["sr_new"]
-    with pytest.raises(ValueError, match="already superseded"):
-        sessions.approve_session_request("sr_old", root=session_env, now=2_000_000_002)
+    assert [item["request_id"] for item in pending] == ["sr_old", "sr_new"]
 
-    approved = sessions.approve_session_request("sr_new", root=session_env, now=2_000_000_002)
-    assert approved.policy["policy_template"] == "hermes-gpt-operator-maintenance"
+    approved_old = sessions.approve_session_request("sr_old", root=session_env, now=2_000_000_002)
+    approved_new = sessions.approve_session_request("sr_new", root=session_env, now=2_000_000_003)
+    assert approved_old.policy["policy_template"] == "sandbox"
+    assert approved_new.policy["policy_template"] == "hermes-gpt-operator-maintenance"
+
     audit = op.audit_tail(limit=20)
     superseded = [
         record for record in audit
         if record.get("tool") == "session_approval" and record.get("decision") == "superseded"
     ]
-    assert superseded
-    assert superseded[-1]["request_id"] == "sr_old"
-    assert superseded[-1]["superseded_by_request_id"] == "sr_new"
+    assert superseded == []
 
 
 def test_unknown_policy_template_rejected_before_any_request_exists():
