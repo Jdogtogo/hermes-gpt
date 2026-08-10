@@ -241,17 +241,16 @@ def test_legacy_approved_request_can_be_bound_without_duplicate_approval(session
         connection.execute("DELETE FROM task_authorities WHERE task_id=?", ("bridge-upgrade",))
         connection.commit()
 
-    before = sessions.resolve_effective_authority(now=now + 2)
-    assert before.status == "active"  # legacy session remains valid, but not task-bound yet
+    # The first normal sidecar resolution performs the one-time migration
+    # from the already-approved legacy row. No second approval/request exists.
+    migrated = sessions.resolve_effective_authority(now=now + 2)
+    assert migrated.status == "task_bound"
+    assert migrated.logical_task_id == "bridge-upgrade"
+    assert migrated.session_id == record.session_id
+    assert migrated.source_request_id == request_id
 
-    migrated = sessions.bind_approved_session_request_to_task_authority(
-        request_id,
-        root=session_env,
-        now=now + 3,
-    )
-    assert migrated["logical_task_id"] == "bridge-upgrade"
-    assert migrated["source_request_id"] == request_id
-    assert migrated["source_session_id"] == record.session_id
+    pending = sessions.list_pending_session_requests(root=session_env)
+    assert pending == []
 
     after = sessions.resolve_effective_authority(now=record.expires_at + 1)
     assert after.status == "task_bound"

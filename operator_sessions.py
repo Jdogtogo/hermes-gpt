@@ -241,11 +241,31 @@ def resolve_effective_authority(*, now: int | None = None, task_id: str | None =
             binding = connection.execute(
                 "SELECT request_id, logical_task_id FROM session_creation_requests "
                 "WHERE resulting_session_id = ? AND status = 'approved' "
-                "AND logical_task_id IS NOT NULL ORDER BY decided_at DESC LIMIT 1",
+                "ORDER BY decided_at DESC LIMIT 1",
                 (sid,),
             ).fetchone()
     except Exception as exc:
         return _closed("malformed", sid, f"Task binding store could not be read: {exc.__class__.__name__}.")
+
+    # Upgrade compatibility: an already-approved session may have been minted
+    # before v2 columns/bindings existed. Bind that exact approved snapshot on
+    # first resolution rather than forcing a duplicate human approval merely
+    # because the service was upgraded mid-task. If migration cannot be
+    # completed, preserve the still-valid legacy session path; never create
+    # authority from an unapproved/expired/revoked request.
+    if binding is not None and not str(binding["logical_task_id"] or "").strip():
+        try:
+            migrated = bind_approved_session_request_to_task_authority(
+                str(binding["request_id"]),
+                root=root,
+                now=current,
+            )
+            binding = {
+                "request_id": str(binding["request_id"]),
+                "logical_task_id": str(migrated["logical_task_id"]),
+            }
+        except Exception:
+            binding = None
 
     if binding is not None and str(binding["logical_task_id"] or "").strip():
         bound_task_id = str(binding["logical_task_id"]).strip()
