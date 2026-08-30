@@ -359,6 +359,51 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
         "baseline_required": False,
     },
+    "hermes-controller-release": {
+        "active": True,
+        "description": (
+            "One-purpose authority to publish the exact clean ChatGPT Controller HEAD to the "
+            "configured GitHub origin on the fixed Controller branch. No force-push, arbitrary "
+            "remote, arbitrary branch, filesystem mutation, service change, credentials, or other "
+            "network operation is granted."
+        ),
+        "risk_tier": 3,
+        "standing_authority_eligible": False,
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt/.release-preservation",
+            ],
+            "writable_roots": [],
+            "egress_hosts": ["github.com"],
+            "service_units": [],
+            "verbs": {"git": ["push"]},
+            "containment_strength": "process",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "branch_guard_verified": True,
+            "baseline_guard_verified": True,
+            "single_writer_verified": True,
+            "untracked_delete_protected": True,
+            "version_controlled_rollback": True,
+            "deliverable_verification_required": True,
+            "deliverable_verification_verified": False,
+            "data_sensitivity": "internal",
+            "production_effect": "release",
+            "paid_route_change": "none",
+            "has_secret_access": False,
+            "has_credential_access": False,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": True,
+            "has_deployment": True,
+        },
+        "max_duration_seconds": 60 * 60,
+        "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
+        "baseline_required": True,
+    },
     "hermes-exec-first-safe-model": {
         "active": True,
         "description": (

@@ -18,6 +18,7 @@ import operator_skills as op_skills
 import operator_config as op_config
 import operator_workspace as op_workspace
 import operator_release as op_release
+import operator_controller_publish as op_controller_publish
 import operator_diagnostics as op_diagnostics
 import operator_computer_use_diagnostics as op_computer_use
 import operator_windows_app_control as op_windows_app
@@ -1892,6 +1893,11 @@ def hermes_restricted_agent_run(
 
 
 
+def hermes_controller_publish(expected_commit: str, dry_run: bool = True) -> str:
+    """Publish the exact clean Controller HEAD through the fixed governed release surface."""
+    return op_controller_publish.hermes_controller_publish(expected_commit, dry_run=dry_run)
+
+
 def build_server(
     *,
     host: str = "127.0.0.1",
@@ -2000,6 +2006,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_workspace_exec,
         hermes_workspace_git_commit,
         hermes_routing_release_v019,
+        hermes_controller_publish,
         hermes_first_safe_model_prepare,
         hermes_first_safe_model_verify,
         hermes_first_safe_provision_prepare,
@@ -2072,6 +2079,13 @@ def register_tools(
     # (readOnlyHint=False) and are only declared non-destructive, closed-world
     # and locally scoped, which is what they are.
     explicit_tool_annotations = {
+        "hermes_controller_publish": ToolAnnotations(
+            title="Publish the exact clean Controller HEAD to its fixed origin branch",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
         # FIRST_SAFE, stated truthfully rather than left to the MCP spec
         # defaults (readOnlyHint=false, destructiveHint=true, openWorldHint=true)
         # that an un-annotated tool inherits.

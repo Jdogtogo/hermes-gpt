@@ -16,8 +16,8 @@ from typing import Any
 # hermes_first_safe_model_verify (read-only evidence). Execution moved to
 # first_safe_worker.py, a trusted host-side worker deliberately NOT part of this
 # public surface. Net effect: 45 -> 46 tools, and no tool that reaches the VM.
-MANIFEST_VERSION = "1.6.0"
-EXPECTED_TOOL_COUNT = 50
+MANIFEST_VERSION = "1.7.0"
+EXPECTED_TOOL_COUNT = 51
 
 # Canonical public surface for the authenticated ChatGPT operator connector.
 # This is intentionally independent of registration order.
@@ -28,6 +28,7 @@ CANONICAL_TOOL_NAMES = tuple(
             "hermes_computer_use_status",
             "hermes_computer_use_doctor",
             "hermes_claude_desktop_restart",
+            "hermes_controller_publish",
             "hermes_antigravity_dispatch",
             "hermes_antigravity_dispatch_cancel",
             "hermes_antigravity_dispatch_status",
@@ -88,7 +89,7 @@ if len(CANONICAL_TOOL_NAMES) != EXPECTED_TOOL_COUNT:
 # 1.2.0 was c068da8c29c0be1fca941a4e2060f2bfff694266d9a23b5b70e08ec7abf3f99f
 # (45 tools, hermes_exec_first_safe_model present). Re-pinned for 1.3.0 after the
 # deliberate FIRST_SAFE prepare/verify split described above.
-EXPECTED_SCHEMA_FINGERPRINT = "9773baeda42866c6dacace88791204d82802dd6187b59c495b56e007b9194fa0"
+EXPECTED_SCHEMA_FINGERPRINT = "b9dbf9f2381fe7417e9b9122c7c90938cc20ec231b9dd039d5877faa8f6a00d3"
 
 
 def _canonicalize(value: Any) -> Any:

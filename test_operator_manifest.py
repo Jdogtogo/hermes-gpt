@@ -127,14 +127,15 @@ def test_validate_manifest_reports_schema_drift_when_names_match():
     assert result["issues"] == ["schema_drift"]
 
 
-def test_canonical_chatgpt_operator_name_manifest_is_50_tools():
-    # 50 as of manifest 1.6.0: adds the fixed-purpose FIRST_SAFE provisioning
-    # execute surface between prepare and verify while preserving the separate
-    # trusted worker implementation and authority/lease binding.
-    assert manifest.MANIFEST_VERSION == "1.6.0"
-    assert manifest.EXPECTED_TOOL_COUNT == 50
-    assert len(manifest.CANONICAL_TOOL_NAMES) == 50
-    assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 50
+def test_canonical_chatgpt_operator_name_manifest_is_51_tools():
+    # 51 as of manifest 1.7.0: adds the fixed-purpose Controller publication
+    # surface. It can only publish the exact clean fixed branch to its configured
+    # GitHub origin and exposes no generic networked Git command surface.
+    assert manifest.MANIFEST_VERSION == "1.7.0"
+    assert manifest.EXPECTED_TOOL_COUNT == 51
+    assert len(manifest.CANONICAL_TOOL_NAMES) == 51
+    assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 51
+    assert "hermes_controller_publish" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_routing_release_v019" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_first_safe_model_prepare" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_first_safe_model_verify" in manifest.CANONICAL_TOOL_NAMES
