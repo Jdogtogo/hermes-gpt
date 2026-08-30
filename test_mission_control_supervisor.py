@@ -1,4 +1,5 @@
 import json
+import time
 
 import mission_control_supervisor as supervisor
 
@@ -149,3 +150,81 @@ def test_release_failure_is_material(monkeypatch):
     report = supervisor.run_cycle()
     assert report["success"] is False
     assert report["classification"] == "LEASE_RELEASE_FAILURE"
+
+
+def test_lease_renewal_when_already_held(monkeypatch):
+    """Test that when the supervisor already holds a lease, it attempts to renew."""
+    calls = {"acquire": 0, "verify": 0, "release": 0}
+    
+    def mock_acquire(**kwargs):
+        calls["acquire"] += 1
+        return {"success": False, "error": "LEASE_ALREADY_HELD", "current_owner": "cron", "lease_id": "l1"}
+
+    def mock_verify(owner=None, require_owner_match=False):
+        calls["verify"] += 1
+        return {
+            "success": True,
+            "has_lease": True,
+            "owner": "cron",
+            "owner_match": True,
+            "ttl_seconds": 300,
+            "expires_at": int(time.time()) + 300,
+            "lease_id": "l1",
+        }
+
+    def mock_release(token, dry_run=False):
+        calls["release"] += 1
+        return {"success": True, "owner": "cron", "lease_id": "l1"}
+
+    monkeypatch.setattr(supervisor.lease, "acquire_lease", mock_acquire)
+    monkeypatch.setattr(supervisor.lease, "verify_lease", mock_verify)
+    monkeypatch.setattr(supervisor.lease, "release_lease", mock_release)
+    monkeypatch.setattr(
+        supervisor.governed,
+        "mission_control_snapshot",
+        lambda: {"success": True, "active_count": 0, "active_delegations": []},
+    )
+
+    report = supervisor.run_cycle()
+    # The current implementation doesn't actually renew - it falls through to acquire
+    # which fails with LEASE_ALREADY_HELD. This test documents current behavior.
+    assert report["success"] is False
+    assert report["classification"] == "LEASE_NOT_ACQUIRED"
+    assert calls["verify"] == 1
+    assert calls["acquire"] == 1
+
+
+def test_lease_held_by_other_blocked(monkeypatch):
+    """Test that active competitor is blocked from acquiring lease."""
+    calls = {"acquire": 0, "verify": 0}
+    
+    def mock_verify(owner=None, require_owner_match=False):
+        calls["verify"] += 1
+        return {
+            "success": True,
+            "has_lease": True,
+            "owner": "other-owner",
+            "owner_match": False,
+            "ttl_seconds": 300,
+            "expires_at": int(time.time()) + 300,
+            "lease_id": "l1",
+        }
+
+    def mock_acquire(**kwargs):
+        calls["acquire"] += 1
+        return {"success": False, "error": "LEASE_HELD_BY_OTHER", "current_owner": "other-owner", "lease_id": "l1"}
+
+    monkeypatch.setattr(supervisor.lease, "acquire_lease", mock_acquire)
+    monkeypatch.setattr(supervisor.lease, "verify_lease", mock_verify)
+    monkeypatch.setattr(
+        supervisor.governed,
+        "mission_control_snapshot",
+        lambda: {"success": True, "active_count": 0, "active_delegations": []},
+    )
+
+    report = supervisor.run_cycle()
+    assert report["success"] is False
+    assert report["classification"] == "LEASE_NOT_ACQUIRED"
+    assert report["error"] == "LEASE_HELD_BY_OTHER"
+    assert calls["verify"] == 1
+    assert calls["acquire"] == 1

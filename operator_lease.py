@@ -39,14 +39,18 @@ def _lease_lock() -> Iterator[None]:
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-# Lease duration in seconds (default 1 hour, configurable via env)
+# Lease duration in seconds (default 10 minutes, configurable via env)
+# Reduced from 1 hour to limit friction from stale/abandoned leases.
+# Workflows that need longer hold must explicitly renew.
 DEFAULT_LEASE_DURATION_SECONDS = int(
-    os.environ.get("HERMES_MISSION_CONTROL_LEASE_TTL", str(60 * 60))
+    os.environ.get("HERMES_MISSION_CONTROL_LEASE_TTL", str(10 * 60))
 )
 # Maximum allowed lease duration (12 hours)
 MAX_LEASE_DURATION_SECONDS = 12 * 60 * 60
 # Minimum allowed lease duration (1 minute)
 MIN_LEASE_DURATION_SECONDS = 60
+# Maximum lease renewals before requiring full reacquisition (prevents indefinite extension)
+MAX_RENEWALS = 12  # 12 * 10min = 2 hours max continuous hold
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,7 @@ class LeaseState:
     issued_at: int                # Unix timestamp when lease was acquired
     expires_at: int               # Unix timestamp when lease expires
     lease_id: str                 # Unique lease identifier for this acquisition
+    renewal_count: int = 0        # Number of times this lease has been renewed
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -88,6 +93,7 @@ def _read_lease_state() -> LeaseState | None:
             issued_at=int(raw["issued_at"]),
             expires_at=int(raw["expires_at"]),
             lease_id=str(raw["lease_id"]),
+            renewal_count=int(raw.get("renewal_count", 0)),
         )
     except (ValueError, TypeError):
         return None
@@ -104,6 +110,7 @@ def _write_lease_state(state: LeaseState) -> None:
                 "issued_at": state.issued_at,
                 "expires_at": state.expires_at,
                 "lease_id": state.lease_id,
+                "renewal_count": state.renewal_count,
             },
             indent=2,
             sort_keys=True,
@@ -428,9 +435,284 @@ def verify_lease_token(token: str) -> dict[str, Any]:
             "success": True,
             "owner": current.owner,
             "lease_id": current.lease_id,
+            "issued_at": current.issued_at,
             "expires_at": current.expires_at,
+            "renewal_count": current.renewal_count,
             "ttl_seconds": max(0, current.expires_at - now),
         }
+
+
+def renew_lease(
+    token: str,
+    ttl_seconds: int | None = None,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Renew the Mission Control exclusive lease.
+
+    Extends the lease expiry by the requested TTL (default: DEFAULT_LEASE_DURATION_SECONDS).
+    Only the current owner with the correct token can renew.
+
+    Args:
+        token: The token returned from acquire_lease or a previous renew.
+        ttl_seconds: Additional lease duration in seconds (default: 10 min, min: 1 min, max: 12 hours).
+        dry_run: If True, validate but don't persist.
+
+    Returns:
+        Dict with success, updated lease details (owner, issued_at, expires_at, lease_id, renewal_count).
+        The token is NOT returned on renew - caller keeps the existing token.
+
+    Raises:
+        PermissionError: If operator authority insufficient.
+        RuntimeError: If token doesn't match current lease owner, lease expired, or max renewals reached.
+    """
+    policy = _require_operator_authority(mutate=True, dry_run=dry_run)
+
+    # Validate TTL
+    if ttl_seconds is None:
+        ttl_seconds = DEFAULT_LEASE_DURATION_SECONDS
+    ttl_seconds = max(MIN_LEASE_DURATION_SECONDS, min(int(ttl_seconds), MAX_LEASE_DURATION_SECONDS))
+
+    with _lease_lock():
+        current = _read_lease_state()
+        if not current:
+            return {
+                "success": False,
+                "error": "NO_LEASE",
+                "message": "No Mission Control lease exists to renew",
+            }
+
+        if _is_expired(current):
+            if not dry_run:
+                _delete_lease_state()
+            return {
+                "success": False,
+                "error": "LEASE_EXPIRED",
+                "message": "Mission Control lease has already expired; cannot renew",
+                "expired_at": current.expires_at,
+            }
+
+        if not secrets.compare_digest(current.token, token):
+            return {
+                "success": False,
+                "error": "INVALID_TOKEN",
+                "message": "Invalid token for lease renewal",
+            }
+
+        # Check renewal limit
+        if current.renewal_count >= MAX_RENEWALS:
+            return {
+                "success": False,
+                "error": "MAX_RENEWALS_REACHED",
+                "message": f"Lease has been renewed {MAX_RENEWALS} times; must reacquire for continued access",
+                "renewal_count": current.renewal_count,
+                "max_renewals": MAX_RENEWALS,
+            }
+
+        owner = current.owner
+        lease_id = current.lease_id
+        issued_at = current.issued_at
+        now = _now()
+        new_expires_at = now + ttl_seconds
+        new_renewal_count = current.renewal_count + 1
+
+        new_state = LeaseState(
+            owner=owner,
+            token=current.token,  # Token stays the same
+            issued_at=issued_at,
+            expires_at=new_expires_at,
+            lease_id=lease_id,
+            renewal_count=new_renewal_count,
+        )
+
+        if not dry_run:
+            _write_lease_state(new_state)
+            try:
+                op_policy.audit_record(
+                    tool="hermes_mission_control_lease_renew",
+                    level=policy.level,
+                    apply_mode=policy.apply_mode,
+                    dry_run=False,
+                    success=True,
+                    changed=True,
+                    summary="Mission Control exclusive lease renewed",
+                    extra={
+                        "owner": owner,
+                        "lease_id": lease_id,
+                        "issued_at": issued_at,
+                        "expires_at": new_expires_at,
+                        "ttl_seconds": ttl_seconds,
+                        "renewal_count": new_renewal_count,
+                        "dry_run": False,
+                    },
+                )
+            except Exception:
+                # Renew is failure-atomic: if post-write auditing fails, rollback
+                # to previous state (same token check protects against race)
+                persisted = _read_lease_state()
+                if (
+                    persisted
+                    and persisted.owner == owner
+                    and secrets.compare_digest(persisted.token, token)
+                    and persisted.renewal_count == new_renewal_count
+                ):
+                    # Write back the old state
+                    old_state = LeaseState(
+                        owner=owner,
+                        token=current.token,
+                        issued_at=issued_at,
+                        expires_at=current.expires_at,
+                        lease_id=lease_id,
+                        renewal_count=current.renewal_count,
+                    )
+                    _write_lease_state(old_state)
+                raise
+
+    return {
+        "success": True,
+        "owner": owner,
+        "issued_at": issued_at,
+        "expires_at": new_expires_at,
+        "lease_id": lease_id,
+        "renewal_count": new_renewal_count,
+        "ttl_seconds": ttl_seconds,
+        "dry_run": dry_run,
+    }
+
+
+def handoff_lease(
+    token: str,
+    new_owner: str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Hand off the Mission Control exclusive lease to another owner identity.
+
+    Transfers lease ownership to a new identity while preserving the original token.
+    This allows related workflows from the same logical operator to continue work
+    without waiting for expiry. Only the current owner with the correct token can handoff.
+
+    The handoff preserves the lease's original issued_at and lease_id, resets renewal_count,
+    and extends expiry by the default TTL. The token remains unchanged so the new owner
+    can renew or release.
+
+    Args:
+        token: The token returned from acquire_lease or a previous renew/handoff.
+        new_owner: The new owner identity to transfer the lease to.
+        dry_run: If True, validate but don't persist.
+
+    Returns:
+        Dict with success, updated lease details (new_owner, issued_at, expires_at, lease_id).
+        The token is NOT returned - caller keeps the existing token.
+
+    Raises:
+        PermissionError: If operator authority insufficient.
+        RuntimeError: If token doesn't match current lease owner, lease expired, or same owner.
+    """
+    policy = _require_operator_authority(mutate=True, dry_run=dry_run)
+
+    new_owner = _sanitize_owner(new_owner)
+
+    with _lease_lock():
+        current = _read_lease_state()
+        if not current:
+            return {
+                "success": False,
+                "error": "NO_LEASE",
+                "message": "No Mission Control lease exists to handoff",
+            }
+
+        if _is_expired(current):
+            if not dry_run:
+                _delete_lease_state()
+            return {
+                "success": False,
+                "error": "LEASE_EXPIRED",
+                "message": "Mission Control lease has already expired; cannot handoff",
+                "expired_at": current.expires_at,
+            }
+
+        if not secrets.compare_digest(current.token, token):
+            return {
+                "success": False,
+                "error": "INVALID_TOKEN",
+                "message": "Invalid token for lease handoff",
+            }
+
+        if current.owner == new_owner:
+            return {
+                "success": False,
+                "error": "SAME_OWNER",
+                "message": "Lease is already owned by the requested identity; use renew instead",
+                "current_owner": current.owner,
+            }
+
+        owner = new_owner
+        lease_id = current.lease_id
+        issued_at = current.issued_at
+        now = _now()
+        new_expires_at = now + DEFAULT_LEASE_DURATION_SECONDS
+
+        new_state = LeaseState(
+            owner=owner,
+            token=current.token,  # Token stays the same
+            issued_at=issued_at,
+            expires_at=new_expires_at,
+            lease_id=lease_id,
+            renewal_count=0,  # Reset renewal count on handoff
+        )
+
+        if not dry_run:
+            _write_lease_state(new_state)
+            try:
+                op_policy.audit_record(
+                    tool="hermes_mission_control_lease_handoff",
+                    level=policy.level,
+                    apply_mode=policy.apply_mode,
+                    dry_run=False,
+                    success=True,
+                    changed=True,
+                    summary="Mission Control exclusive lease handed off",
+                    extra={
+                        "previous_owner": current.owner,
+                        "new_owner": owner,
+                        "lease_id": lease_id,
+                        "issued_at": issued_at,
+                        "expires_at": new_expires_at,
+                        "dry_run": False,
+                    },
+                )
+            except Exception:
+                # Handoff is failure-atomic: rollback to previous state
+                persisted = _read_lease_state()
+                if (
+                    persisted
+                    and persisted.owner == owner
+                    and secrets.compare_digest(persisted.token, token)
+                    and persisted.renewal_count == 0
+                ):
+                    old_state = LeaseState(
+                        owner=current.owner,
+                        token=current.token,
+                        issued_at=issued_at,
+                        expires_at=current.expires_at,
+                        lease_id=lease_id,
+                        renewal_count=current.renewal_count,
+                    )
+                    _write_lease_state(old_state)
+                raise
+
+    return {
+        "success": True,
+        "owner": owner,
+        "previous_owner": current.owner,
+        "issued_at": issued_at,
+        "expires_at": new_expires_at,
+        "lease_id": lease_id,
+        "renewal_count": 0,
+        "ttl_seconds": DEFAULT_LEASE_DURATION_SECONDS,
+        "dry_run": dry_run,
+    }
 
 
 def verify_lease(
@@ -649,6 +931,86 @@ def hermes_mission_control_lease_status(
                 layer="operator",
                 code="LEASE_STATUS_ERROR",
                 suggested_action="Check operator policy.",
+            ),
+            indent=2,
+        )
+
+
+def hermes_mission_control_lease_renew(
+    token: str,
+    ttl_seconds: int | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Renew the local Mission Control coordination lease.
+
+    Extends the lease expiry by the requested TTL (default: 10 minutes).
+    Only the current holder, presenting the release token returned by acquire,
+    can renew it; a missing or wrong token changes nothing.
+
+    Scope and limits:
+    - Local and closed-world: it touches one lease file on this machine.
+    - Non-destructive: it extends the existing lease record.
+    - Bounded: max 12 renewals (2 hours total) before requiring reacquisition.
+    - dry_run=true validates the token and persists nothing.
+
+    Args:
+        token: The release token returned from hermes_mission_control_lease_acquire.
+        ttl_seconds: Additional lease duration in seconds (default 600, min 60, max 43200).
+        dry_run: Validate only; persist nothing.
+
+    Returns:
+        JSON with lease details (token is NOT returned on renew).
+    """
+    try:
+        result = renew_lease(token=token, ttl_seconds=ttl_seconds, dry_run=dry_run)
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="LEASE_RENEW_ERROR",
+                suggested_action="Provide the correct token from lease acquire.",
+            ),
+            indent=2,
+        )
+
+
+def hermes_mission_control_lease_handoff(
+    token: str,
+    new_owner: str,
+    dry_run: bool = False,
+) -> str:
+    """Hand off the local Mission Control coordination lease to another owner.
+
+    Transfers lease ownership to a new identity while preserving the original token.
+    This allows related workflows from the same logical operator to continue work
+    without waiting for expiry. Only the current holder with the correct token can handoff.
+
+    Scope and limits:
+    - Local and closed-world: it touches one lease file on this machine.
+    - Non-destructive: it modifies the existing lease record.
+    - Token-preserving: the same token works for the new owner to renew/release.
+    - dry_run=true validates the token and persists nothing.
+
+    Args:
+        token: The release token returned from hermes_mission_control_lease_acquire.
+        new_owner: The new owner identity to transfer the lease to.
+        dry_run: Validate only; persist nothing.
+
+    Returns:
+        JSON with lease details including new owner (token is NOT returned).
+    """
+    try:
+        result = handoff_lease(token=token, new_owner=new_owner, dry_run=dry_run)
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            op_policy.error_from_exception(
+                exc,
+                layer="operator",
+                code="LEASE_HANDOFF_ERROR",
+                suggested_action="Provide the correct token from lease acquire and a valid new owner.",
             ),
             indent=2,
         )

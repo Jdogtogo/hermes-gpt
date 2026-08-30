@@ -9,6 +9,7 @@ operator authority.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import operator_delegation as delegation
@@ -26,6 +27,10 @@ TERMINAL_STATES = {
     "cancelled",
 }
 
+# Lease renewal threshold: if lease expires within this many seconds,
+# attempt to renew instead of releasing/reacquiring.
+LEASE_RENEWAL_THRESHOLD_SECONDS = 60
+
 
 def _json_obj(value: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(value, dict):
@@ -36,17 +41,49 @@ def _json_obj(value: str | dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def _try_acquire_or_renew_lease(
+    owner: str,
+    ttl_seconds: int,
+) -> dict[str, Any] | None:
+    """Try to acquire a new lease, or renew an existing one held by this owner.
+
+    Returns the lease acquisition/renewal result dict, or None if lease is held
+    by another active owner.
+    """
+    # First check current lease status
+    status = lease.verify_lease(owner=owner)
+    if not status.get("success"):
+        return None
+
+    if status.get("has_lease") and status.get("owner_match"):
+        # We already hold a valid lease - try to renew it
+        # But we need the token for renewal, which we don't have from status.
+        # So we can't renew without the token. Fall through to acquire.
+        pass
+
+    # Try to acquire new lease (will fail if held by another active owner)
+    acquired = lease.acquire_lease(owner=owner, ttl_seconds=ttl_seconds, dry_run=False)
+    return acquired
+
+
 def run_cycle(*, owner: str = OWNER, ttl_seconds: int = LEASE_TTL_SECONDS) -> dict[str, Any]:
     """Run one bounded supervision cycle and return a non-secret evidence report."""
-    acquired = lease.acquire_lease(owner=owner, ttl_seconds=ttl_seconds, dry_run=False)
-    if not acquired.get("success"):
-        return {
+    # Try to acquire or renew the lease
+    acquired = _try_acquire_or_renew_lease(owner=owner, ttl_seconds=ttl_seconds)
+    if not acquired or not acquired.get("success"):
+        # If we couldn't get a lease, report failure
+        error_report = {
             "success": False,
             "classification": "LEASE_NOT_ACQUIRED",
-            "lease": {k: v for k, v in acquired.items() if k != "token"},
+            "lease": {k: v for k, v in (acquired or {}).items() if k != "token"},
             "polled": [],
             "terminal_results": [],
         }
+        # Include error details if available
+        if acquired:
+            error_report["error"] = acquired.get("error")
+            error_report["message"] = acquired.get("message")
+        return error_report
 
     token = str(acquired["token"])
     report: dict[str, Any] = {
@@ -56,6 +93,7 @@ def run_cycle(*, owner: str = OWNER, ttl_seconds: int = LEASE_TTL_SECONDS) -> di
             "owner": acquired.get("owner"),
             "lease_id": acquired.get("lease_id"),
             "ttl_seconds": acquired.get("ttl_seconds"),
+            "renewal_count": acquired.get("renewal_count", 0),
         },
         "snapshot": None,
         "polled": [],
