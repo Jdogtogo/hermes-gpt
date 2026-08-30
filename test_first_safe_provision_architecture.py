@@ -120,6 +120,29 @@ def test_remote_program_requires_existing_private_profile_credential_and_never_r
     assert 'OPENROUTER_API_KEY=' not in src
 
 
+def test_remote_program_quarantines_only_profile_auth_without_reading_contents():
+    src = worker.REMOTE_PROGRAM
+    fixed_path = 'PROFILE_AUTH_QUARANTINE=PROFILE/"auth.json.pre-first-safe.quarantine"'
+    collision = 'if PROFILE_AUTH_QUARANTINE.exists(): fail("profile auth quarantine already exists"'
+    rename = 'os.rename(PROFILE_AUTH,PROFILE_AUTH_QUARANTINE)'
+    chmod = 'os.chmod(PROFILE_AUTH_QUARANTINE,0o600)'
+    config_write = 'CONFIG.write_text(CONFIG_TEXT,encoding="utf-8")'
+    assert fixed_path in src
+    assert 'if PROFILE_AUTH.exists():' in src
+    assert 'PROFILE_AUTH.is_symlink() or not PROFILE_AUTH.is_file()' in src
+    assert collision in src
+    assert rename in src
+    assert chmod in src
+    assert src.index(collision) < src.index(rename) < src.index(chmod) < src.index(config_write)
+    assert 'profile_auth_quarantined=False' in src
+    assert 'profile_auth_quarantined=True' in src
+    assert '"profile_auth_quarantined":profile_auth_quarantined' in src
+    assert '"profile_auth_quarantine_path":str(PROFILE_AUTH_QUARANTINE)' in src
+    assert 'PROFILE_AUTH.read_text' not in src
+    assert 'PROFILE_AUTH.read_bytes' not in src
+    assert 'PROFILE_AUTH.unlink' not in src
+
+
 def test_remote_program_fails_closed_on_root_state_and_sibling_or_git_change():
     src = worker.REMOTE_PROGRAM
     assert 'ROOT_CONFIG' in src and 'ROOT_ENV' in src and 'ROOT_AUTH' in src and 'ROOT_NOUS' in src
@@ -170,7 +193,7 @@ def test_policy_is_tier3_nonstanding_zero_local_write_and_fixed_egress():
         "mission_control": ["lease_status"],
     }
     assert policy["has_secret_access"] is False
-    assert policy["has_credential_access"] is False
+    assert policy["has_credential_access"] is True
     assert policy["has_external_communication"] is False
 
 

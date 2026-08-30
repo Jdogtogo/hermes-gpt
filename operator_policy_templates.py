@@ -479,9 +479,10 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "description": (
             "One-purpose PRE-LIVE authority for fixed trusted provisioning of the dedicated "
             "first-safe profile on jfroh@hermes-exec. The connector only records/verifies a bounded "
-            "intent; the trusted host worker may create the approved sparse profile config only after "
-            "the target-local private profile .env already exists with the expected key name. No secret "
-            "value is read or returned, and no model/API call, arbitrary command, service, Git, OAuth, "
+            "intent; the trusted host worker may quarantine only the exact profile-local auth.json by "
+            "non-content rename, then create the approved sparse profile config after the target-local "
+            "private profile .env already exists with the expected key name. No secret value is read or "
+            "returned, and no model/API call, arbitrary command, service, Git, OAuth, "
             "Cloudflare, cron, cutover or WSL-retirement capability is granted."
         ),
         "risk_tier": 3,
@@ -529,7 +530,7 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "production_effect": "config",
             "paid_route_change": "none",
             "has_secret_access": False,
-            "has_credential_access": False,
+            "has_credential_access": True,
             "has_client_identifiable_data": False,
             "has_financial_data": False,
             "has_external_communication": False,

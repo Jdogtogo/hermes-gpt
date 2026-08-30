@@ -42,6 +42,7 @@ PROFILE=ROOT/"profiles"/"first-safe"
 CONFIG=PROFILE/"config.yaml"
 PROFILE_ENV=PROFILE/".env"
 PROFILE_AUTH=PROFILE/"auth.json"
+PROFILE_AUTH_QUARANTINE=PROFILE/"auth.json.pre-first-safe.quarantine"
 PROFILE_SHARED=PROFILE/"shared"
 PROFILE_NOUS=PROFILE_SHARED/"nous_auth.json"
 ROOT_CONFIG=ROOT/"config.yaml"
@@ -82,6 +83,16 @@ def env_has_key(path,key):
 
 who=pwd.getpwuid(os.geteuid())
 if who.pw_name!="jfroh" or who.pw_dir!="/home/jfroh": fail("wrong target runtime identity")
+profile_auth_quarantined=False
+if PROFILE_AUTH.exists():
+    if PROFILE_AUTH.is_symlink() or not PROFILE_AUTH.is_file(): fail("profile auth.json must be a regular file before quarantine",path=str(PROFILE_AUTH))
+    if PROFILE_AUTH_QUARANTINE.exists(): fail("profile auth quarantine already exists",path=str(PROFILE_AUTH_QUARANTINE))
+    try:
+        os.rename(PROFILE_AUTH,PROFILE_AUTH_QUARANTINE)
+        os.chmod(PROFILE_AUTH_QUARANTINE,0o600)
+    except OSError as exc:
+        fail("unable to quarantine profile auth.json",detail=type(exc).__name__)
+    profile_auth_quarantined=True
 for p,label in ((ROOT_CONFIG,"root config.yaml"),(ROOT_ENV,"root .env"),(ROOT_AUTH,"root auth.json"),(ROOT_NOUS,"root Nous auth"),(PROFILE_AUTH,"profile auth.json"),(PROFILE_NOUS,"profile Nous auth")):
     if p.exists(): fail(label+" must be absent",path=str(p))
 
@@ -115,6 +126,7 @@ print("HERMES_FIRST_SAFE_PROVISION_JSON="+json.dumps({
   "target_user":"jfroh","target_host":"hermes-exec","profile":"first-safe",
   "config_path":str(CONFIG),"config_mode":oct(stat.S_IMODE(CONFIG.stat().st_mode)),
   "credential_file_present":True,"credential_key_name_present":True,"credential_value_exposed":False,
+  "profile_auth_quarantined":profile_auth_quarantined,"profile_auth_quarantine_path":str(PROFILE_AUTH_QUARANTINE) if profile_auth_quarantined else None,
   "root_provider_state_absent":True,"sibling_profiles_unchanged":True,"git_status_unchanged":True,
   "model_api_calls":0,"services_changed":False,"cloudflare_changed":False,"cron_changed":False,"cutover":False,
 },sort_keys=True))
@@ -192,6 +204,7 @@ def execute(intent_id: str) -> dict[str, Any]:
         allowed = {
             "success","target_user","target_host","profile","config_path","config_mode",
             "credential_file_present","credential_key_name_present","credential_value_exposed",
+            "profile_auth_quarantined","profile_auth_quarantine_path",
             "root_provider_state_absent","sibling_profiles_unchanged","git_status_unchanged",
             "model_api_calls","services_changed","cloudflare_changed","cron_changed","cutover"
         }
