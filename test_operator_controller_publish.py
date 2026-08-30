@@ -143,3 +143,42 @@ def test_expected_commit_must_equal_full_lowercase_head(monkeypatch):
     assert result["success"] is False
     assert result["code"] == "CONTROLLER_PUBLISH_ERROR"
     assert calls == []
+
+
+def test_release_template_can_be_approved_into_live_task_authority(tmp_path, monkeypatch):
+    import operator_policy as op
+    import operator_sessions as sessions
+
+    root = tmp_path / "sessions"
+    monkeypatch.setenv(sessions.SESSION_ROOT_ENV, str(root))
+    for name in [
+        op.OPERATOR_ENABLED_ENV,
+        op.OPERATOR_LEVEL_ENV,
+        op.OPERATOR_APPLY_MODE_ENV,
+        op.OPERATOR_ALLOWED_PATHS_ENV,
+        op.OWNER_ACK_ENV,
+    ]:
+        monkeypatch.delenv(name, raising=False)
+
+    resolved = templates.resolve_template("hermes-controller-release")
+    request_id = sessions.request_session(
+        policy_template="hermes-controller-release",
+        resolved_policy=resolved["policy"],
+        requested_duration_seconds=3600,
+        reason="publish exact reviewed Controller commit",
+        root=root,
+        now=2_000_000_000,
+        request_id="sr_controller_release_test",
+    )
+    record = sessions.approve_session_request(
+        request_id,
+        decided_by="localhost",
+        root=root,
+        now=2_000_000_001,
+    )
+    authority = sessions.resolve_effective_authority(now=2_000_000_002)
+
+    assert record.policy["policy_template"] == "hermes-controller-release"
+    assert authority.is_active is True
+    assert authority.policy_template == "hermes-controller-release"
+    assert authority.verbs == {"git": ["push"]}
