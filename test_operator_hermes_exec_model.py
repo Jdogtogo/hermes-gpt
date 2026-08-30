@@ -117,6 +117,53 @@ def test_remote_program_contains_no_legacy_target_or_fallback_route():
     assert 'z-ai/glm-5.2' not in program
 
 
+def test_sibling_snapshot_ignores_runtime_churn_but_detects_static_config(tmp_path):
+    namespace = {"__name__": "first_safe_non_live_test"}
+    exec(compile(spec.REMOTE_PROGRAM, "<first-safe-remote>", "exec"), namespace, namespace)
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "backend-eng"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model:\n  default: model-a\n", encoding="utf-8")
+    (profile / ".env").write_text("PROVIDER_MODE=stable\n", encoding="utf-8")
+    (profile / "state.db").write_bytes(b"runtime-db")
+    (profile / "state.db-shm").write_bytes(b"runtime-shm-1")
+    (profile / "auth.json").write_text('{"request_count": 1}', encoding="utf-8")
+    (profile / "logs").mkdir()
+    (profile / "logs" / "agent.log").write_text("before\n", encoding="utf-8")
+
+    namespace["ROOT"] = root
+    namespace["SIBLINGS"] = ("backend-eng",)
+    before = namespace["sibling_snapshot"]()
+
+    (profile / "state.db").write_bytes(b"runtime-db-changed")
+    (profile / "state.db-shm").write_bytes(b"runtime-shm-2")
+    (profile / "state.db-wal").write_bytes(b"runtime-wal")
+    (profile / "auth.json").write_text('{"request_count": 2}', encoding="utf-8")
+    (profile / "logs" / "agent.log").write_text("after\n", encoding="utf-8")
+    assert namespace["sibling_snapshot"]() == before
+
+    (profile / "config.yaml").write_text("model:\n  default: model-b\n", encoding="utf-8")
+    assert namespace["sibling_snapshot"]() != before
+
+
+def test_sibling_snapshot_detects_static_provider_environment_change(tmp_path):
+    namespace = {"__name__": "first_safe_non_live_test"}
+    exec(compile(spec.REMOTE_PROGRAM, "<first-safe-remote>", "exec"), namespace, namespace)
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model:\n  default: model-a\n", encoding="utf-8")
+    (profile / ".env").write_text("PROVIDER_MODE=stable\n", encoding="utf-8")
+
+    namespace["ROOT"] = root
+    namespace["SIBLINGS"] = ("coder",)
+    before = namespace["sibling_snapshot"]()
+    (profile / ".env").write_text("PROVIDER_MODE=changed\n", encoding="utf-8")
+    assert namespace["sibling_snapshot"]() != before
+
+
 def test_remote_program_purges_ambient_credentials_and_binds_profile(monkeypatch):
     import os
 
