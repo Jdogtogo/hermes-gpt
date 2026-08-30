@@ -8,6 +8,7 @@ Tests and commits remain separate, policy-gated operator actions.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ import operator_policy as op
 import operator_standing_authority as op_standing
 import operator_antigravity as op_antigravity
 import operator_antigravity_tax as op_antigravity_tax
+import operator_lease as op_lease
 import operator_routing as routing
 
 HERMES_BIN = str(Path.home() / ".local" / "bin" / "hermes")
@@ -67,6 +69,7 @@ LEGAL_TRANSITIONS = {
 }
 _TASKS_ROOT = Path(__file__).resolve().parent / "logs" / "delegated_tasks"
 MISSION_CONTROL_DB_ENV = "HERMES_GPT_DELEGATION_MISSION_CONTROL_DB"
+MISSION_CONTROL_REVIEW_ACCEPT_PREFIX = "MISSION_CONTROL_REVIEW_ACCEPT:"
 _LOCK = threading.RLock()
 _PROCESSES: dict[str, subprocess.Popen[str]] = {}
 
@@ -195,7 +198,9 @@ def _prepare_runtime_home(
         for candidate in resolved.alternates[: resolved.max_alternate_attempts]
         if candidate.key != primary.key
     ]
-    if chain:
+    if resolved.fallbacks_disabled:
+        runtime_config["fallback_providers"] = []
+    elif chain:
         runtime_config["fallback_providers"] = chain
     (runtime_home / "config.yaml").write_text(
         yaml.safe_dump(runtime_config, sort_keys=False), encoding="utf-8"
@@ -420,6 +425,21 @@ def _extract_final_answer(stdout: str, stderr: str = "") -> tuple[str | None, st
     if len(meaningful) == 1:
         return _safe_text(candidate), "legacy_single_line"
     return None, "unstructured_ambiguous"
+
+
+def _store_worker_output(task: dict[str, Any], stdout: str, stderr: str) -> None:
+    """Persist bounded diagnostics without losing the caller-facing final answer.
+
+    Final-answer extraction must run against the raw provider streams before
+    ``_safe_text`` truncates diagnostic output. The extracted answer is already
+    redacted/bounded by ``_extract_final_answer`` and is stored separately so
+    result retrieval never needs to reconstruct it from clipped transcripts.
+    """
+    final_answer, extraction_status = _extract_final_answer(stdout, stderr)
+    task["final_answer"] = final_answer
+    task["final_answer_extraction_status"] = extraction_status
+    task["stdout"] = _safe_text(stdout)
+    task["stderr"] = _safe_text(stderr)
 
 
 def _workspace_snapshot(root: Path) -> dict[str, tuple[int, int]]:
@@ -732,19 +752,40 @@ def _write_checkpoint(task: dict[str, Any], *, reason: str) -> str:
 
 
 def _mission_control_db_path() -> Path | None:
+    """Return only an explicit legacy/test Mission Control DB path.
+
+    Production Mission Control persistence uses the existing governed
+    ``hermes-stabilization`` board rather than the legacy global kanban.db.
+    """
     configured = os.environ.get(MISSION_CONTROL_DB_ENV)
-    if configured:
-        path = Path(configured).expanduser()
-        return path if path.is_file() else None
-    if os.environ.get("PYTEST_CURRENT_TEST"):
+    if not configured:
         return None
-    path = Path.home() / ".hermes" / "kanban.db"
+    path = Path(configured).expanduser()
     return path if path.is_file() else None
 
 
-def _mission_status(task_status: str) -> str:
+def _mission_control_task_status(logical_work_id: str) -> str | None:
+    db_path = _mission_control_db_path()
+    if db_path is None:
+        try:
+            governed = importlib.import_module("operator_governed_kanban")
+            return governed.mission_control_task_status(logical_work_id)
+        except Exception:
+            return None
+    try:
+        with sqlite3.connect(db_path, timeout=10) as connection:
+            row = connection.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (logical_work_id,),
+            ).fetchone()
+        return str(row[0]) if row else None
+    except sqlite3.Error:
+        return None
+
+
+def _mission_status(task_status: str, review_status: str | None = None) -> str:
     if task_status == "completed":
-        return "Completed"
+        return "Completed" if review_status == "accepted" else "In Review"
     if task_status == "cancelled":
         return "Cancelled"
     if task_status in TERMINAL_STATES:
@@ -755,6 +796,11 @@ def _mission_status(task_status: str) -> str:
 def _record_mission_control(task: dict[str, Any], *, event: str) -> None:
     db_path = _mission_control_db_path()
     if db_path is None:
+        try:
+            governed = importlib.import_module("operator_governed_kanban")
+            governed.record_mission_control_task(task, event=event)
+        except Exception:
+            pass
         return
     try:
         now = _now()
@@ -767,6 +813,8 @@ def _record_mission_control(task: dict[str, Any], *, event: str) -> None:
                 "profile": task.get("profile"),
                 "checkpoint_ref": task.get("checkpoint_ref"),
                 "outcome_reason": task.get("outcome_reason", ""),
+                "review_status": task.get("review_status"),
+                "reviewed_at": task.get("reviewed_at"),
             },
             sort_keys=True,
         )
@@ -790,7 +838,10 @@ def _record_mission_control(task: dict[str, Any], *, event: str) -> None:
                     title,
                     "Hermes delegated execution worker record. Prompt content is intentionally not stored.",
                     task.get("profile"),
-                    _mission_status(str(task.get("status") or "")),
+                    _mission_status(
+                        str(task.get("status") or ""),
+                        str(task.get("review_status") or "") or None,
+                    ),
                     ADAPTER_NAME,
                     now,
                     task.get("workdir"),
@@ -827,6 +878,11 @@ def _classify_failure(*, rc: int, stdout: str, stderr: str, status: str, reason:
         return "timeout", None
     if status == "blocked":
         return "permission", None
+    if status == "completed" and rc == 0:
+        # The substantive routing classifier has already accepted this attempt.
+        # Do not reclassify valid answer text (for example a historical mention
+        # of `fallback_response`) as a current provider/model failure.
+        return None, None
     if "provider resolver returned an empty api key" in combined:
         return "provider_configuration", "missing_api_key"
     if "model returned empty content" in combined or "empty-response" in reason:
@@ -1416,8 +1472,7 @@ def _worker(task_id: str) -> None:
                 task = _load(task_id)
                 cancelled = task["status"] == "cancel_requested"
                 task["returncode"] = rc
-                task["stdout"] = _safe_text(stdout)
-                task["stderr"] = _safe_text(stderr)
+                _store_worker_output(task, stdout, stderr)
                 task["pid"] = None
                 after_snapshot = _workspace_snapshot(Path(task["workdir"])) if task.get("mode") == "apply" else {}
                 changed_files = _changed_files(before_snapshot, after_snapshot) if task.get("mode") == "apply" else []
@@ -2140,7 +2195,7 @@ def hermes_delegated_task_status(task_id: str) -> str:
             "started_at", "finished_at", "pid", "returncode", "prompt_sha256",
             "changed_files", "outcome_reason", "failure_category",
             "provider_error_category", "retry_count", "checkpoint_ref",
-            "checkpoint_sequence", "authority",
+            "checkpoint_sequence", "review_status", "reviewed_at", "authority",
         )
         payload = {"success": True, **{key: task.get(key) for key in keys}}
         payload.update(
@@ -2190,11 +2245,26 @@ def hermes_delegated_task_result(task_id: str) -> str:
                 },
                 indent=2,
             )
-        final_answer, final_answer_extraction_status = _extract_final_answer(
-            str(task.get("stdout") or ""),
-            str(task.get("stderr") or ""),
-        )
+        stored_extraction_status = str(task.get("final_answer_extraction_status") or "").strip()
+        if stored_extraction_status:
+            stored_final_answer = task.get("final_answer")
+            final_answer = _safe_text(str(stored_final_answer)) if stored_final_answer is not None else None
+            final_answer_extraction_status = stored_extraction_status
+        else:
+            # Backward compatibility for tasks created before pre-truncation
+            # final-answer capture was introduced.
+            final_answer, final_answer_extraction_status = _extract_final_answer(
+                str(task.get("stdout") or ""),
+                str(task.get("stderr") or ""),
+            )
+        authority = task.get("authority") or {}
+        checkpoint_ref = task.get("checkpoint_ref")
+        logical_work_id = str(task.get("logical_work_id") or task.get("task_id") or task_id)
+        mission_control_status = _mission_control_task_status(logical_work_id)
         return json.dumps({
+            "evidence_envelope_version": 1,
+            "mission_control_status": mission_control_status,
+            "mission_control_persisted": mission_control_status is not None,
             "success": task["status"] == "completed",
             "logical_work_id": task.get("logical_work_id"),
             "task_id": task_id,
@@ -2212,17 +2282,35 @@ def hermes_delegated_task_result(task_id: str) -> str:
             "ready": True,
             "returncode": task.get("returncode"),
             "final_answer": final_answer,
+            "final_summary": final_answer,
             "final_answer_extraction_status": final_answer_extraction_status,
-            "stdout": task.get("stdout", ""),
-            "stderr": task.get("stderr", ""),
-            "messages": task.get("messages", []),
-            "changed_files": task.get("changed_files", []),
-            "outcome_reason": task.get("outcome_reason", ""),
+            "raw_output_included": False,
+            "raw_output_available": bool(task.get("stdout") or task.get("stderr")),
+            "message_count": len(task.get("messages") or []),
+            "changed_files": list(task.get("changed_files") or [])[:200],
+            "outcome_reason": _safe_text(str(task.get("outcome_reason") or "")),
             "failure_category": task.get("failure_category"),
             "provider_error_category": task.get("provider_error_category"),
-            "checkpoint_ref": task.get("checkpoint_ref"),
+            "review_status": task.get("review_status"),
+            "reviewed_at": task.get("reviewed_at"),
+            "review_summary": task.get("review_summary"),
+            "checkpoint_ref": checkpoint_ref,
+            "evidence_refs": [checkpoint_ref] if checkpoint_ref else [],
             "resumable": task["status"] in RESUMABLE_STATES and not bool(long_horizon.get("final_stop_reason")),
-            "authority": task.get("authority", {}),
+            "authority": {
+                key: authority.get(key)
+                for key in (
+                    "authority_kind",
+                    "session_id",
+                    "logical_task_id",
+                    "expires_at",
+                    "mode",
+                    "profile",
+                    "workdir",
+                    "evidence_required",
+                )
+                if authority.get(key) is not None
+            },
             "long_horizon": long_horizon,
         }, indent=2)
     except Exception as exc:
@@ -2238,9 +2326,81 @@ def hermes_delegated_task_message(task_id: str, message: str) -> str:
             raise ValueError("message is required.")
         if len(message.encode("utf-8")) > 8192:
             raise ValueError("message exceeds 8192 bytes.")
+
+        normalized = message.strip()
+        if normalized.startswith(MISSION_CONTROL_REVIEW_ACCEPT_PREFIX):
+            review_payload = normalized[len(MISSION_CONTROL_REVIEW_ACCEPT_PREFIX):]
+            lease_token, separator, review_summary = review_payload.partition(":")
+            if not separator or not lease_token.strip() or not review_summary.strip():
+                raise ValueError(
+                    "Mission Control review acceptance requires an active lease token and review summary."
+                )
+            lease = op_lease.verify_lease_token(lease_token.strip())
+            if not lease.get("success"):
+                raise PermissionError(
+                    "Mission Control review acceptance requires a valid active lease token "
+                    f"({lease.get('error') or 'verification_failed'})."
+                )
+            with _LOCK:
+                requested = _load(task_id)
+                task = _latest_task_for(requested)
+                if str(task.get("status") or "") != "completed":
+                    raise PermissionError(
+                        "Only a successfully completed delegated task can pass Mission Control review."
+                    )
+                if task.get("review_status") == "accepted":
+                    logical_work_id = str(task.get("logical_work_id") or task.get("task_id") or task_id)
+                    persisted_status = _mission_control_task_status(logical_work_id)
+                    if persisted_status != "Completed":
+                        _record_mission_control(task, event="review_reconciled")
+                        persisted_status = _mission_control_task_status(logical_work_id)
+                    persisted = persisted_status == "Completed"
+                    return json.dumps(
+                        {
+                            "success": persisted,
+                            "task_id": task.get("task_id") or task_id,
+                            "logical_work_id": task.get("logical_work_id"),
+                            "status": task.get("status"),
+                            "review_status": "accepted",
+                            "mission_control_status": persisted_status,
+                            "mission_control_persisted": persisted,
+                            "already_reviewed": True,
+                        },
+                        indent=2,
+                    )
+                task["review_status"] = "accepted"
+                task["reviewed_at"] = _now()
+                task["reviewed_by_lease_owner"] = lease.get("owner")
+                task["review_summary"] = _safe_text(review_summary.strip())[:2000]
+                _save(task)
+                _record_mission_control(task, event="review_accepted")
+                logical_work_id = str(task.get("logical_work_id") or task.get("task_id") or task_id)
+                persisted_status = _mission_control_task_status(logical_work_id)
+                persisted = persisted_status == "Completed"
+            return json.dumps(
+                {
+                    "success": persisted,
+                    "task_id": task.get("task_id") or task_id,
+                    "logical_work_id": task.get("logical_work_id"),
+                    "status": task.get("status"),
+                    "review_status": "accepted",
+                    "reviewed_at": task.get("reviewed_at"),
+                    "reviewed_by_lease_owner": task.get("reviewed_by_lease_owner"),
+                    "mission_control_status": persisted_status,
+                    "mission_control_persisted": persisted,
+                    "already_reviewed": False,
+                    "note": (
+                        "Mission Control evidence review accepted; lease token was verified and not persisted."
+                        if persisted
+                        else "Mission Control evidence review was accepted, but canonical Kanban completion did not verify."
+                    ),
+                },
+                indent=2,
+            )
+
         with _LOCK:
             task = _load(task_id)
-            task["messages"].append({"created_at": _now(), "message": message.strip()})
+            task["messages"].append({"created_at": _now(), "message": normalized})
             _save(task)
         return json.dumps({"success": True, "task_id": task_id, "status": task["status"], "message_count": len(task["messages"]), "note": "Message recorded durably. Running one-shot Hermes processes cannot consume it until a continuation task is submitted."}, indent=2)
     except Exception as exc:

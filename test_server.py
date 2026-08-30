@@ -342,7 +342,6 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_operator_session_status",
         "hermes_operator_session_request_extension",
         "hermes_operator_session_revoke",
-        "hermes_operator_task_complete",
         "hermes_operator_service_restart",
         "hermes_search_files",
         "hermes_workspace_read",
@@ -352,6 +351,9 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_workspace_exec",
         "hermes_workspace_git_commit",
         "hermes_routing_release_v019",
+        "hermes_first_safe_provision_prepare",
+        "hermes_first_safe_provision_execute",
+        "hermes_first_safe_provision_verify",
         "hermes_antigravity_smoke_test",
         "hermes_antigravity_dispatch",
         "hermes_antigravity_dispatch_status",
@@ -385,10 +387,31 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_skill_write_file",
     ]:
         assert forbidden not in names
-    for tool in tools_by_name(built).values():
+    registered = tools_by_name(built)
+    for tool in registered.values():
         assert tool.meta == {
             "securitySchemes": [{"type": "oauth2", "scopes": ["hermes:operator"]}]
         }
+    for read_only_name in [
+        "hermes_delegated_task_status",
+        "hermes_delegated_task_result",
+        "hermes_workspace_read",
+        "hermes_search_files",
+        "hermes_git_status",
+        "hermes_git_diff",
+    ]:
+        annotations = registered[read_only_name].annotations
+        assert annotations is not None
+        assert annotations.readOnlyHint is True
+        assert annotations.openWorldHint is False
+    for mutating_name in [
+        "hermes_delegate_task",
+        "hermes_delegated_task_continue",
+        "hermes_delegated_task_cancel",
+        "hermes_workspace_patch",
+    ]:
+        annotations = registered[mutating_name].annotations
+        assert annotations is None or annotations.readOnlyHint is not True
 
 
 def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
@@ -419,7 +442,8 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     public_manifest = status["public_manifest"]
     assert public_manifest["applicable"] is True
     assert public_manifest["manifest_version"] == server.op_manifest.MANIFEST_VERSION
-    assert public_manifest["expected_tool_count"] == 42
+    # 50 as of manifest 1.6.0 (adds fixed-purpose FIRST_SAFE provisioning execute).
+    assert public_manifest["expected_tool_count"] == 50
     assert public_manifest["registered_tool_count"] == len(live_names)
     assert public_manifest["schema_fingerprint"] == server.op_manifest.EXPECTED_SCHEMA_FINGERPRINT
     assert public_manifest["missing_tools"] == []
@@ -435,9 +459,13 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
         "hermes_operator_session_status",
         "hermes_operator_session_request_extension",
         "hermes_operator_session_revoke",
-        "hermes_operator_task_complete",
         "hermes_operator_service_restart",
         "hermes_approval_web_service_restart",
+        "hermes_first_safe_model_prepare",
+        "hermes_first_safe_model_verify",
+        "hermes_first_safe_provision_prepare",
+        "hermes_first_safe_provision_execute",
+        "hermes_first_safe_provision_verify",
         "hermes_antigravity_review_start",
         "hermes_antigravity_review_status",
         "hermes_antigravity_review_cancel",
@@ -862,6 +890,14 @@ def test_ops_brain_query_uses_only_narrow_policy_readable_roots(monkeypatch, tmp
     ops_brain = hermes_root / "ops-brain"
     projects = ops_brain / "projects"
     projects.mkdir(parents=True)
+    tools = ops_brain / "tools"
+    tools.mkdir()
+    source_script = Path("/home/jfroh/.hermes/ops-brain/tools/ops_brain_query.py")
+    (tools / "ops_brain_query.py").write_text(source_script.read_text(encoding="utf-8"), encoding="utf-8")
+    source_frontmatter = Path("/home/jfroh/.hermes/ops-brain/tools/opsbrain_frontmatter.py")
+    (tools / "opsbrain_frontmatter.py").write_text(
+        source_frontmatter.read_text(encoding="utf-8"), encoding="utf-8"
+    )
     allowed = projects / "mission-control.md"
     allowed.write_text(
         "---\n"
@@ -874,15 +910,17 @@ def test_ops_brain_query_uses_only_narrow_policy_readable_roots(monkeypatch, tmp
         "---\n\n# Mission Control\n",
         encoding="utf-8",
     )
-    # This document is deliberately outside the authority snapshot and contains
+    # This document is deliberately outside OpsBrain and contains
     # malformed YAML. A policy-scoped query must never open or parse it.
-    (projects / "client-financial-private.md").write_text(
+    outside = hermes_root / "private" / "client-financial-private.md"
+    outside.parent.mkdir()
+    outside.write_text(
         "---\nname: [unterminated\n---\n",
         encoding="utf-8",
     )
 
     class NarrowPolicy:
-        readable_roots = [allowed]
+        readable_roots = [ops_brain]
         allowed_paths = []
 
         def require_level(self, level):
@@ -898,13 +936,11 @@ def test_ops_brain_query_uses_only_narrow_policy_readable_roots(monkeypatch, tmp
     monkeypatch.setattr(server.op_policy, "OperatorPolicy", NarrowPolicy)
     monkeypatch.setattr(server, "_hermes_root_for_operator", lambda: hermes_root)
 
-    status = json.loads(server.hermes_ops_brain_query("status", "Mission Control", 5))
-    assert status["scope"] == "operator_policy_readable_roots"
-    assert status["count"] == 1
-    assert status["items"][0]["path"] == "projects/mission-control.md"
-    assert status["items"][0]["status"] == "Completed"
+    status = server.hermes_ops_brain_query("status", "Mission Control", 5)
+    assert "Source: projects/mission-control.md" in status
+    assert "Status: Completed" in status
 
-    listed = json.loads(server.hermes_ops_brain_query("projects", limit=10))
-    assert listed["count"] == 1
-    assert [item["name"] for item in listed["items"]] == ["Mission Control"]
-    assert "client-financial-private" not in json.dumps(listed)
+    listed = server.hermes_ops_brain_query("projects", limit=10)
+    assert "projects/mission-control.md" in listed
+    assert "status=Completed" in listed
+    assert "client-financial-private" not in listed

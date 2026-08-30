@@ -15,9 +15,11 @@ Safety rules:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -583,6 +585,74 @@ def _check_connector_api_bridge(profile_home: Path) -> dict[str, Any]:
     )
 
 
+def _check_hermes_exec_reachability() -> dict[str, Any]:
+    """Fixed read-only Hyper-V/SSH reachability check for the hermes-exec VM."""
+    ps = [
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+        "$ErrorActionPreference='Stop'; "
+        "$ips=(Get-VMNetworkAdapter -VMName 'hermes-exec' | Select-Object -ExpandProperty IPAddresses | "
+        "Where-Object { $_ -match '^[0-9]+(\\.[0-9]+){3}$' }); "
+        "$ips | ConvertTo-Json -Compress",
+    ]
+    try:
+        proc = subprocess.run(ps, capture_output=True, text=True, timeout=15, shell=False)
+    except Exception as exc:
+        return _check_result(
+            status=STATUS_WARN,
+            layer="network",
+            code="HERMES_EXEC_VM_QUERY_FAILED",
+            message=f"Could not query Hyper-V address for hermes-exec: {exc.__class__.__name__}",
+            suggested_action="Verify the Hyper-V VM exists and the Windows bridge is available.",
+        )
+    if proc.returncode != 0:
+        return _check_result(
+            status=STATUS_WARN,
+            layer="network",
+            code="HERMES_EXEC_VM_QUERY_FAILED",
+            message="Hyper-V did not return a usable address for hermes-exec.",
+            suggested_action="Verify the VM is running and its network adapter has an IPv4 address.",
+        )
+    raw = (proc.stdout or "").strip()
+    try:
+        parsed = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        parsed = []
+    candidates = [parsed] if isinstance(parsed, str) else list(parsed or [])
+    private_ipv4: list[str] = []
+    for value in candidates:
+        try:
+            addr = ipaddress.ip_address(str(value))
+        except ValueError:
+            continue
+        if addr.version == 4 and addr.is_private:
+            private_ipv4.append(str(addr))
+    private_ipv4 = sorted(set(private_ipv4))
+    reachable: list[str] = []
+    for host in private_ipv4:
+        try:
+            with socket.create_connection((host, 22), timeout=2):
+                reachable.append(host)
+        except OSError:
+            pass
+    if reachable:
+        return _check_result(
+            status=STATUS_PASS,
+            layer="network",
+            code="HERMES_EXEC_SSH_REACHABLE",
+            message="hermes-exec has a current Hyper-V IPv4 address reachable on TCP/22.",
+            suggested_action="Use the reachable fixed address for the bounded provisioning transport.",
+            extra={"vm_name": "hermes-exec", "ipv4_addresses": private_ipv4, "ssh_reachable_ipv4": reachable},
+        )
+    return _check_result(
+        status=STATUS_FAIL,
+        layer="network",
+        code="HERMES_EXEC_SSH_UNREACHABLE",
+        message="hermes-exec has no current Hyper-V IPv4 address reachable on TCP/22 from WSL.",
+        suggested_action="Check VM power/network attachment, guest address, firewall, and sshd before provisioning.",
+        extra={"vm_name": "hermes-exec", "ipv4_addresses": private_ipv4, "ssh_reachable_ipv4": []},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public tools
 # ---------------------------------------------------------------------------
@@ -630,6 +700,7 @@ def hermes_operator_doctor(
             "operator_policy": _check_operator_policy(profile, hermes_root),
             "last_audit_record": _check_last_audit_record(),
             "connector_api_bridge": _check_connector_api_bridge(profile_home),
+            "hermes_exec_reachability": _check_hermes_exec_reachability(),
         }
 
         failed = [name for name, c in checks.items() if c["status"] == STATUS_FAIL]

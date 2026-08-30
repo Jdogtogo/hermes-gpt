@@ -125,11 +125,11 @@ def test_commit_requires_git_commit_verb(git_repo, clean_env, audit_override, mo
     assert _run_git(["rev-parse", "HEAD"], git_repo) == baseline
 
 
-def test_commit_rejects_out_of_scope_tracked_file(git_repo, clean_env, audit_override, monkeypatch, tmp_path):
+def test_commit_allows_out_of_scope_unstaged_tracked_file(git_repo, clean_env, audit_override, monkeypatch, tmp_path):
     record, session_root = _make_session(tmp_path, git_repo, verbs={"git": ["commit"]})
     _activate(monkeypatch, record, session_root)
     (git_repo / "approved.txt").write_text("ok\n", encoding="utf-8")
-    (git_repo / "README.md").write_text("unexpected tracked change\n", encoding="utf-8")
+    (git_repo / "README.md").write_text("unrelated tracked working-tree change\n", encoding="utf-8")
     baseline = _run_git(["rev-parse", "HEAD"], git_repo)
     branch = _run_git(["branch", "--show-current"], git_repo)
 
@@ -141,9 +141,11 @@ def test_commit_rejects_out_of_scope_tracked_file(git_repo, clean_env, audit_ove
         message="add approved.txt",
         dry_run=False,
     ))
-    assert out["success"] is False
-    assert "README.md" in out["error"]
-    assert _run_git(["rev-parse", "HEAD"], git_repo) == baseline
+    assert out["success"] is True
+    assert out["files"] == ["approved.txt"]
+    assert _run_git(["show", "--name-only", "--format=", "HEAD"], git_repo) == "approved.txt"
+    assert (git_repo / "README.md").read_text(encoding="utf-8") == "unrelated tracked working-tree change\n"
+    assert _run_git(["status", "--short"], git_repo) == "M README.md"
 
 
 def test_commit_allows_unrelated_untracked_file(git_repo, clean_env, audit_override, monkeypatch, tmp_path):

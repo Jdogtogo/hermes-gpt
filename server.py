@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 import operator_policy as op_policy
 import operator_cron as op_cron
@@ -19,17 +20,19 @@ import operator_workspace as op_workspace
 import operator_release as op_release
 import operator_diagnostics as op_diagnostics
 import operator_computer_use_diagnostics as op_computer_use
+import operator_windows_app_control as op_windows_app
 import operator_manifest as op_manifest
 import operator_bridge as op_bridge
 import operator_auth as op_auth
 import operator_sessions as op_sessions
-import operator_task_authority as op_task_authority
 import operator_policy_templates as op_templates
 import operator_risk as op_risk
 import operator_delegation as op_delegation
-import operator_governed_kanban as op_governed_kanban
 import operator_antigravity_tax as op_antigravity_tax
 import operator_antigravity_dispatch as op_antigravity_dispatch
+import operator_first_safe as op_first_safe
+import operator_first_safe_provision as op_first_safe_provision
+import operator_hermes_exec_model as op_hermes_exec_model
 import dcr_compat
 
 try:
@@ -40,6 +43,18 @@ except ModuleNotFoundError as exc:
         raise
     op_agent = None
     OPERATOR_AGENT_IMPORT_ERROR = str(exc)
+
+try:
+    import operator_lease as op_lease
+    OPERATOR_LEASE_IMPORT_ERROR: str | None = None
+    hermes_mission_control_lease_acquire = op_lease.hermes_mission_control_lease_acquire
+    hermes_mission_control_lease_release = op_lease.hermes_mission_control_lease_release
+    hermes_mission_control_lease_status = op_lease.hermes_mission_control_lease_status
+except ModuleNotFoundError as exc:
+    if exc.name != "operator_lease":
+        raise
+    op_lease = None
+    OPERATOR_LEASE_IMPORT_ERROR = str(exc)
 
 
 LOCAL_DEV_PROFILE = "local-dev"
@@ -449,11 +464,24 @@ def hermes_search_files(
 ) -> str:
     try:
         require_imports()
+        resolved_path = expand_path(path)
+        # Content search is an arbitrary file-read surface and must obey the
+        # same path policy as hermes_workspace_read. Without this it was the
+        # one registered read tool with no operator guard at all, so a session
+        # scoped to a single readable root could still search -- and return
+        # matching file content from -- anywhere on the host. Deliberately the
+        # SAME guard shape as hermes_workspace_read (level + readable roots,
+        # not a verb): in this operator, read authority is expressed by
+        # readable_roots, and diverging here would silently re-scope every
+        # existing template.
+        policy = op_policy.OperatorPolicy()
+        policy.require_level("read_only")
+        policy.require_read_path(resolved_path)
         return call_with_supported_kwargs(
             file_tools.search_tool,
             pattern=pattern,
             target=target,
-            path=expand_path(path),
+            path=resolved_path,
             file_glob=file_glob,
             limit=limit,
         )
@@ -665,26 +693,6 @@ def hermes_operator_status() -> str:
         # hardcoded list, which reflected the default profile and omitted the
         # session tools while wrongly listing owner tools).
         registered = list(REGISTERED_TOOL_NAMES)
-        task_authority = {
-            "label": "TASK_AUTHORITY",
-            "logical_task_id": None,
-            "task_state": "none",
-            "approval_required": True,
-            "missing_capability": None,
-        }
-        if getattr(policy, "logical_task_id", None):
-            try:
-                import operator_task_authority as task_authority_module
-                task_authority = task_authority_module.task_status(policy.logical_task_id)
-                task_authority.setdefault("missing_capability", None)
-            except Exception as exc:
-                task_authority = {
-                    "label": "TASK_AUTHORITY",
-                    "logical_task_id": policy.logical_task_id,
-                    "task_state": "unknown",
-                    "approval_required": True,
-                    "missing_capability": f"task authority status unavailable: {exc.__class__.__name__}",
-                }
         result = {
             "success": True,
             "hermes_gpt_project_path": project_path,
@@ -708,13 +716,22 @@ def hermes_operator_status() -> str:
                 "failure_reason": policy.session_failure_reason,
                 "writable_roots": [str(p) for p in policy.writable_roots] if policy.session_id else [],
             },
-            "task_authority": task_authority,
             "registered_operator_tools": registered,
             "registered_tool_count": len(registered),
             "public_manifest": dict(REGISTERED_MANIFEST_VALIDATION),
-            "governed_kanban": op_governed_kanban.status_snapshot(),
             "audit_log_path": str(op_policy.audit_log_path()),
         }
+        try:
+            governed = importlib.import_module("operator_governed_kanban")
+            result["mission_control_kanban"] = governed.mission_control_snapshot()
+        except Exception as exc:
+            result["mission_control_kanban"] = {
+                "success": False,
+                "board": "hermes-stabilization",
+                "active_delegations": [],
+                "active_count": 0,
+                "error": f"{exc.__class__.__name__}: {exc}",
+            }
         return json.dumps(result, indent=2)
     except Exception as exc:
         return json.dumps(
@@ -775,39 +792,13 @@ def hermes_operator_session_status() -> str:
                 indent=2,
             )
         oauth_subject, oauth_client_id = op_policy.current_oauth_identity()
-        if policy.session_status == "task_bound":
-            import operator_task_authority as task_authority_module
-            task_state = task_authority_module.task_status(policy.logical_task_id)
-            task_state.setdefault("missing_capability", None)
-            return json.dumps(
-                {
-                    "success": True,
-                    "authority_kind": "task_bound",
-                    "logical_task_id": policy.logical_task_id,
-                    "session_id": policy.session_id,
-                    "snapshot_hash": policy.snapshot_hash,
-                    "issued_at": policy.session_approved_at,
-                    "expires_at": policy.expires_at,
-                    "approval_state": "approved",
-                    "level": policy.level,
-                    "apply_mode": policy.apply_mode,
-                    "readable_roots": [str(p) for p in policy.readable_roots],
-                    "writable_roots": [str(p) for p in policy.writable_roots],
-                    "verbs": policy.verbs,
-                    "task_authority": task_state,
-                    "oauth_subject": oauth_subject,
-                    "oauth_client_id": oauth_client_id,
-                    "owner_mode_ready": False,
-                    "revocation": "task completion/cancellation/revocation or source-session revoke",
-                },
-                indent=2,
-            )
         if policy.session_status == "standing":
             return json.dumps(
                 {
                     "success": True,
                     "authority_kind": "standing",
                     "standing_authority_id": policy.session_id,
+                    "session_status": policy.session_status,
                     "snapshot_hash": policy.snapshot_hash,
                     "issued_at": policy.session_approved_at,
                     "expires_at": None,
@@ -871,11 +862,6 @@ def hermes_operator_session_request_extension(minutes: int = 30) -> str:
                 "Standing authority has no authorization expiry and cannot be extended; "
                 "set a separate operational watchdog deadline instead."
             )
-        if policy.session_status == "task_bound":
-            raise ValueError(
-                "Task-bound authority follows the logical task lifecycle and cannot be extended "
-                "with a routine session extension; change task scope or request new authority instead."
-            )
         seconds = max(
             60,
             min(int(minutes) * 60, op_sessions.GLOBAL_MAX_SESSION_DURATION_SECONDS),
@@ -922,33 +908,42 @@ def hermes_operator_session_request_extension(minutes: int = 30) -> str:
         )
 
 
-def _notify_pending_request(request_type: str, request_id: str, details: dict) -> None:
-    """Best-effort: tell a human a new approval request is waiting, via
-    Telegram if configured. Never raises — a notification failure must never
-    block or fail the tool call that created the request. The localhost
-    approval page needs no push notification since it polls the same
-    pending-request tables directly.
+def _notify_pending_request(request_type: str, request_id: str, details: dict) -> dict:
+    """Best-effort approval notification with observable delivery status.
 
-    Forwards to the localhost-only approval centre (127.0.0.1:7690) rather
-    than sending Telegram messages directly -- this is the internet-facing
-    chatgpt-operator connector, so it must never hold the Telegram bot
-    token. Only the loopback-bound approval centre does."""
+    Notification failure never invalidates or deletes the pending approval
+    request. The caller can safely invoke the same logical request again: the
+    request broker reuses its existing request id and this function re-notifies
+    that same request instead of creating duplicate authority.
+    """
     try:
         import httpx
-        httpx.post(
+        response = httpx.post(
             "http://127.0.0.1:7690/notify",
             json={"request_type": request_type, "request_id": request_id, "details": details},
             timeout=3.0,
         )
-    except Exception:
-        pass
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        delivered = 200 <= status_code < 300
+        return {
+            "attempted": True,
+            "delivered_to_approval_centre": delivered,
+            "status_code": status_code or None,
+            "error": None if delivered else "approval centre returned a non-success status",
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "delivered_to_approval_centre": False,
+            "status_code": None,
+            "error": exc.__class__.__name__,
+        }
 
 
 def hermes_operator_session_request(
     policy_template: str,
     requested_duration_minutes: int = 60,
     reason: str = "",
-    authority_mode: str = "session",
 ) -> str:
     """Request a new Operator Session. This never creates authority by
     itself — it only ever records a pending request carrying the fully
@@ -963,7 +958,7 @@ def hermes_operator_session_request(
         mode = (
             "standing"
             if resolved.get("standing_authority_eligible", False)
-            else str(authority_mode or "session").strip().lower()
+            else "session"
         )
         if mode not in {"session", "standing"}:
             raise ValueError("authority_mode must be 'session' or 'standing'.")
@@ -1019,25 +1014,16 @@ def hermes_operator_session_request(
             )
         requested_seconds = max(60, int(requested_duration_minutes) * 60)
         capped_seconds = min(requested_seconds, resolved["max_duration_seconds"])
+        pending_before = {
+            str(item.get("request_id"))
+            for item in op_sessions.list_pending_session_requests()
+        }
         request_id = op_sessions.request_session(
             policy_template=policy_template,
             resolved_policy=policy_snapshot,
             requested_duration_seconds=capped_seconds,
             reason=reason.strip(),
         )
-        request_info = op_sessions.session_request_info(request_id)
-        request_status = str(request_info.get("status") or "pending")
-        logical_task_id = request_info.get("logical_task_id")
-        request_identity = request_info.get("request_identity")
-        already_authorized = False
-        if request_status == "approved" and logical_task_id:
-            try:
-                import operator_task_authority as task_authority_module
-                already_authorized = bool(
-                    task_authority_module.task_status(str(logical_task_id)).get("valid")
-                )
-            except Exception:
-                already_authorized = False
         op_policy.audit_record(
             tool="hermes_operator_session_request",
             level="none",
@@ -1053,28 +1039,21 @@ def hermes_operator_session_request(
                 "risk_class": approval_forecast["risk_class"],
                 "risk_tier": approval_forecast["tier"],
                 "risk_factors_hash": approval_forecast["factors_hash"],
-                "logical_task_id": logical_task_id,
-                "request_identity": request_identity,
-                "request_status": request_status,
-                "already_authorized": already_authorized,
             },
         )
-        if request_status == "pending":
-            _notify_pending_request(
-                "session_creation",
-                request_id,
-                {
-                    "request_id": request_id,
-                    "policy_template": policy_template,
-                    "resolved_policy": policy_snapshot,
-                    "requested_duration_seconds": capped_seconds,
-                    "authority_mode": mode,
-                    "approval_forecast": approval_forecast,
-                    "reason": reason.strip(),
-                    "logical_task_id": logical_task_id,
-                    "request_identity": request_identity,
-                },
-            )
+        notification = _notify_pending_request(
+            "session_creation",
+            request_id,
+            {
+                "request_id": request_id,
+                "policy_template": policy_template,
+                "resolved_policy": policy_snapshot,
+                "requested_duration_seconds": capped_seconds,
+                "authority_mode": mode,
+                "approval_forecast": approval_forecast,
+                "reason": reason.strip(),
+            },
+        )
         return json.dumps(
             {
                 "success": True,
@@ -1084,18 +1063,14 @@ def hermes_operator_session_request(
                 "requested_duration_seconds": capped_seconds,
                 "authority_mode": mode,
                 "approval_forecast": approval_forecast,
-                "logical_task_id": logical_task_id,
-                "request_identity": request_identity,
-                "status": "already_authorized" if already_authorized else request_status,
+                "status": "pending",
+                "request_reused": request_id in pending_before,
+                "notification": notification,
                 "note": (
-                    "Equivalent approved task authority is already active; no new human approval was created."
-                    if already_authorized
-                    else (
-                        "Requires local (Telegram or localhost) approval. Standing mode creates "
-                        "a revocable, policy-bound LOW-risk authority plus a short operational session."
-                        if mode == "standing"
-                        else "Requires local (Telegram or localhost) approval before any authority is created."
-                    )
+                    "Requires local (Telegram or localhost) approval. Standing mode creates "
+                    "a revocable, policy-bound LOW-risk authority plus a short operational session."
+                    if mode == "standing"
+                    else "Requires local (Telegram or localhost) approval before any session is created."
                 ),
             },
             indent=2,
@@ -1123,63 +1098,10 @@ def hermes_operator_session_request(
 
 
 def hermes_operator_session_revoke(session_id: str = "") -> str:
-    """Revoke an authority, or complete ``task:<logical_task_id>`` for stale clients."""
+    """Revoke the active Operator Session or an explicitly supplied session id."""
     try:
-        explicit_target = (session_id or "").strip()
-        if explicit_target.startswith("task:"):
-            task_id = explicit_target.removeprefix("task:").strip()
-            if not task_id:
-                raise ValueError("task:<logical_task_id> requires a non-empty logical task id.")
-            policy = op_policy.OperatorPolicy(logical_task_id=task_id)
-            if (
-                policy.authority_kind != "task_bound"
-                or policy.session_status != "task_bound"
-                or policy.logical_task_id != task_id
-            ):
-                raise PermissionError(
-                    "Task completion requires active task-bound authority for the named logical task."
-                )
-            before = op_task_authority.task_status(task_id, root=op_sessions.session_root())
-            if not before.get("valid") or before.get("task_state") != "active":
-                raise PermissionError(
-                    f"Logical task {task_id!r} is not active and cannot be completed."
-                )
-            op_task_authority.complete_task(
-                task_id,
-                actor="hermes_operator_session_revoke:task-compat",
-                root=op_sessions.session_root(),
-            )
-            after = op_task_authority.task_status(task_id, root=op_sessions.session_root())
-            op_policy.audit_record(
-                tool="hermes_operator_session_revoke",
-                level=policy.level,
-                apply_mode=policy.apply_mode,
-                dry_run=False,
-                success=True,
-                changed=True,
-                summary="completed logical task via stale-client compatibility selector",
-                extra={
-                    "logical_task_id": task_id,
-                    "authority_kind": "task_bound",
-                    "action": "complete",
-                    "task_state": after.get("task_state"),
-                    "task_authority_valid": after.get("valid"),
-                },
-            )
-            return json.dumps(
-                {
-                    "success": True,
-                    "completed": True,
-                    "logical_task_id": task_id,
-                    "authority_kind": "task_bound",
-                    "task_authority": after,
-                    "compatibility_path": True,
-                },
-                indent=2,
-            )
-
         policy = op_policy.OperatorPolicy()
-        target = (explicit_target or policy.session_id or "").strip()
+        target = (session_id or policy.session_id or "").strip()
         if not target:
             raise ValueError("session_id is required.")
         if policy.session_status == "standing" or target.startswith("sa_"):
@@ -1201,22 +1123,18 @@ def hermes_operator_session_revoke(session_id: str = "") -> str:
             dry_run=False,
             success=True,
             changed=changed,
-            summary=(
-                f"revoked operator {authority_kind} authority"
-                if changed
-                else f"operator {authority_kind} authority was already revoked or missing"
-            ),
-            extra={"target_authority_id": target, "authority_kind": authority_kind},
+            summary="revoked operator session" if changed else "operator session was already revoked or missing",
+            extra={"target_session_id": target, "authority_kind": authority_kind},
         )
-        return json.dumps(
-            {
-                "success": True,
-                "revoked": changed,
-                "authority_id": target,
-                "authority_kind": authority_kind,
-            },
-            indent=2,
-        )
+        response = {
+            "success": True,
+            "revoked": changed,
+            "authority_id": target,
+            "authority_kind": authority_kind,
+        }
+        if authority_kind == "session":
+            response["session_id"] = target
+        return json.dumps(response, indent=2)
     except Exception as exc:
         return json.dumps(
             op_policy.error_from_exception(
@@ -1224,63 +1142,6 @@ def hermes_operator_session_revoke(session_id: str = "") -> str:
                 layer="operator",
                 code="OPERATOR_SESSION_REVOKE_ERROR",
                 suggested_action="Check the active Operator Session id.",
-            ),
-            indent=2,
-        )
-
-
-def hermes_operator_task_complete() -> str:
-    """Complete the currently active logical task and invalidate its authority."""
-    try:
-        policy = op_policy.OperatorPolicy()
-        task_id = (policy.logical_task_id or "").strip()
-        if policy.authority_kind != "task_bound" or policy.session_status != "task_bound" or not task_id:
-            raise PermissionError(
-                "Task completion requires an active task-bound Operator authority."
-            )
-
-        before = op_task_authority.task_status(task_id, root=op_sessions.session_root())
-        if not before.get("valid") or before.get("task_state") != "active":
-            raise PermissionError(
-                f"Logical task {task_id!r} is not active and cannot be completed."
-            )
-
-        op_task_authority.complete_task(
-            task_id,
-            actor="hermes_operator_task_complete",
-            root=op_sessions.session_root(),
-        )
-        after = op_task_authority.task_status(task_id, root=op_sessions.session_root())
-        op_policy.audit_record(
-            tool="hermes_operator_task_complete",
-            level=policy.level,
-            apply_mode=policy.apply_mode,
-            dry_run=False,
-            success=True,
-            changed=True,
-            summary="completed logical task and invalidated task-bound authority",
-            extra={
-                "logical_task_id": task_id,
-                "task_state": after.get("task_state"),
-                "task_authority_valid": after.get("valid"),
-            },
-        )
-        return json.dumps(
-            {
-                "success": True,
-                "completed": True,
-                "logical_task_id": task_id,
-                "task_authority": after,
-            },
-            indent=2,
-        )
-    except Exception as exc:
-        return json.dumps(
-            op_policy.error_from_exception(
-                exc,
-                layer="operator",
-                code="OPERATOR_TASK_COMPLETE_ERROR",
-                suggested_action="Use this tool only while the intended logical task has active task-bound authority.",
             ),
             indent=2,
         )
@@ -1336,6 +1197,11 @@ def hermes_computer_use_doctor(timeout: int = 15) -> str:
         agent_root=HERMES_ROOT,
         hermes_root=_default_hermes_root(),
     )
+
+
+def hermes_claude_desktop_restart(dry_run: bool = True) -> str:
+    """Restart only the already-running Windows Claude Desktop application."""
+    return op_windows_app.hermes_claude_desktop_restart(dry_run=dry_run)
 
 
 # --- Cron wrappers (pass hermes_root through) ----------------------------
@@ -1671,6 +1537,13 @@ def hermes_routing_release_v019(dry_run: bool = True) -> str:
     return op_release.hermes_routing_release_v019(dry_run=dry_run)
 
 
+hermes_first_safe_model_prepare = op_first_safe.hermes_first_safe_model_prepare
+hermes_first_safe_model_verify = op_first_safe.hermes_first_safe_model_verify
+hermes_first_safe_provision_prepare = op_first_safe_provision.hermes_first_safe_provision_prepare
+hermes_first_safe_provision_execute = op_first_safe_provision.hermes_first_safe_provision_execute
+hermes_first_safe_provision_verify = op_first_safe_provision.hermes_first_safe_provision_verify
+
+
 def hermes_delegate_task_forecast(
     workdir: str,
     mode: str = "apply",
@@ -1854,166 +1727,40 @@ def bridge_write_adjudication(command_id: str, verdict: str, root: str | None = 
     return op_bridge.bridge_write_adjudication(command_id=command_id, verdict=verdict, root=root)
 
 
-def _ops_brain_frontmatter(path: Path) -> dict[str, Any]:
-    """Read YAML frontmatter from one policy-authorized Markdown document."""
-    text = path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        return {}
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    import yaml
-
-    payload = yaml.safe_load(parts[1]) or {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _policy_scoped_ops_brain_docs(policy: op_policy.OperatorPolicy, ops_brain: Path) -> list[Path]:
-    """Return only Markdown documents covered by the current read authority.
-
-    A narrow standing authority may intentionally grant selected project files
-    without granting the whole OpsBrain directory. In that case the query tool
-    must not reject the authority merely because the parent directory is not an
-    allowed root, and it must not scan files outside the approved snapshot.
-    """
-    roots = policy.readable_roots or policy.allowed_paths
-    documents: set[Path] = set()
-    for raw_root in roots:
-        root = Path(raw_root).expanduser().resolve(strict=False)
-        if not op_policy.path_under_allowed(root, [ops_brain]):
-            continue
-        if root.is_file():
-            if root.suffix.lower() == ".md" and not policy.denies_path(root):
-                documents.add(root)
-            continue
-        if root.is_dir():
-            for candidate in root.rglob("*.md"):
-                resolved = candidate.resolve(strict=False)
-                try:
-                    policy.require_read_path(resolved)
-                except PermissionError:
-                    continue
-                documents.add(resolved)
-    return sorted(documents, key=lambda item: str(item))
-
-
-def _scoped_ops_brain_query(
-    policy: op_policy.OperatorPolicy,
-    ops_brain: Path,
-    command: str,
-    keyword: str,
-    limit: int,
-) -> str:
-    """Query only documents explicitly readable under a narrow policy snapshot."""
-    docs = _policy_scoped_ops_brain_docs(policy, ops_brain)
-    records: list[tuple[Path, dict[str, Any]]] = []
-    for path in docs:
-        policy.require_read_path(path)
-        try:
-            records.append((path, _ops_brain_frontmatter(path)))
-        except (OSError, ValueError):
-            continue
-
-    key = (keyword or "").strip().lower()
-
-    def identity(path: Path, data: dict[str, Any]) -> str:
-        rel = str(path.relative_to(ops_brain)).lower()
-        name = str(data.get("name") or "").lower()
-        return " ".join((name, path.stem.lower(), rel))
-
-    if command in {"status", "evidence", "linked"}:
-        if not key:
-            return f"OpsBrain query command {command!r} requires keyword."
-        records = [(path, data) for path, data in records if key in identity(path, data)]
-
-    items: list[dict[str, Any]] = []
-    for path, data in records:
-        rel = str(path.relative_to(ops_brain))
-        base = {"path": rel, "name": data.get("name") or path.stem}
-        if command == "status":
-            base.update(
-                {
-                    "type": data.get("type"),
-                    "status": data.get("status"),
-                    "priority": data.get("priority"),
-                    "next_action": data.get("next_action"),
-                    "blocked_by": data.get("blocked_by") or [],
-                    "health": data.get("health"),
-                }
-            )
-        elif command == "evidence":
-            base["evidence"] = data.get("evidence") or []
-        elif command == "linked":
-            base["related"] = data.get("related") or []
-        elif command == "blockers":
-            blockers = data.get("blocked_by") or []
-            if not blockers:
-                continue
-            base["blocked_by"] = blockers
-        elif command == "next-actions":
-            actions = data.get("next_actions") or data.get("next_action")
-            if not actions:
-                continue
-            base["next_actions"] = actions
-        elif command == "projects":
-            if data.get("type") != "project" and "projects" not in path.parts:
-                continue
-            base["status"] = data.get("status")
-        elif command == "runbooks":
-            if data.get("type") != "runbook" and "runbooks" not in path.parts:
-                continue
-        items.append(base)
-        if len(items) >= limit:
-            break
-
-    return json.dumps(
-        {
-            "scope": "operator_policy_readable_roots",
-            "command": command,
-            "count": len(items),
-            "items": items,
-        },
-        indent=2,
-    )
-
-
 def hermes_ops_brain_query(command: str, keyword: str = "", limit: int = 5) -> str:
-    """Run a read-only OpsBrain query within the current authority snapshot.
+    """Run the read-only OpsBrain Markdown query prototype.
 
-    When the policy grants the complete OpsBrain root, this uses the committed
-    query prototype unchanged. When the policy grants only selected Markdown
-    documents, it uses a policy-scoped frontmatter query and never scans beyond
-    those readable roots. No shell, index mutation, runtime/session database, or
-    write path is involved.
+    This is a narrow wrapper around ~/.hermes/ops-brain/tools/ops_brain_query.py.
+    It does not use a shell, does not create an index, and does not inspect
+    runtime/session databases. It only reads OpsBrain Markdown through the
+    committed query prototype.
     """
     try:
-        policy = op_policy.OperatorPolicy()
-        policy.require_level("read_only")
         hermes_root = _hermes_root_for_operator()
         if hermes_root is None:
             return "OpsBrain query unavailable: Hermes root could not be resolved."
         ops_brain = hermes_root / "ops-brain"
+        if op_policy.is_denied_path(ops_brain):
+            return "OpsBrain query unavailable: OpsBrain path is denied by policy."
+
+        def _validate_ops_brain_read(candidate):
+            candidate.require_level("read_only")
+            candidate.require_read_path(ops_brain)
+
+        # Do not let an unrelated narrow task/session shadow an independently
+        # sufficient standing read authority. Select one complete approved
+        # authority for this operation; never union capabilities across grants.
+        policy = op_workspace._select_workspace_operation_policy(_validate_ops_brain_read)
+        script = ops_brain / "tools" / "ops_brain_query.py"
+        if not script.is_file():
+            return f"OpsBrain query unavailable: missing {script}."
 
         cmd = (command or "").strip()
         allowed = {"status", "evidence", "linked", "blockers", "next-actions", "projects", "runbooks"}
         if cmd not in allowed:
             return "Unsupported OpsBrain query command. Allowed: " + ", ".join(sorted(allowed))
+
         lim = max(1, min(int(limit or 5), 20))
-
-        try:
-            policy.require_read_path(ops_brain)
-            full_root_allowed = True
-        except PermissionError:
-            full_root_allowed = False
-
-        if not full_root_allowed:
-            return _scoped_ops_brain_query(policy, ops_brain, cmd, keyword, lim)
-
-        script = ops_brain / "tools" / "ops_brain_query.py"
-        policy.require_read_path(script)
-        if not script.is_file():
-            return f"OpsBrain query unavailable: missing {script}."
-
         argv: list[str] = [cmd]
         if cmd in {"status", "evidence", "linked"}:
             key = (keyword or "").strip()
@@ -2203,8 +1950,6 @@ def build_server(
     if provider is not None:
         op_auth.register_login_routes(server, provider)
     register_tools(server, include_bridge=bridge_requested, profile=profile)
-    if profile == CHATGPT_OPERATOR_PROFILE:
-        op_governed_kanban.start_dispatcher()
     return server
 
 
@@ -2236,12 +1981,12 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_operator_session_request,
         hermes_operator_session_request_extension,
         hermes_operator_session_revoke,
-        hermes_operator_task_complete,
         hermes_operator_audit_tail,
         hermes_operator_doctor,
         hermes_operator_snapshot,
         hermes_computer_use_status,
         hermes_computer_use_doctor,
+        hermes_claude_desktop_restart,
         hermes_config_get,
         hermes_env_status,
         hermes_gateway_status,
@@ -2255,6 +2000,11 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_workspace_exec,
         hermes_workspace_git_commit,
         hermes_routing_release_v019,
+        hermes_first_safe_model_prepare,
+        hermes_first_safe_model_verify,
+        hermes_first_safe_provision_prepare,
+        hermes_first_safe_provision_execute,
+        hermes_first_safe_provision_verify,
         hermes_antigravity_review_start,
         hermes_antigravity_review_status,
         hermes_antigravity_review_cancel,
@@ -2271,6 +2021,9 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_delegated_task_cancel,
         hermes_git_status,
         hermes_git_diff,
+        hermes_mission_control_lease_acquire,
+        hermes_mission_control_lease_release,
+        hermes_mission_control_lease_status,
     ]
 
 
@@ -2284,8 +2037,118 @@ def register_tools(
     RUNTIME_PROFILE = profile
     registered: list[str] = []
 
+    read_only_tools = {
+        "hermes_antigravity_dispatch_status",
+        "hermes_antigravity_review_status",
+        "hermes_computer_use_doctor",
+        "hermes_computer_use_status",
+        "hermes_config_get",
+        "hermes_delegate_task_forecast",
+        "hermes_delegated_task_result",
+        "hermes_delegated_task_status",
+        "hermes_env_status",
+        "hermes_gateway_status",
+        "hermes_first_safe_provision_verify",
+        "hermes_git_diff",
+        "hermes_git_status",
+        "hermes_mission_control_lease_status",
+        "hermes_operator_audit_tail",
+        "hermes_operator_doctor",
+        "hermes_operator_policy",
+        "hermes_operator_session_status",
+        "hermes_operator_snapshot",
+        "hermes_operator_status",
+        "hermes_ops_brain_query",
+        "hermes_search_files",
+        "hermes_workspace_read",
+    }
+
+    # Explicit execution semantics for the Mission Control coordination lease.
+    # A client that receives no annotations must fall back to the MCP spec
+    # defaults (readOnlyHint=false, destructiveHint=true, openWorldHint=true),
+    # which reads a bounded, local, additive lease marker as a destructive
+    # open-world mutation. These values state the real semantics rather than
+    # soften them: acquire and release stay honestly state-changing
+    # (readOnlyHint=False) and are only declared non-destructive, closed-world
+    # and locally scoped, which is what they are.
+    explicit_tool_annotations = {
+        # FIRST_SAFE, stated truthfully rather than left to the MCP spec
+        # defaults (readOnlyHint=false, destructiveHint=true, openWorldHint=true)
+        # that an un-annotated tool inherits.
+        #
+        # Prepare writes one local intent record and nothing else: state-changing
+        # (not read-only), non-destructive (it creates a record; it changes no
+        # user content, config, credential or authority), closed-world (purely
+        # local disk -- it makes no network call of any kind), and idempotent
+        # (re-preparing while a live intent exists returns that same intent).
+        "hermes_first_safe_model_prepare": ToolAnnotations(
+            title="Prepare the governed FIRST_SAFE hermes-exec acceptance (records intent only)",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        # Verify only reads a local record.
+        "hermes_first_safe_model_verify": ToolAnnotations(
+            title="Read FIRST_SAFE acceptance evidence",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        "hermes_first_safe_provision_prepare": ToolAnnotations(
+            title="Prepare governed FIRST_SAFE target provisioning (records intent only)",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        "hermes_first_safe_provision_execute": ToolAnnotations(
+            title="Execute one prepared FIRST_SAFE target provisioning intent via the fixed trusted worker",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+        "hermes_first_safe_provision_verify": ToolAnnotations(
+            title="Read FIRST_SAFE provisioning evidence",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        "hermes_mission_control_lease_status": ToolAnnotations(
+            title="Read Mission Control lease status",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+        "hermes_mission_control_lease_acquire": ToolAnnotations(
+            title="Acquire Mission Control coordination lease",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+        "hermes_mission_control_lease_release": ToolAnnotations(
+            title="Release Mission Control coordination lease",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    }
+
     def add(tool: Any) -> None:
-        server.add_tool(tool, meta=tool_meta())
+        annotations = explicit_tool_annotations.get(tool.__name__)
+        if annotations is None and tool.__name__ in read_only_tools:
+            annotations = ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                openWorldHint=False,
+            )
+        server.add_tool(tool, meta=tool_meta(), annotations=annotations)
         registered.append(tool.__name__)
 
     def finalize() -> None:

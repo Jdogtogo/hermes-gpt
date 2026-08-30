@@ -151,9 +151,7 @@ def test_cannot_submit_raw_roots_or_policy_json(isolated_session_root, audit_ove
     is no channel through which a remote caller could smuggle one in."""
     import inspect
     sig = inspect.signature(server.hermes_operator_session_request)
-    assert set(sig.parameters) == {
-        "policy_template", "requested_duration_minutes", "reason", "authority_mode"
-    }
+    assert set(sig.parameters) == {"policy_template", "requested_duration_minutes", "reason"}
 
 
 def test_notify_failure_never_breaks_the_tool(isolated_session_root, audit_override, monkeypatch):
@@ -164,6 +162,53 @@ def test_notify_failure_never_breaks_the_tool(isolated_session_root, audit_overr
         policy_template="sandbox", requested_duration_minutes=60, reason="x",
     ))
     assert out["success"] is True
+
+
+def test_notify_failure_is_visible_but_request_remains_pending(isolated_session_root, audit_override, monkeypatch):
+    def fail_post(*args, **kwargs):
+        raise RuntimeError("approval centre unavailable")
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", fail_post)
+
+    out = json.loads(server.hermes_operator_session_request(
+        policy_template="sandbox", requested_duration_minutes=60, reason="visible notify failure",
+    ))
+    assert out["success"] is True
+    assert out["status"] == "pending"
+    assert out["notification"]["attempted"] is True
+    assert out["notification"]["delivered_to_approval_centre"] is False
+    assert out["notification"]["error"] == "RuntimeError"
+    pending = op_sessions.list_pending_session_requests(root=isolated_session_root)
+    assert [item["request_id"] for item in pending] == [out["request_id"]]
+
+
+def test_identical_pending_request_is_reused_and_renotified(isolated_session_root, audit_override, monkeypatch):
+    calls = []
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        class FakeResponse:
+            status_code = 200
+        return FakeResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    first = json.loads(server.hermes_operator_session_request(
+        policy_template="sandbox", requested_duration_minutes=60, reason="same logical approval",
+    ))
+    second = json.loads(server.hermes_operator_session_request(
+        policy_template="sandbox", requested_duration_minutes=60, reason="same logical approval",
+    ))
+
+    assert first["request_id"] == second["request_id"]
+    assert first["request_reused"] is False
+    assert second["request_reused"] is True
+    assert second["notification"]["delivered_to_approval_centre"] is True
+    assert len(calls) == 2
+    assert calls[0]["json"]["request_id"] == calls[1]["json"]["request_id"]
+    assert len(op_sessions.list_pending_session_requests(root=isolated_session_root)) == 1
 
 
 def test_notify_forwards_to_localhost_approval_centre_only(isolated_session_root, audit_override, monkeypatch):

@@ -153,7 +153,7 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "active": True,
         "description": (
             "Durable low-risk standing authority for the dedicated Hermes Stabilization "
-            "Kanban board only. It may read and edit that named board directory but cannot "
+            "Kanban board. It may read OpsBrain and may read and edit only that named board directory, but cannot "
             "touch the default kanban.db, other boards, services, network, repositories, "
             "credentials, client/financial data, releases, or runtime authority state."
         ),
@@ -164,7 +164,8 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "apply_mode": "direct",
             "allowed_profiles": ["default"],
             "readable_roots": [
-                "/home/jfroh/.hermes/kanban/boards/hermes-stabilization"
+                "/home/jfroh/.hermes/kanban/boards/hermes-stabilization",
+                "/home/jfroh/.hermes/ops-brain",
             ],
             "writable_roots": [
                 "/home/jfroh/.hermes/kanban/boards/hermes-stabilization"
@@ -288,6 +289,33 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": ["mission-control/preservation-integration"],
         "baseline_required": True,
     },
+    "hermes-claude-desktop-restart": {
+        "active": True,
+        "description": (
+            "Fixed-purpose restart of the already-running Windows Claude Desktop application. "
+            "No arbitrary process names, executable paths, shell commands, GUI automation, or file access."
+        ),
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [],
+            "writable_roots": [],
+            "verbs": {"applications": ["restart"]},
+            "containment_strength": "process",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "has_secret_access": False,
+            "has_credential_access": False,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": False,
+            "has_deployment": False,
+        },
+        "max_duration_seconds": 30 * 60,
+        "allowed_branches": None,
+        "baseline_required": False,
+    },
     "hermes-gpt-operator-maintenance": {
         "active": True,
         "description": "Maintenance access to the operator profile's own source worktree.",
@@ -308,8 +336,14 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
                 "multimodal-kimi-k26",
                 "vision-nemotron-omni",
             ],
-            "readable_roots": ["/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"],
-            "writable_roots": ["/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt",
+                "/home/jfroh/.hermes/ops-brain/antigravity/runtime",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt",
+                "/home/jfroh/.hermes/ops-brain/antigravity/runtime",
+            ],
             "service_units": [
                 "hermes-gpt-chatgpt-operator.service",
                 "hermes-gpt-approval-web.service",
@@ -323,6 +357,141 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         },
         "max_duration_seconds": _FOUR_HOURS,
         "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
+        "baseline_required": False,
+    },
+    "hermes-exec-first-safe-model": {
+        "active": True,
+        "description": (
+            "One-purpose authority for the fixed hermes-exec first-safe free-model acceptance. "
+            "The connector egress is fixed to hermes-exec; the trusted worker then performs exactly "
+            "two zero-cost API-key-authenticated model calls from the dedicated first-safe profile. "
+            "No arbitrary remote command, host, path, model, service, Git write, OAuth flow, or "
+            "broader routing capability is granted."
+        ),
+        "risk_tier": 3,
+        "standing_authority_eligible": False,
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt/.release-preservation",
+            ],
+            "writable_roots": [],
+            "egress_hosts": ["hermes-exec"],
+            "service_units": [],
+            "hard_denied_paths": [
+                "/home/jfroh/.ssh",
+                "/home/jfroh/.hermes/.env",
+                "/home/jfroh/.hermes/.env.*",
+                "/home/jfroh/.hermes/auth",
+                "/home/jfroh/.hermes/auth.json",
+                "/home/jfroh/.hermes/credentials",
+                "/home/jfroh/.hermes/**/credentials",
+                "/home/jfroh/.hermes/**/API keys",
+                "/home/jfroh/.hermes/**/OAuth tokens",
+                "/home/jfroh/.hermes/**/secret stores",
+                "/home/jfroh/.hermes/**/private keys",
+                "/home/jfroh/.hermes/**/SSH material",
+            ],
+            "verbs": {
+                "filesystem": ["edit"],
+                "tests": ["run"],
+                # Fixed-purpose, read-only inspection of the single Mission
+                # Control coordination lease record. Mission Control must
+                # verify it holds the lease before invoking the fixed VM
+                # operation. Deliberately NOT filesystem:read: this capability
+                # takes no path input, enumerates nothing and writes nothing,
+                # so the policy keeps a zero general local read/write surface.
+                "mission_control": ["lease_status"],
+            },
+            "containment_strength": "vm",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "branch_guard_verified": True,
+            "baseline_guard_verified": True,
+            "single_writer_verified": True,
+            "untracked_delete_protected": True,
+            "version_controlled_rollback": False,
+            "deliverable_verification_required": True,
+            "deliverable_verification_verified": False,
+            "data_sensitivity": "internal",
+            "production_effect": "config",
+            "paid_route_change": "none",
+            "has_secret_access": False,
+            "has_credential_access": False,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": False,
+            "has_deployment": False,
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": None,
+        "baseline_required": False,
+    },
+    "hermes-exec-first-safe-provision": {
+        "active": True,
+        "description": (
+            "One-purpose PRE-LIVE authority for fixed trusted provisioning of the dedicated "
+            "first-safe profile on jfroh@hermes-exec. The connector only records/verifies a bounded "
+            "intent; the trusted host worker may create the approved sparse profile config only after "
+            "the target-local private profile .env already exists with the expected key name. No secret "
+            "value is read or returned, and no model/API call, arbitrary command, service, Git, OAuth, "
+            "Cloudflare, cron, cutover or WSL-retirement capability is granted."
+        ),
+        "risk_tier": 3,
+        "standing_authority_eligible": False,
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt/.release-preservation",
+            ],
+            "writable_roots": [],
+            "egress_hosts": ["hermes-exec"],
+            "service_units": [],
+            "hard_denied_paths": [
+                "/home/jfroh/.ssh",
+                "/home/jfroh/.hermes/.env",
+                "/home/jfroh/.hermes/.env.*",
+                "/home/jfroh/.hermes/auth",
+                "/home/jfroh/.hermes/auth.json",
+                "/home/jfroh/.hermes/credentials",
+                "/home/jfroh/.hermes/**/credentials",
+                "/home/jfroh/.hermes/**/API keys",
+                "/home/jfroh/.hermes/**/OAuth tokens",
+                "/home/jfroh/.hermes/**/secret stores",
+                "/home/jfroh/.hermes/**/private keys",
+                "/home/jfroh/.hermes/**/SSH material",
+            ],
+            "verbs": {
+                "filesystem": ["read", "edit"],
+                "tests": ["run"],
+                "mission_control": ["lease_status"],
+            },
+            "containment_strength": "vm",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "branch_guard_verified": True,
+            "baseline_guard_verified": True,
+            "single_writer_verified": True,
+            "untracked_delete_protected": True,
+            "version_controlled_rollback": False,
+            "deliverable_verification_required": True,
+            "deliverable_verification_verified": False,
+            "data_sensitivity": "internal",
+            "production_effect": "config",
+            "paid_route_change": "none",
+            "has_secret_access": False,
+            "has_credential_access": False,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": False,
+            "has_deployment": False,
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": None,
         "baseline_required": False,
     },
     "hermes-routing-v019-release": {
@@ -594,6 +763,50 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "verbs": {
                 "filesystem": ["read", "edit"],
                 "services": ["restart"],
+                "tests": ["run"],
+            },
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": None,
+        "baseline_required": False,
+    },
+    "hermes-windows-stale-backend-cleanup": {
+        "active": True,
+        "description": (
+            "Task-bound cleanup authority for the retired Windows Hermes/LiteLLM duplicate only. "
+            "Allows evidence backup/quarantine and disabling its known autostart launchers while preserving WSL Hermes as authoritative."
+        ),
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/mnt/c/Users/jfroh/.hermes",
+                "/mnt/c/Users/jfroh/.litellm",
+                "/mnt/c/Users/jfroh/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/HermesLiteLLM.vbs",
+                "/mnt/c/Users/jfroh/Desktop/Hermes Desktop.lnk",
+                "/mnt/c/Users/jfroh/OneDrive/Desktop/Hermes Desktop.lnk",
+                "/mnt/c/Users/jfroh/Launch-Hermes-Desktop.ps1",
+                "/home/jfroh/.hermes/model-routing-migration",
+            ],
+            "writable_roots": [
+                "/mnt/c/Users/jfroh/.hermes",
+                "/mnt/c/Users/jfroh/.litellm",
+                "/mnt/c/Users/jfroh/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/HermesLiteLLM.vbs",
+                "/home/jfroh/.hermes/model-routing-migration",
+            ],
+            "hard_denied_paths": [
+                "/home/jfroh/.hermes/config.yaml",
+                "/home/jfroh/.hermes/.env",
+                "/home/jfroh/.hermes/.env.*",
+                "/home/jfroh/.hermes/auth.json",
+                "/home/jfroh/.hermes/profiles",
+                "/home/jfroh/.hermes/ops-brain",
+                "/home/jfroh/.hermes/memories",
+                "/home/jfroh/.hermes/skills",
+            ],
+            "verbs": {
+                "filesystem": ["read", "edit"],
                 "tests": ["run"],
             },
         },

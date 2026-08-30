@@ -142,6 +142,62 @@ def _reset_state(monkeypatch, kb):
     )
 
 
+def test_mission_control_record_persists_task_id_and_review_lifecycle(monkeypatch):
+    kb = FakeKanban()
+    _reset_state(monkeypatch, kb)
+    task = {
+        "logical_work_id": "lw_watch",
+        "task_id": "dt_watch",
+        "status": "running",
+        "workdir": "/tmp/work",
+        "review_status": None,
+        "outcome_reason": "",
+    }
+
+    assert gk.record_mission_control_task(task, event="running") is True
+    card = next(t for t in kb.tasks.values() if t.idempotency_key == "mission-control:lw_watch")
+    assert card.status == "running"
+    assert any(c.body == "governed-delegation-task-id=dt_watch" for c in kb.comments[card.id])
+    snapshot = gk.mission_control_snapshot()
+    assert snapshot["active_count"] == 1
+    assert snapshot["active_delegations"][0]["delegated_task_id"] == "dt_watch"
+
+    task["status"] = "completed"
+    assert gk.record_mission_control_task(task, event="completed") is True
+    assert card.status == "review"
+    snapshot = gk.mission_control_snapshot()
+    assert snapshot["active_count"] == 1
+    assert snapshot["active_delegations"][0]["status"] == "review"
+    assert gk.mission_control_task_status("lw_watch") == "In Review"
+
+    task["review_status"] = "accepted"
+    task["review_summary"] = "independent acceptance passed"
+    assert gk.record_mission_control_task(task, event="review_accepted") is True
+    assert card.status == "done"
+    assert gk.mission_control_task_status("lw_watch") == "Completed"
+    assert gk.mission_control_snapshot()["active_count"] == 0
+
+
+def test_mission_control_record_blocks_terminal_failure(monkeypatch):
+    kb = FakeKanban()
+    _reset_state(monkeypatch, kb)
+    task = {
+        "logical_work_id": "lw_failed",
+        "task_id": "dt_failed",
+        "status": "failed",
+        "workdir": "/tmp/work",
+        "failure_category": "model_failure",
+        "outcome_reason": "bounded worker failed",
+    }
+
+    assert gk.record_mission_control_task(task, event="failed") is True
+    card = next(t for t in kb.tasks.values() if t.idempotency_key == "mission-control:lw_failed")
+    assert card.status == "blocked"
+    assert card.block_reason == "bounded worker failed"
+    assert gk.mission_control_task_status("lw_failed") == "On Hold"
+    assert gk.mission_control_snapshot()["active_count"] == 0
+
+
 def test_seed_uses_named_board_and_blocks_material_boundaries(monkeypatch):
     kb = FakeKanban()
     _reset_state(monkeypatch, kb)
@@ -194,7 +250,7 @@ def test_ready_card_is_forecast_then_queued_through_governed_delegation(monkeypa
     assert result["counts"]["running"] == 1
 
 
-def test_running_card_completes_from_delegated_evidence(monkeypatch):
+def test_running_card_moves_to_review_from_delegated_evidence(monkeypatch):
     kb = FakeKanban()
     _reset_state(monkeypatch, kb)
     ids = gk._ensure_board_and_seed(kb, FakePolicy())
@@ -205,6 +261,11 @@ def test_running_card_completes_from_delegated_evidence(monkeypatch):
     delegate_task.started_at = 100
     kb.add_comment(None, delegate_task.id, gk.CREATED_BY, "governed-delegation-task-id=dt_done")
 
+    monkeypatch.setattr(
+        gk.op_delegation,
+        "hermes_delegated_task_status",
+        lambda task_id: json.dumps({"success": True, "task_id": task_id, "status": "completed", "latest_status": "completed"}),
+    )
     monkeypatch.setattr(
         gk.op_delegation,
         "hermes_delegated_task_result",
@@ -233,9 +294,9 @@ def test_running_card_completes_from_delegated_evidence(monkeypatch):
 
     gk.dispatch_once()
 
-    assert kb.tasks[delegate_task.id].status == "done"
-    assert kb.tasks[delegate_task.id].metadata["delegated_task_id"] == "dt_done"
-    assert kb.tasks[delegate_task.id].metadata["authority_id"] == "sa_contained"
+    assert kb.tasks[delegate_task.id].status == "review"
+    assert kb.tasks[delegate_task.id].result == "Verified governed completion."
+    assert any(c.body == "mission-control-review-required=v1" for c in kb.comments[delegate_task.id])
 
 
 def test_forecast_denial_blocks_instead_of_bypassing_authority(monkeypatch):

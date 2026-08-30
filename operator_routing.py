@@ -454,6 +454,7 @@ class ResolvedRouting:
     alternates: list[RouteCandidate] = field(default_factory=list)
     excluded: list[ExcludedRoute] = field(default_factory=list)
     free_only: bool = True
+    fallbacks_disabled: bool = False
     max_alternate_attempts: int = DEFAULT_MAX_ALTERNATE_ATTEMPTS
     provider_order: tuple[str, ...] = CANONICAL_PROVIDER_ORDER
     deadline_seconds: int = 0
@@ -470,6 +471,7 @@ class ResolvedRouting:
             "eligible_alternate_count": len(self.alternates),
             "excluded": [item.to_audit_dict() for item in self.excluded],
             "free_only": self.free_only,
+            "fallbacks_disabled": self.fallbacks_disabled,
             "max_alternate_attempts": self.max_alternate_attempts,
             "provider_order": list(self.provider_order),
             "deadline_seconds": self.deadline_seconds,
@@ -499,8 +501,12 @@ def _eligibility_failure(
         and candidate.lane == "openrouter"
         and provider_control.free_tier_only
         and not str(candidate.model).strip().lower().endswith(":free")
+        and not provider_control.qualifies_for_agent(candidate.model)
     ):
-        return "OpenRouter route is not explicitly proven free (:free suffix required)"
+        return (
+            "OpenRouter route is not explicitly proven free "
+            "(:free suffix or current routing-control qualification required)"
+        )
     if provider_control.quarantined or not provider_control.eligible:
         return provider_control.reason or f"provider lane {candidate.lane!r} is quarantined"
     if require_qualified and not provider_control.qualifies_for_agent(candidate.model):
@@ -573,6 +579,7 @@ def resolve_routing(
                 and primary.lane == "openrouter"
                 and primary_control.free_tier_only
                 and not str(primary.model).strip().lower().endswith(":free")
+                and not primary_control.qualifies_for_agent(primary.model)
             )
         )
     )
@@ -580,16 +587,35 @@ def resolve_routing(
         excluded.append(ExcludedRoute(primary.provider, primary.model, primary_failure))
 
     # --- alternates: accumulate in precedence order, then gate --------------
-    ordered_sources = [
-        *_fallback_candidates(task_routing, "task"),
-        *_fallback_candidates(profile_config, "profile"),
-        *_fallback_candidates(global_config, "global"),
-    ]
-    if control.include_qualified_routes:
-        # Configured fallback lists are frequently single-provider, which cannot
-        # satisfy "a fallback must use a genuinely different provider". The
-        # reviewed control surface supplies the remaining qualified routes.
-        ordered_sources.extend(control.qualified_routes())
+    # Missing fallback_providers means lower-precedence/global/control recovery
+    # may still be inherited. An explicit empty list is different: it is a
+    # deliberate fail-closed barrier and must disable every fallback source.
+    explicit_fallback_config = next(
+        (
+            config
+            for config in (task_routing, profile_config, global_config)
+            if "fallback_providers" in config
+        ),
+        None,
+    )
+    fallbacks_disabled = bool(
+        explicit_fallback_config is not None
+        and isinstance(explicit_fallback_config.get("fallback_providers"), list)
+        and len(explicit_fallback_config.get("fallback_providers")) == 0
+    )
+
+    ordered_sources: list[RouteCandidate] = []
+    if not fallbacks_disabled:
+        ordered_sources = [
+            *_fallback_candidates(task_routing, "task"),
+            *_fallback_candidates(profile_config, "profile"),
+            *_fallback_candidates(global_config, "global"),
+        ]
+        if control.include_qualified_routes:
+            # Configured fallback lists are frequently single-provider, which cannot
+            # satisfy "a fallback must use a genuinely different provider". The
+            # reviewed control surface supplies the remaining qualified routes.
+            ordered_sources.extend(control.qualified_routes())
 
     seen: set[tuple[str, str]] = {primary.key}
     eligible: list[RouteCandidate] = []
@@ -626,7 +652,8 @@ def resolve_routing(
         alternates=eligible,
         excluded=excluded,
         free_only=control.free_only,
-        max_alternate_attempts=control.max_alternate_attempts,
+        fallbacks_disabled=fallbacks_disabled,
+        max_alternate_attempts=0 if fallbacks_disabled else control.max_alternate_attempts,
         provider_order=control.provider_order,
         deadline_seconds=int(deadline_seconds or 0),
         control_source=control.source_path,
@@ -849,7 +876,12 @@ def classify_outcome(
             RecoveryClass.MODEL_RECOVERABLE,
             "process exited cleanly but produced no output",
         )
-    if "fallback" in combined:
+    provider_fallback_markers = (
+        "provider returned fallback response",
+        "provider fallback response:",
+        "upstream fallback response:",
+    )
+    if _contains(combined, provider_fallback_markers):
         return (
             FailureClass.PROVIDER_FALLBACK_RESPONSE,
             RecoveryClass.MODEL_RECOVERABLE,

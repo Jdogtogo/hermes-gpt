@@ -74,9 +74,7 @@ def _final_response() -> str:
         f"{ag._YAML_START}\n"
         "schema_version: 1\nreview:\n"
         "  target_commits:\n"
-        "    - 9f4dfe8\n"
-        "    - fc9494b\n"
-        "    - 2deadfc\n"
+        "    - HEAD\n"
         "  verdict: ACCEPT\n"
         "  blocking_findings: 0\n"
         "  non_blocking_findings: 0\n"
@@ -98,7 +96,8 @@ def _final_response() -> str:
 def test_fixed_surface_and_long_horizon_contract() -> None:
     assert list(inspect.signature(ag.start).parameters) == ["dry_run"]
     assert ag.TAX_CALCULATOR_ROOT == Path("/mnt/c/Dev/Tax Calculator")
-    assert ag.TARGET_COMMITS == ("9f4dfe8", "fc9494b", "2deadfc")
+    assert ag.TARGET_COMMITS == ("HEAD",)
+    assert ag.TARGET_RANGE == "HEAD^..HEAD"
     assert ag.OUTER_TIMEOUT_SECONDS == 8 * 60 * 60
     assert ag.WORKER_SLICE_TIMEOUT_SECONDS == 60 * 60
     assert ag.MAXIMUM_CONTINUATIONS == 8

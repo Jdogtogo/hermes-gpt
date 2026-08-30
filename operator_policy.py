@@ -971,7 +971,10 @@ class OperatorPolicy:
         if not has_level(required, self.level):
             # In a session deployment the env var is NOT the fix -- a lapsed
             # session is. Say what actually happened and what actually helps.
-            if self.session_status not in ("none_configured", "active"):
+            # "task_bound" joins "active" here: both are live approved authority,
+            # so an insufficient level in either state is a scope problem, not a
+            # lapsed-session problem, and must not be reported as one.
+            if self.session_status not in ("none_configured", "active", "task_bound"):
                 reason = self.session_failure_reason or f"session state: {self.session_status}"
                 raise PermissionError(
                     f"Operator level {self.level!r} does not satisfy required level {required!r}. "
@@ -1088,6 +1091,34 @@ class OperatorPolicy:
         granted = set(self.verbs.get(resource, []))
         if verb not in granted:
             raise PermissionError(f"Verb {resource}:{verb} is not granted by this Operator Session.")
+
+    def has_verb(self, resource: str, verb: str) -> bool:
+        """Non-raising form of require_verb, for tools that must vary their
+        BEHAVIOUR (not merely pass/fail) with the capability actually held."""
+        return verb in set(self.verbs.get(resource, []))
+
+    def require_any_verb(self, candidates: Iterable[tuple[str, str]]) -> tuple[str, str]:
+        """Authorize when the session grants ANY ONE of ``candidates``.
+
+        The verb namespace is open -- normalize_policy() carries an arbitrary
+        ``{resource: [action]}`` map into the immutable, hashed snapshot the
+        human approves -- so a fixed-purpose tool can name its own narrow
+        capability instead of borrowing a broad one. This helper is what lets
+        such a tool accept EITHER its narrow capability OR the broader legacy
+        verb that already implied it, so introducing the narrow capability
+        never revokes access from templates already granting the broad one.
+
+        Returns the granted pair that authorized the call, so the caller can
+        keep the narrow path strictly narrower than the legacy path.
+        """
+        wanted_pairs = [(str(resource), str(verb)) for resource, verb in candidates]
+        for resource, verb in wanted_pairs:
+            if self.has_verb(resource, verb):
+                return resource, verb
+        wanted = " or ".join(f"{resource}:{verb}" for resource, verb in wanted_pairs)
+        raise PermissionError(
+            f"None of the required capabilities ({wanted}) are granted by this Operator Session."
+        )
 
     def require_branch(self, branch: str) -> None:
         """Enforce the session's branch restriction, if any.

@@ -72,6 +72,25 @@ def _enable_workspace(monkeypatch, workspace: Path, *, direct: bool = True) -> N
     monkeypatch.setenv(op_sessions.ACTIVE_SESSION_ID_ENV, record.session_id)
 
 
+def _enable_exact_file_workspace(monkeypatch, target: Path, *, direct: bool = True) -> None:
+    session_root = target.parent / "operator-file-sessions"
+    record = op_sessions.create_session(
+        {
+            "policy_template": "sandbox",
+            "level": "workspace",
+            "apply_mode": "direct" if direct else "dry_run",
+            "readable_roots": [str(target)],
+            "writable_roots": [str(target)],
+            "verbs": {"filesystem": ["read", "edit"]},
+        },
+        duration_seconds=600,
+        root=session_root,
+        session_id="ops-exact-file-test",
+    )
+    monkeypatch.setenv(op_sessions.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.setenv(op_sessions.ACTIVE_SESSION_ID_ENV, record.session_id)
+
+
 def _enable_service_restart_session(
     monkeypatch,
     workspace: Path,
@@ -189,6 +208,41 @@ def test_workspace_write_refuses_symlink_escape(workspace_tree, tmp_path, clean_
     assert parsed["success"] is False
     assert "not under" in parsed["error"].lower()
     assert not (outside_dir / "pwned.txt").exists()
+
+
+def test_workspace_patch_exact_file_root_writes_without_parent_sibling_creation(tmp_path, clean_env, audit_override, monkeypatch):
+    target = tmp_path / "config.yaml"
+    target.write_text("model: old\n", encoding="utf-8")
+    _enable_exact_file_workspace(monkeypatch, target)
+
+    def fail_atomic(*args, **kwargs):
+        pytest.fail("exact-file writable root must not use sibling atomic replace")
+
+    def fail_backup(*args, **kwargs):
+        pytest.fail("exact-file writable root must not create a sibling backup")
+
+    monkeypatch.setattr(ows, "_atomic_write_text", fail_atomic)
+    monkeypatch.setattr(ows, "_backup_file", fail_backup)
+
+    out = ows.hermes_workspace_patch(
+        path=str(target), old_string="model: old", new_string="model: new", dry_run=False
+    )
+    parsed = json.loads(out)
+    assert parsed["success"] is True
+    assert parsed["backup"] is None
+    assert target.read_text(encoding="utf-8") == "model: new\n"
+
+
+def test_workspace_exact_file_root_cannot_create_sibling(tmp_path, clean_env, audit_override, monkeypatch):
+    target = tmp_path / "config.yaml"
+    target.write_text("model: old\n", encoding="utf-8")
+    _enable_exact_file_workspace(monkeypatch, target)
+    sibling = tmp_path / "config.yaml.tmp"
+
+    out = ows.hermes_workspace_write_file(path=str(sibling), content="blocked", dry_run=False)
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert not sibling.exists()
 
 
 def test_workspace_patch_refuses_denied_paths(workspace_tree, clean_env, audit_override, monkeypatch):

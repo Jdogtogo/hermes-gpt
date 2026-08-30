@@ -7,8 +7,17 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-MANIFEST_VERSION = "1.3.0"
-EXPECTED_TOOL_COUNT = 42
+# 1.3.0 -- FIRST_SAFE became a three-stage governed operation. The single
+# hermes_exec_first_safe_model tool launched ssh and piped a Python program to
+# hermes-exec from inside the connector call; regardless of its narrow
+# dry_run-only input surface it was semantically a remote-command-execution
+# mechanism. On the public surface it is replaced by
+# hermes_first_safe_model_prepare (records a bounded local intent) and
+# hermes_first_safe_model_verify (read-only evidence). Execution moved to
+# first_safe_worker.py, a trusted host-side worker deliberately NOT part of this
+# public surface. Net effect: 45 -> 46 tools, and no tool that reaches the VM.
+MANIFEST_VERSION = "1.6.0"
+EXPECTED_TOOL_COUNT = 50
 
 # Canonical public surface for the authenticated ChatGPT operator connector.
 # This is intentionally independent of registration order.
@@ -18,6 +27,7 @@ CANONICAL_TOOL_NAMES = tuple(
             "hermes_approval_web_service_restart",
             "hermes_computer_use_status",
             "hermes_computer_use_doctor",
+            "hermes_claude_desktop_restart",
             "hermes_antigravity_dispatch",
             "hermes_antigravity_dispatch_cancel",
             "hermes_antigravity_dispatch_status",
@@ -34,6 +44,11 @@ CANONICAL_TOOL_NAMES = tuple(
             "hermes_delegated_task_result",
             "hermes_delegated_task_status",
             "hermes_env_status",
+            "hermes_first_safe_model_prepare",
+            "hermes_first_safe_model_verify",
+            "hermes_first_safe_provision_prepare",
+            "hermes_first_safe_provision_execute",
+            "hermes_first_safe_provision_verify",
             "hermes_gateway_status",
             "hermes_git_diff",
             "hermes_git_status",
@@ -44,7 +59,6 @@ CANONICAL_TOOL_NAMES = tuple(
             "hermes_operator_session_request",
             "hermes_operator_session_request_extension",
             "hermes_operator_session_revoke",
-            "hermes_operator_task_complete",
             "hermes_operator_session_status",
             "hermes_operator_snapshot",
             "hermes_operator_status",
@@ -57,16 +71,24 @@ CANONICAL_TOOL_NAMES = tuple(
             "hermes_workspace_read",
             "hermes_workspace_run_test",
             "hermes_workspace_write_file",
+            "hermes_mission_control_lease_acquire",
+            "hermes_mission_control_lease_release",
+            "hermes_mission_control_lease_status",
         }
     )
 )
 
 if len(CANONICAL_TOOL_NAMES) != EXPECTED_TOOL_COUNT:
-    raise RuntimeError("Canonical ChatGPT operator tool manifest must contain exactly 42 unique names.")
+    raise RuntimeError(
+        f"Canonical ChatGPT operator tool manifest must contain exactly {EXPECTED_TOOL_COUNT} unique names."
+    )
 
 # Pinned after computing the canonical MCP input-schema payload. Intentional
 # public tool or schema changes must update both this digest and MANIFEST_VERSION.
-EXPECTED_SCHEMA_FINGERPRINT = "eb67aa5b8ed9c662db1e20d5da0233ee9b8bf0ab54d392118dd17d5795bc62a6"
+# 1.2.0 was c068da8c29c0be1fca941a4e2060f2bfff694266d9a23b5b70e08ec7abf3f99f
+# (45 tools, hermes_exec_first_safe_model present). Re-pinned for 1.3.0 after the
+# deliberate FIRST_SAFE prepare/verify split described above.
+EXPECTED_SCHEMA_FINGERPRINT = "9773baeda42866c6dacace88791204d82802dd6187b59c495b56e007b9194fa0"
 
 
 def _canonicalize(value: Any) -> Any:

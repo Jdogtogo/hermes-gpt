@@ -909,6 +909,22 @@ def test_continuation_links_to_previous_checkpoint(monkeypatch, tmp_path):
     assert new_task["interaction_id"] != previous["interaction_id"]
 
 
+@pytest.mark.parametrize(
+    ("worker_status", "expected_status"),
+    [
+        ("queued", "In Progress"),
+        ("running", "In Progress"),
+        ("completed", "In Review"),
+        ("cancelled", "Cancelled"),
+        ("failed", "On Hold"),
+        ("blocked", "On Hold"),
+        ("incomplete", "On Hold"),
+    ],
+)
+def test_mission_status_maps_worker_lifecycle(worker_status, expected_status):
+    assert delegation._mission_status(worker_status) == expected_status
+
+
 def test_mission_control_upsert_is_idempotent(monkeypatch, tmp_path):
     db = tmp_path / "kanban.db"
     with sqlite3.connect(db) as connection:
@@ -961,11 +977,153 @@ def test_mission_control_upsert_is_idempotent(monkeypatch, tmp_path):
     with sqlite3.connect(db) as connection:
         task_count = connection.execute("SELECT count(*) FROM tasks").fetchone()[0]
         event_count = connection.execute("SELECT count(*) FROM task_events").fetchone()[0]
-        status = connection.execute("SELECT status FROM tasks WHERE id='lw_mc'").fetchone()[0]
+        row = connection.execute(
+            "SELECT status, result FROM tasks WHERE id='lw_mc'"
+        ).fetchone()
+        status, result_json = row[0], row[1]
 
     assert task_count == 1
     assert event_count == 2
+    assert status == "In Review"
+    result_payload = json.loads(result_json)
+    assert result_payload["task_id"] == "dt_mc"
+
+
+def test_mission_control_review_acceptance_requires_lease_and_completes_canonical_task(monkeypatch, tmp_path):
+    db = tmp_path / "kanban.db"
+    with sqlite3.connect(db) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT,
+                assignee TEXT,
+                status TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                created_by TEXT,
+                created_at INTEGER NOT NULL,
+                workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+                workspace_path TEXT,
+                result TEXT,
+                idempotency_key TEXT,
+                session_id TEXT
+            );
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                run_id INTEGER,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL
+            );
+            """
+        )
+    monkeypatch.setenv(delegation.MISSION_CONTROL_DB_ENV, str(db))
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(
+        delegation.op_lease,
+        "verify_lease_token",
+        lambda token: {
+            "success": token == "lease-secret",
+            "error": None if token == "lease-secret" else "INVALID_LEASE_TOKEN",
+            "owner": "mission-control-test",
+            "lease_id": "lease-test",
+        },
+    )
+    task = {
+        "logical_work_id": "lw_review",
+        "task_id": "dt_review",
+        "attempt_id": "da_review",
+        "interaction_id": "di_review",
+        "status": "completed",
+        "profile": "default",
+        "workdir": str(tmp_path),
+        "checkpoint_ref": "checkpoint-review",
+        "outcome_reason": "complete",
+        "returncode": 0,
+        "stdout": "REVIEW_OK",
+        "stderr": "",
+        "messages": [],
+        "changed_files": [],
+        "authority": {"session_id": "ops_test"},
+    }
+    delegation._save(task)
+    delegation._record_mission_control(task, event="completed")
+
+    accepted = json.loads(
+        delegation.hermes_delegated_task_message(
+            "dt_review",
+            delegation.MISSION_CONTROL_REVIEW_ACCEPT_PREFIX
+            + "lease-secret:independent runtime acceptance passed",
+        )
+    )
+    persisted = delegation._load("dt_review")
+    replay = json.loads(
+        delegation.hermes_delegated_task_message(
+            "dt_review",
+            delegation.MISSION_CONTROL_REVIEW_ACCEPT_PREFIX
+            + "lease-secret:independent runtime acceptance passed",
+        )
+    )
+    envelope = json.loads(delegation.hermes_delegated_task_result("dt_review"))
+
+    with sqlite3.connect(db) as connection:
+        status, result_json = connection.execute(
+            "SELECT status, result FROM tasks WHERE id='lw_review'"
+        ).fetchone()
+        event_count = connection.execute(
+            "SELECT count(*) FROM task_events WHERE task_id='lw_review'"
+        ).fetchone()[0]
+
+    assert accepted["success"] is True
+    assert accepted["mission_control_status"] == "Completed"
+    assert accepted["mission_control_persisted"] is True
+    assert accepted["already_reviewed"] is False
+    assert replay["mission_control_persisted"] is True
+    assert replay["already_reviewed"] is True
+    assert persisted["review_status"] == "accepted"
+    assert persisted["messages"] == []
+    assert "lease-secret" not in json.dumps(persisted)
     assert status == "Completed"
+    assert json.loads(result_json)["review_status"] == "accepted"
+    assert event_count == 2
+    assert envelope["review_status"] == "accepted"
+    assert envelope["review_summary"] == "independent runtime acceptance passed"
+    assert envelope["mission_control_status"] == "Completed"
+    assert envelope["mission_control_persisted"] is True
+    assert delegation._mission_status("completed", "accepted") == "Completed"
+
+
+def test_mission_control_review_acceptance_rejects_invalid_lease(monkeypatch, tmp_path):
+    monkeypatch.setattr(delegation, "_TASKS_ROOT", tmp_path / "tasks")
+    monkeypatch.setattr(
+        delegation.op_lease,
+        "verify_lease_token",
+        lambda token: {"success": False, "error": "INVALID_LEASE_TOKEN"},
+    )
+    task = {
+        "logical_work_id": "lw_review_bad",
+        "task_id": "dt_reviewbad",
+        "status": "completed",
+        "messages": [],
+        "stdout": "REVIEW_OK",
+        "stderr": "",
+    }
+    delegation._save(task)
+
+    rejected = json.loads(
+        delegation.hermes_delegated_task_message(
+            "dt_reviewbad",
+            delegation.MISSION_CONTROL_REVIEW_ACCEPT_PREFIX + "bad-token:review passed",
+        )
+    )
+    persisted = delegation._load("dt_reviewbad")
+
+    assert rejected["success"] is False
+    assert "review_status" not in persisted
+    assert persisted["messages"] == []
+    assert "bad-token" not in json.dumps(persisted)
 
 
 def test_require_task_authority_rejects_snapshot_replacement(monkeypatch, tmp_path):
@@ -1095,11 +1253,16 @@ def test_result_redacts_and_returns_terminal_output(monkeypatch, tmp_path):
     result = json.loads(delegation.hermes_delegated_task_result(task_id))
     assert result["success"] is True
     assert result["ready"] is True
-    assert result["stdout"] == "done"
+    assert result["evidence_envelope_version"] == 1
     assert result["final_answer"] == "done"
+    assert result["final_summary"] == "done"
     assert result["final_answer_extraction_status"] == "legacy_single_line"
-    assert "stderr" in result
-    assert "messages" in result
+    assert result["raw_output_included"] is False
+    assert result["raw_output_available"] is True
+    assert result["message_count"] == 0
+    assert "stdout" not in result
+    assert "stderr" not in result
+    assert "messages" not in result
     assert "changed_files" in result
 
 
@@ -1593,7 +1756,9 @@ def test_root_status_and_result_resolve_latest_child(monkeypatch, tmp_path):
     assert status["latest_task_id"] == child_id
     assert status["status"] == "completed"
     assert result["result_task_id"] == child_id
-    assert result["stdout"] == "final result"
+    assert result["final_answer"] == "final result"
+    assert result["raw_output_included"] is False
+    assert "stdout" not in result
     assert result["continuation_count"] == 1
     assert result["final_stop_reason"] == "completion"
 
@@ -1705,6 +1870,26 @@ def test_runtime_materialisation_preserves_the_resolved_fallback_chain(monkeypat
     assert audit["deadline_seconds"] == 120
 
 
+def test_runtime_materialisation_preserves_explicit_empty_fallback_barrier(monkeypatch, tmp_path):
+    _routing_workspace(monkeypatch, tmp_path, fallbacks=[])
+
+    runtime_home = delegation._prepare_runtime_home(
+        {"task_id": "dt_" + "f" * 32, "profile": "default", "timeout": 120}
+    )
+
+    loaded = delegation.yaml.safe_load(
+        (runtime_home / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert loaded["model"]["provider"] == "openrouter"
+    assert loaded["fallback_providers"] == []
+
+    audit = json.loads((runtime_home / "routing.json").read_text(encoding="utf-8"))
+    assert audit["fallbacks_disabled"] is True
+    assert audit["alternates"] == []
+    assert audit["materialised_fallback_providers"] == []
+    assert audit["max_alternate_attempts"] == 0
+
+
 def test_direct_only_ollama_is_excluded_while_nous_remains_agent_available(monkeypatch, tmp_path):
     _routing_workspace(
         monkeypatch,
@@ -1813,6 +1998,18 @@ def test_worker_uses_selected_nous_profile_and_keeps_file_root_confined(monkeypa
     assert Path(observed["SHARED_AUTH_DIR"]) == shared_dir
     assert not shared_dir.exists()
     assert auth_path.read_text(encoding="utf-8") == before_auth
+
+
+def test_completed_task_metadata_does_not_reclassify_historical_fallback_text():
+    failure_category, provider_error_category = delegation._classify_failure(
+        rc=0,
+        stdout="Historical evidence recorded provider_error_category=fallback_response.",
+        stderr="",
+        status="completed",
+        reason="substantive output and required workspace evidence were produced",
+    )
+    assert failure_category is None
+    assert provider_error_category is None
 
 
 def test_provider_attempt_start_clears_previous_attempt_outcome(monkeypatch, tmp_path):

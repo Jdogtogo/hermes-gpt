@@ -93,13 +93,15 @@ def test_governed_kanban_standing_is_single_board_only():
     resolved = templates.resolve_template("hermes-governed-kanban-standing")
     policy = resolved["policy"]
     board = "/home/jfroh/.hermes/kanban/boards/hermes-stabilization"
+    opsbrain = "/home/jfroh/.hermes/ops-brain"
 
     assert resolved["active"] is True
     assert resolved["standing_authority_eligible"] is True
     assert resolved["risk_tier"] == 1
     assert resolved["allowed_branches"] is None
-    assert policy["readable_roots"] == [board]
+    assert policy["readable_roots"] == [board, opsbrain]
     assert policy["writable_roots"] == [board]
+    assert opsbrain not in policy["writable_roots"]
     assert "/home/jfroh/.hermes/kanban.db" not in policy["readable_roots"]
     assert "/home/jfroh/.hermes/kanban.db" not in policy["writable_roots"]
     assert "/home/jfroh/.hermes/kanban.db" in policy["hard_denied_paths"]
@@ -122,10 +124,12 @@ def test_maintenance_resolves_to_exact_paths_and_branch_restriction():
     resolved = templates.resolve_template("hermes-gpt-operator-maintenance")
     policy = resolved["policy"]
     assert policy["readable_roots"] == [
-        "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"
+        "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt",
+        "/home/jfroh/.hermes/ops-brain/antigravity/runtime",
     ]
     assert policy["writable_roots"] == [
-        "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt"
+        "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt",
+        "/home/jfroh/.hermes/ops-brain/antigravity/runtime",
     ]
     assert resolved["allowed_branches"] == ["codex/operator-session-chatgpt-20260713"]
     assert policy["service_units"] == [
@@ -448,3 +452,54 @@ def test_governance_inventory_includes_opsbrain_and_remains_strictly_read_only()
     assert "services" not in policy["verbs"]
     assert "git" not in policy["verbs"]
     assert "tests" not in policy["verbs"]
+
+
+def test_governed_kanban_standing_reads_opsbrain_and_writes_single_board_only():
+    resolved = templates.resolve_template("hermes-governed-kanban-standing")
+    policy = resolved["policy"]
+    board = "/home/jfroh/.hermes/kanban/boards/hermes-stabilization"
+    opsbrain = "/home/jfroh/.hermes/ops-brain"
+
+    assert resolved["active"] is True
+    assert resolved["standing_authority_eligible"] is True
+    assert resolved["risk_tier"] == 1
+    assert resolved["allowed_branches"] is None
+    assert policy["readable_roots"] == [board, opsbrain]
+    assert policy["writable_roots"] == [board]
+    assert opsbrain not in policy["writable_roots"]
+    assert "/home/jfroh/.hermes/kanban.db" not in policy["readable_roots"]
+    assert "/home/jfroh/.hermes/kanban.db" not in policy["writable_roots"]
+    assert "/home/jfroh/.hermes/kanban.db" in policy["hard_denied_paths"]
+    assert "/home/jfroh/.hermes/kanban/current" in policy["hard_denied_paths"]
+    assert policy["egress_hosts"] == []
+    assert policy["service_units"] == []
+    assert policy["verbs"] == {"filesystem": ["read", "edit"]}
+    assert policy["containment_strength"] == "container"
+
+
+def test_hermes_exec_first_safe_model_template_is_single_host_and_no_local_writes():
+    resolved = templates.resolve_template("hermes-exec-first-safe-model")
+    policy = resolved["policy"]
+    assert resolved["active"] is True
+    assert resolved["risk_tier"] == 3
+    assert resolved["standing_authority_eligible"] is False
+    assert policy["level"] == "workspace"
+    assert policy["apply_mode"] == "direct"
+    assert policy["egress_hosts"] == ["hermes-exec"]
+    assert policy["writable_roots"] == []
+    assert policy["service_units"] == []
+    assert policy["allowed_profiles"] == ["default"]
+    # mission_control:lease_status lets Mission Control verify its coordination
+    # lease before the fixed VM operation. It is exhaustively pinned here so a
+    # future edit cannot quietly slip filesystem:read in beside it.
+    assert policy["verbs"] == {
+        "filesystem": ["edit"],
+        "tests": ["run"],
+        "mission_control": ["lease_status"],
+    }
+    assert "read" not in policy["verbs"]["filesystem"]
+    assert policy["containment_strength"] == "vm"
+    assert policy["production_effect"] == "config"
+    assert policy["paid_route_change"] == "none"
+    assert policy["has_secret_access"] is False
+    assert policy["has_credential_access"] is False

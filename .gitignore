@@ -27,3 +27,18 @@ tunnel-url.txt
 
 # Live deployment scripts (customized from examples/)
 *.ps1
+
+# Local Controller reconciliation / diagnostic artefacts retained on disk.
+# Exact filenames only: do not hide future probes or evidence implicitly.
+.inspect_server_lifecycle.py
+.tba_live_probe.py
+antigravity_overnight_migration_acceleration_20260819.json
+first-safe-final-antigravity-review-2026-08-21.json
+first-safe-provision-antigravity-review-2026-08-20.json
+first-safe-repair-antigravity-review-2026-08-19.json
+first-safe-repair-evidence-2026-08-19.md
+fix_first_safe_remote_escapes.py
+inspect_first_safe_parser_runtime.py
+repro_first_safe_default_rewrite.py
+standing_authority_patch.tmp
+verify_first_safe_guard_local.py

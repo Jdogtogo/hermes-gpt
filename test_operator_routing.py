@@ -38,6 +38,7 @@ def _control(**overrides) -> routing.RoutingControl:
             eligible=True,
             quarantined=False,
             qualified_models=(
+                "stealth/ox-alpha",
                 "nvidia/nemotron-3-ultra-550b-a55b:free",
                 "cohere/north-mini-code:free",
             ),
@@ -94,6 +95,7 @@ def _resolve(tmp_path, *, profile_config, global_config=None, task_routing=None,
 
 
 NVIDIA = {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"}
+OR_OX = {"provider": "openrouter", "model": "stealth/ox-alpha"}
 OR_NEMOTRON = {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}
 OR_COHERE = {"provider": "openrouter", "model": "cohere/north-mini-code:free"}
 GEMINI = {"provider": "gemini", "model": "gemini-3.5-flash-lite"}
@@ -111,6 +113,23 @@ def test_no_fallback_configured_yields_empty_chain(tmp_path):
     assert resolved.primary.model == OR_NEMOTRON["model"]
     assert resolved.alternates == []
     assert resolved.runtime_fallback_providers() == []
+
+
+def test_explicit_empty_profile_fallbacks_disable_inheritance_and_control(tmp_path):
+    resolved = _resolve(
+        tmp_path,
+        profile_config={"model": OR_OX, "fallback_providers": []},
+        global_config={"fallback_providers": [NVIDIA, OR_COHERE]},
+        control=_control(include_qualified_routes=True, max_alternate_attempts=3),
+    )
+
+    assert resolved.primary.model == OR_OX["model"]
+    assert resolved.fallbacks_disabled is True
+    assert resolved.alternates == []
+    assert resolved.runtime_fallback_providers() == []
+    assert resolved.max_alternate_attempts == 0
+    assert routing.select_alternate(resolved, failed_routes=[resolved.primary], attempts_used=0) is None
+    assert resolved.to_audit_dict()["fallbacks_disabled"] is True
 
 
 def test_single_fallback_is_materialised(tmp_path):
@@ -360,6 +379,24 @@ def test_shipped_control_qualifies_fresh_ollama_qwen():
     assert "fresh host qualification" in control.reason.lower()
 
 
+def test_shipped_control_qualifies_ox_alpha_and_excludes_eol_glm52():
+    control = _shipped()
+    openrouter = control.control_for("openrouter")
+    nvidia = control.control_for("nvidia")
+    assert openrouter.qualifies_for_agent("stealth/ox-alpha") is True
+    assert nvidia.qualifies_for_agent("z-ai/glm-5.2") is False
+
+
+def test_explicitly_qualified_free_openrouter_primary_need_not_use_free_suffix(tmp_path):
+    resolved = _resolve(
+        tmp_path,
+        profile_config={"model": OR_OX},
+        control=_control(require_qualified_primary=True),
+    )
+    assert resolved.primary.lane == "openrouter"
+    assert resolved.primary.model == "stealth/ox-alpha"
+
+
 def test_shipped_control_qualifies_free_tencent_hy3_on_nous():
     control = _shipped().control_for("nous")
     assert control.eligible is True
@@ -398,13 +435,6 @@ def test_shipped_gemini_rate_limit_schema_is_machine_readable_without_invented_c
     assert control.cooldown_seconds_for("gemini", routing.FailureClass.RATE_LIMIT, "HTTP 429") == 300
     assert control.cooldown_seconds_for("gemini", routing.FailureClass.RATE_LIMIT, "RESOURCE_EXHAUSTED quota") == 3600
     assert control.cooldown_seconds_for("gemini", routing.FailureClass.PROVIDER_UNAVAILABLE, "HTTP 503") == 0
-
-
-def test_shipped_control_qualifies_glm52_only_on_nvidia_direct():
-    control = _shipped()
-    nvidia = control.control_for("nvidia")
-    assert nvidia.qualifies_for_agent("z-ai/glm-5.2") is True
-    assert control.control_for("openrouter").qualifies_for_agent("z-ai/glm-5.2") is False
 
 
 def test_shipped_control_includes_qualified_agent_routes_but_excludes_direct_only_ollama(tmp_path):
@@ -657,6 +687,25 @@ def test_provider_unavailable_is_bounded_recoverable():
 def test_transient_upstream_failure_is_bounded_recoverable():
     failure, recovery, _ = _classify(stderr="502 bad gateway")
     assert failure is routing.FailureClass.TRANSIENT_PROVIDER_FAILURE
+    assert recovery is routing.RecoveryClass.MODEL_RECOVERABLE
+
+
+def test_historical_fallback_word_in_valid_answer_is_not_provider_failure():
+    answer = (
+        "The prior task recorded provider_error_category=fallback_response, "
+        "but this current review completed normally."
+    )
+    failure, recovery, _ = _classify(stdout=answer, final_answer=answer, mode="read_only")
+    assert failure is routing.FailureClass.COMPLETED
+    assert recovery is routing.RecoveryClass.SUCCESS
+
+
+def test_explicit_provider_fallback_marker_remains_recoverable():
+    failure, recovery, _ = _classify(
+        stdout="provider returned fallback response: temporary upstream substitution",
+        final_answer=None,
+    )
+    assert failure is routing.FailureClass.PROVIDER_FALLBACK_RESPONSE
     assert recovery is routing.RecoveryClass.MODEL_RECOVERABLE
 
 

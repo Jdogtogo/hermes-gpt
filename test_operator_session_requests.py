@@ -113,8 +113,12 @@ def test_approved_session_uses_exact_resolved_policy(session_env, audit_override
     )
     record = sessions.approve_session_request(request_id, decided_by="telegram:12345", root=session_env)
     loaded = sessions.load_session(record.session_id, root=session_env)
-    assert loaded.policy["readable_roots"] == resolved["policy"]["readable_roots"]
-    assert loaded.policy["writable_roots"] == resolved["policy"]["writable_roots"]
+    expected = sessions.normalize_policy({
+        **resolved["policy"],
+        "policy_template": "hermes-gpt-operator-maintenance",
+    })
+    assert loaded.policy["readable_roots"] == expected["readable_roots"]
+    assert loaded.policy["writable_roots"] == expected["writable_roots"]
     assert loaded.policy["policy_template"] == "hermes-gpt-operator-maintenance"
     authority = sessions.resolve_effective_authority()
     assert authority.is_active is True
@@ -126,6 +130,69 @@ def test_approved_session_uses_exact_resolved_policy(session_env, audit_override
     assert approvals[-1]["decision"] == "approved"
     assert approvals[-1]["approval_source"] == "telegram:12345"
     assert approvals[-1]["resulting_session_id"] == record.session_id
+
+
+def test_expired_active_pointer_recovers_independently_valid_approved_session(session_env):
+    maintenance = templates.resolve_template("hermes-gpt-operator-maintenance")
+    maintenance_policy = {
+        **maintenance["policy"],
+        "policy_template": "hermes-gpt-operator-maintenance",
+    }
+    older = sessions.create_session(
+        maintenance_policy,
+        duration_seconds=3 * 60 * 60,
+        root=session_env,
+        now=1_000,
+        session_id="ops_long_valid",
+    )
+
+    sandbox = templates.resolve_template("sandbox")
+    sandbox_policy = {**sandbox["policy"], "policy_template": "sandbox"}
+    short = sessions.create_session(
+        sandbox_policy,
+        duration_seconds=60,
+        root=session_env,
+        now=1_100,
+        session_id="ops_short_expired",
+    )
+    sessions._write_active_pointer(short.session_id, root=session_env)
+
+    authority = sessions.resolve_effective_authority(now=1_200)
+    assert authority.is_active is True
+    assert authority.session_id == older.session_id
+    assert authority.policy_template == "hermes-gpt-operator-maintenance"
+
+
+def test_revoked_active_pointer_never_recovers_another_session(session_env):
+    maintenance = templates.resolve_template("hermes-gpt-operator-maintenance")
+    maintenance_policy = {
+        **maintenance["policy"],
+        "policy_template": "hermes-gpt-operator-maintenance",
+    }
+    sessions.create_session(
+        maintenance_policy,
+        duration_seconds=3 * 60 * 60,
+        root=session_env,
+        now=2_000,
+        session_id="ops_other_valid",
+    )
+
+    sandbox = templates.resolve_template("sandbox")
+    sandbox_policy = {**sandbox["policy"], "policy_template": "sandbox"}
+    pointed = sessions.create_session(
+        sandbox_policy,
+        duration_seconds=60 * 60,
+        root=session_env,
+        now=2_100,
+        session_id="ops_pointed_revoked",
+    )
+    sessions._write_active_pointer(pointed.session_id, root=session_env)
+    sessions.revoke_session(pointed.session_id, root=session_env, now=2_200)
+
+    authority = sessions.resolve_effective_authority(now=2_201)
+    assert authority.is_active is False
+    assert authority.status == "revoked"
+    assert authority.pointed_session_id == pointed.session_id
 
 
 def test_denied_session_request_creates_no_authority(session_env, audit_override):

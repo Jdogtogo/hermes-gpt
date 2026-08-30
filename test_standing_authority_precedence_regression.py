@@ -58,10 +58,10 @@ def _approve(root, template, *, mode="session", now=1_000):
             policy_template=template,
             requested_duration_minutes=30,
             reason="precedence regression",
-            authority_mode=mode,
         )
     )
     assert response["success"] is True
+    assert response["authority_mode"] == mode
     return op_sessions.approve_session_request(
         response["request_id"], decided_by="telegram:test", root=root, now=now
     )
@@ -181,6 +181,6 @@ def test_request_defaults_to_session_for_nonstanding_template(precedence_env):
     assert response["authority_mode"] == "session"
 
 
-def test_public_tool_manifest_remains_41_tools():
-    assert operator_manifest.EXPECTED_TOOL_COUNT == 42
-    assert len(operator_manifest.CANONICAL_TOOL_NAMES) == 42
+def test_public_tool_manifest_matches_current_surface():
+    assert operator_manifest.EXPECTED_TOOL_COUNT == 50
+    assert len(operator_manifest.CANONICAL_TOOL_NAMES) == 50

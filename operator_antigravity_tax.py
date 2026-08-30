@@ -1,9 +1,11 @@
 """Fixed supervised host-side Antigravity review for the Projections Calculator.
 
 This module exposes no arbitrary command, prompt, repository, commit, model, or
-output-path input. It launches one pre-approved, read-only review of the fixed
-Tax Calculator commits using the official host ``agy`` binary. Evidence and
-state are written only to fixed Hermes-owned locations.
+output-path input. It launches one pre-approved, read-only review of the Tax
+Calculator commit at ``HEAD`` using the official host ``agy`` binary. ``HEAD``
+is resolved once at launch to an immutable commit SHA, so unrelated dirty
+worktree changes are excluded from the review snapshot. Evidence and state are
+written only to fixed Hermes-owned locations.
 """
 from __future__ import annotations
 
@@ -29,8 +31,8 @@ AGY_BINARY = Path("/home/jfroh/.local/bin/agy")
 HOST_USER = "jfroh"
 HOST_HOME = Path("/home/jfroh")
 TAX_CALCULATOR_ROOT = Path("/mnt/c/Dev/Tax Calculator")
-TARGET_COMMITS: tuple[str, ...] = ("9f4dfe8", "fc9494b", "2deadfc")
-TARGET_RANGE = f"{TARGET_COMMITS[0]}^..{TARGET_COMMITS[-1]}"
+TARGET_COMMITS: tuple[str, ...] = ("HEAD",)
+TARGET_RANGE = "HEAD^..HEAD"
 MODEL = "gemini-3.6-flash-low"
 OUTER_TIMEOUT_SECONDS = 8 * 60 * 60
 WORKER_SLICE_TIMEOUT_SECONDS = 60 * 60
@@ -531,11 +533,12 @@ def _build_prompt(
     commits = ", ".join(TARGET_COMMITS)
     checkpoint_text = "\n".join(f"- {path}" for path in checkpoint_paths) or "- none (initial slice)"
     return f"""Act as an independent senior tax-calculation software reviewer.
-This is bounded review slice {slice_index + 1}. Review the fixed Projections Calculator
-commits {commits} using the immutable approved-commit snapshot rooted at {review_root}.
-The live source repository at {TAX_CALCULATOR_ROOT} may contain unrelated work in progress;
-do not inspect it directly. Use the supplied Git evidence under {input_dir} for commit history
-and diffs, and use only {review_root} for source, fixtures, documentation and tests.
+This is bounded review slice {slice_index + 1}. Review the Projections Calculator
+candidate commit {commits} using the immutable approved-commit snapshot rooted at {review_root}.
+The symbolic ref was resolved once at launch to an immutable SHA. The live source repository
+at {TAX_CALCULATOR_ROOT} may contain unrelated work in progress; do not inspect it directly.
+Use the supplied Git evidence under {input_dir} for commit history and the parent-to-candidate
+diff, and use only {review_root} for source, fixtures, documentation and tests.
 
 Read every file under {input_dir} first, including all prior slice checkpoints listed
 below. Reconcile their completed work before continuing and never repeat completed
@@ -548,17 +551,22 @@ Inspect relevant source, fixtures, tests and documentation directly in the immut
 snapshot. Do not modify files and do not run commands. Independently challenge the
 previous implementer's conclusions.
 
+Attempt to find a reproducible defect only in the supported calculator scope. Cite exact
+snapshot file paths, functions, tests and reproduction steps. Do not infer nonexistent
+modules or features. Historical findings are hypotheses only; if a claim cannot be reproduced
+against this immutable candidate snapshot, classify it NOT REPRODUCED.
+
 Verify all of the following:
-1. JavaScript standard work-related deduction logic exactly matches the authoritative Python implementation.
-2. FY2027-28 WATO is correct, non-refundable, based only on eligible labour income, and cannot benefit passive-income-only taxpayers.
-3. Omitted labour-income data remains distinct from explicitly supplied zero labour income.
-4. Client-side extrapolation does not fabricate deductions or offsets when labour-income data is unavailable.
-5. Canonical Python-generated years expose the correct fields.
-6. Updated fixture values are mathematically justified rather than edited only to satisfy tests.
-7. CGT fixture changes are a legitimate consequence of corrected marginal-tax calculations.
-8. The regression suite detects the former incorrect WATO formula.
-9. Division 293, Division 296, MLS, TBC, household cash flow and unrelated authoritative calculations have not regressed.
-10. Assess whether the reported PASS=93, KNOWN_FAILURE=0, BLOCKED=0, FAIL=0 audit is independently reproduced by the supplied evidence.
+1. A non-retirement-phase TTR/TRIS payment is capped at 10% of the applicable opening pension balance.
+2. A TTR/TRIS resolves to retirement phase when the annual model reaches age 65 or an encoded release condition applies.
+3. A non-retirement-phase TTR commencement does not create a transfer-balance credit merely on commencement.
+4. The TTR retirement-phase transition creates the correct one-time transfer-balance credit and does not double count a same-year pension commencement.
+5. Retirement-phase TTR treatment flows consistently into fund tax/pension exemption logic after transition.
+6. Person age advances across projection years for pension-factor selection.
+7. Account-based pension minimums are rounded to the nearest $10 with an exact $5 rounded up.
+8. The new pension/TTR regression tests genuinely exercise the corrected boundaries rather than merely matching implementation constants.
+9. Division 293, Division 296, super contribution caps, MLS, TBC and unrelated authoritative calculations have not regressed.
+10. Assess whether the supplied Windows full-audit evidence supports PASS with zero KNOWN_FAILURE, BLOCKED and FAIL for the immutable candidate scope. Treat unrelated dirty live-worktree files as out of scope.
 
 At the end of this slice, choose exactly one control status:
 - COMPLETE when the full independent review is finished.
@@ -578,9 +586,7 @@ and a clear merge recommendation. Confirm source, credentials and services were 
 schema_version: 1
 review:
   target_commits:
-    - 9f4dfe8
-    - fc9494b
-    - 2deadfc
+    - HEAD
   verdict: ACCEPT | ACCEPT_WITH_FINDINGS | REJECT
   blocking_findings: <integer>
   non_blocking_findings: <integer>

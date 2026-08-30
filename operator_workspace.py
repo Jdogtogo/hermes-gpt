@@ -73,6 +73,40 @@ def _backup_file(path: Path) -> Path | None:
         return None
 
 
+def _is_exact_file_write_root(policy: op.OperatorPolicy, path: Path) -> bool:
+    """Return True only when the policy grants this exact existing file.
+
+    Exact-file grants are used with systemd ``ProtectHome=read-only`` plus a
+    file-level ``ReadWritePaths=`` exception. The file is writable but its
+    parent directory intentionally is not, so sibling temp/backup creation is
+    unavailable and must not be required.
+    """
+    if not path.exists() or not path.is_file():
+        return False
+    resolved = path.resolve(strict=True)
+    for root in getattr(policy, "writable_roots", []) or []:
+        candidate = Path(root).expanduser().resolve(strict=False)
+        if candidate == resolved and resolved.is_file():
+            return True
+    return False
+
+
+def _write_text_with_policy(path: Path, content: str, policy: op.OperatorPolicy) -> None:
+    """Write within policy, preserving atomic replace for directory grants.
+
+    For an exact-file writable root, write only the already-authorised file in
+    place. This avoids requiring write permission on the parent directory and
+    cannot create or rename sibling paths.
+    """
+    if not _is_exact_file_write_root(policy, path):
+        _atomic_write_text(path, content)
+        return
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def _workspace_policy_score(policy: op.OperatorPolicy) -> tuple[int, ...]:
     """Deterministic least-privilege score for one complete authority grant."""
     verbs = getattr(policy, "verbs", {}) or {}
@@ -888,8 +922,9 @@ def hermes_workspace_patch(
             return json.dumps({"success": True, "dry_run": True, "plan": plan}, indent=2)
 
         policy.require_mutation(dry_run)
-        backup = _backup_file(p)
-        _atomic_write_text(p, new_content)
+        exact_file_root = _is_exact_file_write_root(policy, p)
+        backup = None if exact_file_root else _backup_file(p)
+        _write_text_with_policy(p, new_content, policy)
         result = {
             "success": True,
             "dry_run": False,
@@ -964,8 +999,9 @@ def hermes_workspace_write_file(
             return json.dumps({"success": True, "dry_run": True, "plan": plan}, indent=2)
 
         policy.require_mutation(dry_run)
-        backup = _backup_file(p) if p.exists() else None
-        _atomic_write_text(p, content)
+        exact_file_root = p.exists() and _is_exact_file_write_root(policy, p)
+        backup = None if exact_file_root else (_backup_file(p) if p.exists() else None)
+        _write_text_with_policy(p, content, policy)
         result = {
             "success": True,
             "dry_run": False,
@@ -2201,18 +2237,21 @@ def hermes_workspace_git_commit(
             dirty_entries.append((status, entry))
 
         allowed_set = set(allowed_files)
-        # A path-scoped commit is safe in the presence of unrelated untracked
-        # files because the tool stages and commits only explicit allowed paths.
-        # Any out-of-scope tracked/index change still fails closed, including
-        # staged additions, modifications, deletions, and renames.
-        out_of_scope = [
-            path
-            for status, path in dirty_entries
-            if path not in allowed_set and status != "??"
-        ]
-        if out_of_scope:
+        # Path-scoped commits must coexist safely with unrelated working-tree
+        # activity. `git commit -- <paths>` commits only the explicitly named
+        # paths, so unrelated *unstaged* tracked changes and untracked files can
+        # remain untouched. Determine staged/index changes from Git's index
+        # directly rather than inferring them from porcelain status columns;
+        # transport/output normalization may strip a leading space from the
+        # first porcelain line and make an unstaged ` M path` look staged.
+        staged_rc, staged_out, _ = _git(["diff", "--cached", "--name-only"], workdir, runner=runner)
+        if staged_rc != 0:
+            raise PermissionError("Could not read staged git changes.")
+        staged_files = {line.strip() for line in staged_out.splitlines() if line.strip()}
+        out_of_scope_staged = sorted(staged_files - allowed_set)
+        if out_of_scope_staged:
             raise PermissionError(
-                f"Refusing to commit: unapproved tracked or staged files present: {out_of_scope!r}."
+                f"Refusing to commit: unapproved staged files present: {out_of_scope_staged!r}."
             )
         dirty_files = [path for _status, path in dirty_entries]
         to_stage = [f for f in allowed_files if f in dirty_files]

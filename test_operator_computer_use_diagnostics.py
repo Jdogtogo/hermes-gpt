@@ -128,3 +128,42 @@ def test_doctor_timeout_is_bounded_and_returns_structured_result(monkeypatch, tm
     assert result["returncode"] == 124
     assert result["stdout"] == "partial"
     assert result["stderr"] == "late"
+
+
+def test_runtime_inventory_filters_ports_and_cron_payload(monkeypatch, tmp_path):
+    hermes_root = tmp_path / ".hermes"
+    cron_path = hermes_root / "profiles" / "default" / "cron" / "jobs.json"
+    cron_path.parent.mkdir(parents=True)
+    cron_path.write_text(
+        json.dumps({"jobs": [{"id": "j1", "name": "safe", "enabled": True, "schedule": "0 * * * *", "prompt": "DO-NOT-RETURN"}]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cu, "_resolve_binary", lambda name, preferred=None: f"/mock/{name}")
+
+    def fake_probe(argv, timeout=10):
+        if argv[0].endswith("/ss"):
+            return {"attempted": True, "returncode": 0, "stdout": "LISTEN 0 128 0.0.0.0:8787 0.0.0.0:* users:((\"python\",pid=123,fd=4))\nLISTEN 0 128 0.0.0.0:9999 0.0.0.0:*\n", "stderr": ""}
+        if "list-units" in argv:
+            return {"attempted": True, "returncode": 0, "stdout": "hermes-gateway.service loaded active running Hermes\nunrelated.service loaded active running Other\n", "stderr": ""}
+        if "list-timers" in argv:
+            return {"attempted": True, "returncode": 0, "stdout": "gmail-intake.timer next\n", "stderr": ""}
+        if argv[0].endswith("/docker"):
+            return {"attempted": True, "returncode": 0, "stdout": "searxng\tsearxng/image\t0.0.0.0:8888->8080/tcp\tUp\n", "stderr": ""}
+        if "status" in argv:
+            return {"attempted": True, "returncode": 0, "stdout": json.dumps({"BackendState": "Running", "Self": {"HostName": "desktop", "DNSName": "desktop.tailnet.ts.net.", "TailscaleIPs": ["100.1.2.3"], "Online": True, "Active": True}}), "stderr": ""}
+        if "ip" in argv:
+            return {"attempted": True, "returncode": 0, "stdout": "100.1.2.3\n", "stderr": ""}
+        return {"attempted": True, "returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(cu, "_run_fixed_probe", fake_probe)
+    result = cu._runtime_inventory(hermes_root)
+    rendered = json.dumps(result)
+
+    assert any(":8787" in line for line in result["listeners"]["matches"])
+    assert not any(":9999" in line for line in result["listeners"]["matches"])
+    assert result["tailscale"]["self"]["host_name"] == "desktop"
+    assert result["docker"]["containers"][0].startswith("searxng")
+    assert "DO-NOT-RETURN" not in rendered
+    assert "prompt" not in rendered
+    assert result["guardrails"]["arbitrary_command_input"] is False

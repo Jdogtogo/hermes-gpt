@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import os
+import pwd
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT / "examples" / "hermes-gpt-chatgpt-operator-write-roots.conf"
-TARGET_DIR = Path.home() / ".config" / "systemd" / "user" / "hermes-gpt-chatgpt-operator.service.d"
+USER_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+TARGET_DIR = USER_HOME / ".config" / "systemd" / "user" / "hermes-gpt-chatgpt-operator.service.d"
 TARGET = TARGET_DIR / "50-write-roots.conf"
 UNIT = "hermes-gpt-chatgpt-operator.service"
 

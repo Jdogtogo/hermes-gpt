@@ -141,7 +141,73 @@ def session_deployment_configured() -> bool:
     )
 
 
-def resolve_effective_authority(*, now: int | None = None, task_id: str | None = None) -> EffectiveAuthority:
+def _find_recoverable_session_id(
+    *,
+    root: Path,
+    current: int,
+    exclude_session_id: str,
+) -> str | None:
+    """Find one independently valid approved session after ordinary expiry.
+
+    This is intentionally NOT an authority union. Each candidate must be a
+    complete approved session snapshot in its own right. Recovery is used only
+    when the currently pointed session expired by time; callers must never use
+    it for revocation, cancellation, malformed state, or other security stops.
+    """
+    try:
+        with _connect(root) as connection:
+            rows = connection.execute(
+                "SELECT s.session_id, s.snapshot_hash, p.canonical_json, s.expires_at "
+                "FROM operator_sessions s JOIN policy_snapshots p ON p.snapshot_hash = s.snapshot_hash "
+                "WHERE s.approval_state = 'approved' AND s.revoked_at IS NULL AND s.session_id <> ? "
+                "ORDER BY s.created_at DESC, s.session_id DESC",
+                (exclude_session_id,),
+            ).fetchall()
+            for row in rows:
+                candidate_id = str(row["session_id"])
+                try:
+                    snapshot = json.loads(str(row["canonical_json"]))
+                    if not isinstance(snapshot, dict) or snapshot_authority_defect(snapshot) is not None:
+                        continue
+                except Exception:
+                    continue
+
+                binding = connection.execute(
+                    "SELECT logical_task_id FROM session_creation_requests "
+                    "WHERE resulting_session_id = ? AND status = 'approved' "
+                    "ORDER BY decided_at DESC LIMIT 1",
+                    (candidate_id,),
+                ).fetchone()
+                logical_task_id = (
+                    str(binding["logical_task_id"] or "").strip()
+                    if binding is not None
+                    else ""
+                )
+                if logical_task_id:
+                    try:
+                        import operator_task_authority as task_authority
+                        state = task_authority.task_status(logical_task_id, root=root, now=current)
+                    except Exception:
+                        continue
+                    if bool(state.get("valid")):
+                        return candidate_id
+                    # A cancelled/revoked/completed/hard-expired task-bound
+                    # authority is never recoverable through session fallback.
+                    continue
+
+                if int(row["expires_at"]) >= current:
+                    return candidate_id
+    except Exception:
+        return None
+    return None
+
+
+def resolve_effective_authority(
+    *,
+    now: int | None = None,
+    task_id: str | None = None,
+    _session_id_override: str | None = None,
+) -> EffectiveAuthority:
     """Resolve the runtime's effective operator authority from the
     authoritative session record (pointer file first, env id fallback),
     classifying every non-active outcome instead of collapsing them to None.
@@ -170,7 +236,7 @@ def resolve_effective_authority(*, now: int | None = None, task_id: str | None =
     except Exception as exc:  # session root itself unresolvable
         return _closed("malformed", None, f"Session root could not be resolved: {exc.__class__.__name__}.")
 
-    sid = ""
+    sid = str(_session_id_override or "").strip()
     if task_id:
         try:
             with _connect(root) as connection:
@@ -187,12 +253,13 @@ def resolve_effective_authority(*, now: int | None = None, task_id: str | None =
         if not sid:
             return _closed("task_missing", None, f"No approved operator authority is bound to logical task {task_id!r}.")
     else:
-        try:
-            pointer_path = _active_pointer_path(root)
-            if pointer_path.is_file():
-                sid = pointer_path.read_text(encoding="utf-8").strip()
-        except Exception:
-            return _closed("malformed", None, "Active-session pointer exists but could not be read.")
+        if not sid:
+            try:
+                pointer_path = _active_pointer_path(root)
+                if pointer_path.is_file():
+                    sid = pointer_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                return _closed("malformed", None, "Active-session pointer exists but could not be read.")
         if not sid:
             sid = os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip()
         if not sid:
@@ -303,10 +370,11 @@ def resolve_effective_authority(*, now: int | None = None, task_id: str | None =
         raw_mode = str(snapshot.get("apply_mode") or "direct").strip().lower()
         apply_mode = raw_mode if raw_mode in {"dry_run", "direct"} else "direct"
         writable = [str(p) for p in snapshot.get("writable_roots", [])]
-        if level == "workspace" and not writable:
+        defect = snapshot_authority_defect(snapshot)
+        if defect is not None:
             return _closed(
                 "malformed", sid,
-                f"Task-bound snapshot for {bound_task_id!r} grants workspace level but has no writable roots.",
+                f"Task-bound snapshot for {bound_task_id!r} {defect}.",
                 approved_at=created_at,
                 expires_at=(int(task_state["hard_expires_at"]) if task_state.get("hard_expires_at") else None),
             )
@@ -339,6 +407,24 @@ def resolve_effective_authority(*, now: int | None = None, task_id: str | None =
         )
 
     if expires_at < current:
+        # Ordinary wall-clock expiry is bookkeeping, not revocation. If this
+        # short-lived pointer masked another independently valid approved
+        # authority, recover that one rather than forcing a duplicate human
+        # approval. Never reaches this path for revoked/malformed/task-terminal
+        # authorities, which fail closed above.
+        if not task_id and _session_id_override is None:
+            recovered_id = _find_recoverable_session_id(
+                root=root,
+                current=current,
+                exclude_session_id=sid,
+            )
+            if recovered_id:
+                recovered = resolve_effective_authority(
+                    now=current,
+                    _session_id_override=recovered_id,
+                )
+                if recovered.is_active:
+                    return recovered
         return _closed(
             "expired", sid,
             f"Operator session {sid!r} expired at {expires_at} "
@@ -362,10 +448,11 @@ def resolve_effective_authority(*, now: int | None = None, task_id: str | None =
     raw_mode = str(snapshot.get("apply_mode") or "direct").strip().lower()
     apply_mode = raw_mode if raw_mode in {"dry_run", "direct"} else "direct"
     writable = [str(p) for p in snapshot.get("writable_roots", [])]
-    if level == "workspace" and not writable:
+    defect = snapshot_authority_defect(snapshot)
+    if defect is not None:
         return _closed(
             "malformed", sid,
-            f"Operator session {sid!r} grants workspace level but has no writable roots.",
+            f"Operator session {sid!r} {defect}.",
             approved_at=created_at, expires_at=expires_at,
         )
 
@@ -400,6 +487,37 @@ def session_root() -> Path:
 
 def db_path(root: Path | None = None) -> Path:
     return (root or session_root()) / "operator_sessions.sqlite3"
+
+
+def session_deployment_binding(*, root: Path | None = None) -> dict[str, Any]:
+    """Report exactly which session state THIS process is bound to.
+
+    Every approval surface (localhost page, Telegram resolve endpoint, CLI) and
+    the operator MCP server must agree on all four values below, or an approval
+    recorded by one is invisible to the other. That divergence is never silent
+    -- a session approved under a different root is simply absent from this
+    store, so resolve_effective_authority() reports "missing"/"none_configured"
+    and fails closed rather than granting anything -- but "not silent" is only
+    useful if the binding can actually be read off a running process. This is
+    that read-out, and it is what the deployment check compares across
+    components."""
+    resolved = root or session_root()
+    pointer = _active_pointer_path(resolved)
+    active = ""
+    try:
+        if pointer.is_file():
+            active = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        active = ""
+    return {
+        "session_root": str(resolved),
+        "db_path": str(db_path(resolved)),
+        "active_pointer_path": str(pointer),
+        "active_session_id": active or None,
+        "session_root_env": os.environ.get(SESSION_ROOT_ENV, "").strip() or None,
+        "active_session_id_env": os.environ.get(ACTIVE_SESSION_ID_ENV, "").strip() or None,
+        "session_deployment_configured": session_deployment_configured(),
+    }
 
 
 def canonical_policy(policy: dict[str, Any]) -> str:
@@ -506,6 +624,74 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
         ),
         "has_deployment": bool(policy.get("has_deployment", False)),
     }
+
+
+def _template_declares_no_local_writes(policy_template: str | None) -> bool:
+    """True only when the LOCALLY registered template of this exact name itself
+    declares an empty ``writable_roots`` list.
+
+    This is the discriminator between the two ways an approved workspace-level
+    snapshot can end up with no writable roots:
+
+    * the roots were LOST between approval and resolution (drift, a truncated
+      snapshot, a stale writer) -- the failure mode the workspace/writable-roots
+      integrity check in resolve_effective_authority() was written to catch; and
+    * the template deliberately grants a zero-local-write surface (e.g.
+      ``hermes-exec-first-safe-model``, whose whole point is workspace-tier
+      verbs with egress to one host and no local write authority at all).
+
+    Only the second is legitimate, and only the local template registry can say
+    which one it is -- a remote caller can name a template but never author one.
+    Unknown or unresolvable templates fail closed to False, so the integrity
+    check still applies to anything this deployment cannot vouch for."""
+    name = str(policy_template or "").strip()
+    if not name:
+        return False
+    try:
+        import operator_policy_templates as policy_templates
+
+        resolved = policy_templates.resolve_template(name)
+    except Exception:
+        return False
+    declared = (resolved or {}).get("policy")
+    if not isinstance(declared, dict):
+        return False
+    roots = declared.get("writable_roots")
+    return isinstance(roots, list) and not roots
+
+
+def snapshot_authority_defect(policy: dict[str, Any]) -> str | None:
+    """The single definition of "this approved snapshot can never resolve to
+    live operator authority". Returns a human-readable, secret-free reason, or
+    None when the snapshot is coherent.
+
+    It exists so the invariant is stated ONCE and applied at every point that
+    can either mint or honour authority:
+
+    * ``request_session()``   -- refuse to record a request a human could only
+      ever approve into a dead session;
+    * ``approve_session_request()`` -- refuse BEFORE anything is created, so a
+      human approval is never consumed by an unusable policy and no partial
+      authority (session / task authority / active pointer) is left behind;
+    * ``create_session(approval_state="approved")`` -- the final chokepoint, so
+      no present or future caller can persist an approved-but-unresolvable
+      snapshot; and
+    * ``resolve_effective_authority()`` -- unchanged fail-closed enforcement.
+
+    Before this was single-sourced, the invariant lived only in the resolver.
+    An incoherent template therefore passed request and approval silently, minted
+    a session, moved the active pointer, and marked the request approved -- and
+    then failed closed on the very next call, so OperatorPolicy fell back to the
+    standing authority and the operator reported standing authority instead of
+    the dedicated session the human had just granted."""
+    normalized = normalize_policy(policy)
+    raw_level = str(normalized.get("level") or "workspace").strip().lower()
+    level = raw_level if raw_level in _POLICY_LEVELS else "workspace"
+    writable = [str(path) for path in normalized.get("writable_roots", [])]
+    if level == "workspace" and not writable:
+        if not _template_declares_no_local_writes(normalized.get("policy_template")):
+            return "grants workspace level but has no writable roots"
+    return None
 
 
 def _connect(root: Path | None = None) -> sqlite3.Connection:
@@ -650,6 +836,19 @@ def create_session(
             "every service that imports operator_sessions (see "
             "docs/OPERATOR_RESTART_INVESTIGATION.md) and re-approve."
         )
+    # Second hard invariant, same chokepoint: an approved snapshot must be able
+    # to resolve to live authority. Persisting one that resolve_effective_
+    # authority() will always reject would silently convert a human approval
+    # into a dead session while the runtime fell back to standing authority.
+    if approval_state == "approved":
+        defect = snapshot_authority_defect(normalized)
+        if defect is not None:
+            raise SessionPolicyInvariantError(
+                f"Refusing to create an approved operator session whose policy snapshot "
+                f"{defect}. Such a session can never become the effective authority; "
+                "creating it would consume a human approval and leave the runtime silently "
+                "falling back to whatever standing authority happens to exist."
+            )
     canonical = canonical_policy(normalized)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     sid = session_id or f"ops_{secrets.token_urlsafe(24)}"
@@ -1053,6 +1252,17 @@ def request_session(
 ) -> str:
     current = int(time.time() if now is None else now)
     expires_at = current + SESSION_REQUEST_TTL_SECONDS
+    # Fail at request time rather than presenting a human with a request that
+    # could only ever be approved into a session the resolver will reject. The
+    # requester gets the defect immediately; the approver is never asked to
+    # spend an approval on it.
+    defect = snapshot_authority_defect({**resolved_policy, "policy_template": policy_template})
+    if defect is not None:
+        raise SessionPolicyInvariantError(
+            f"Refusing to record a session request for policy template {policy_template!r}: "
+            f"its resolved policy {defect}, so an approval could never become live operator "
+            "authority. Correct the policy template before requesting this session."
+        )
     task_id = derive_logical_task_id(
         policy_template=policy_template,
         resolved_policy=resolved_policy,
@@ -1169,6 +1379,49 @@ def list_pending_session_requests(*, root: Path | None = None) -> list[dict[str,
     ]
 
 
+FIRST_SAFE_MODEL_POLICY_TEMPLATE = "hermes-exec-first-safe-model"
+FIRST_SAFE_REQUIRED_LEASE_OWNER = "chatgpt-mission-control"
+
+
+def _require_session_approval_prerequisites(policy_template: str) -> None:
+    """Fail closed on template-specific prerequisites before minting authority.
+
+    FIRST_SAFE model acceptance deliberately cannot acquire or release the
+    Mission Control lease itself. Therefore the human approval boundary must
+    only activate that narrow authority after Mission Control already holds a
+    live lease. This is a local prerequisite check only: it grants no lease
+    capability, consumes no token, and mutates nothing.
+    """
+    if policy_template != FIRST_SAFE_MODEL_POLICY_TEMPLATE:
+        return
+
+    # Local import avoids the operator_sessions -> operator_policy ->
+    # operator_sessions import cycle at module import time. The approval
+    # service reads exactly one fixed lease record; it does not call the
+    # operator-facing lease-status tool and therefore does not depend on the
+    # currently active Operator Session.
+    import operator_lease as lease
+
+    state = lease._read_lease_state()
+    if state is None:
+        raise PermissionError(
+            "FIRST_SAFE model authority approval requires an existing Mission Control lease "
+            f"owned by {FIRST_SAFE_REQUIRED_LEASE_OWNER!r}. No valid lease record exists; "
+            "the request remains pending and no authority was minted."
+        )
+    if lease._is_expired(state):
+        raise PermissionError(
+            "FIRST_SAFE model authority approval requires a live Mission Control lease; "
+            "the current lease is expired. The request remains pending and no authority was minted."
+        )
+    if state.owner != FIRST_SAFE_REQUIRED_LEASE_OWNER:
+        raise PermissionError(
+            "FIRST_SAFE model authority approval requires the Mission Control lease to be owned by "
+            f"{FIRST_SAFE_REQUIRED_LEASE_OWNER!r}; current owner is different. "
+            "The request remains pending and no authority was minted."
+        )
+
+
 def approve_session_request(
     request_id: str, *, decided_by: str = "local-cli", root: Path | None = None, now: int | None = None
 ) -> SessionRecord:
@@ -1203,6 +1456,7 @@ def approve_session_request(
                 f"Session creation request {request_id!r} has no policy_template; "
                 "refusing to approve an unbound operator session."
             )
+        _require_session_approval_prerequisites(template_name)
         policy["policy_template"] = template_name
         logical_task_id = str(row["logical_task_id"] or "").strip() or derive_logical_task_id(
             policy_template=template_name,
@@ -1219,6 +1473,18 @@ def approve_session_request(
         )
 
         normalized = normalize_policy(policy)
+        # Validate BEFORE anything is minted. Raising here leaves the request
+        # 'pending' with no session, no task authority and an untouched active
+        # pointer, so a human approval is never consumed by a policy that could
+        # not have become live authority anyway.
+        approval_defect = snapshot_authority_defect(normalized)
+        if approval_defect is not None:
+            raise SessionPolicyInvariantError(
+                f"Refusing to approve session request {request_id!r}: its immutable policy "
+                f"snapshot {approval_defect}, so the resulting session could never become the "
+                "effective authority. The request remains pending and unspent; correct the "
+                f"policy template {template_name!r} and request again."
+            )
         factor_snapshot = dict(normalized)
         factor_snapshot["snapshot_hash"] = snapshot_hash(normalized)
         approval_risk_factors = compute_risk_factors_from_session(

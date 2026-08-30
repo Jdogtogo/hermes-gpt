@@ -1,11 +1,33 @@
 from __future__ import annotations
 
+import os
+import pwd
+import runpy
 import sys
 from pathlib import Path
 
 import pytest
 
 import install_operator_release_capability as installer
+
+
+def test_installer_resolves_user_home_from_uid_not_environment(tmp_path: Path, monkeypatch):
+    wrong_home = tmp_path / "wrong-home"
+    monkeypatch.setenv("HOME", str(wrong_home))
+    namespace = runpy.run_path(
+        str(Path(__file__).resolve().parent / "install_operator_release_capability.py"),
+        run_name="operator_release_installer_test",
+    )
+    expected_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    assert namespace["USER_HOME"] == expected_home
+    assert namespace["TARGET_DIR"] == (
+        expected_home
+        / ".config"
+        / "systemd"
+        / "user"
+        / "hermes-gpt-chatgpt-operator.service.d"
+    )
+    assert not str(namespace["TARGET_DIR"]).startswith(str(wrong_home))
 
 
 def test_installer_copies_exact_drop_in_and_restarts_exact_unit(tmp_path: Path, monkeypatch):

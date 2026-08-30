@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -274,6 +275,216 @@ def _select_board_policy() -> op_policy.OperatorPolicy | None:
     if not candidates:
         return None
     return min(candidates, key=_board_policy_score)
+
+
+MISSION_CONTROL_CREATED_BY = "hermes-gpt-mission-control"
+MISSION_CONTROL_KEY_PREFIX = "mission-control:"
+DELEGATION_MARKER_PREFIX = "governed-delegation-task-id="
+
+
+def _select_board_read_policy() -> op_policy.OperatorPolicy | None:
+    candidates: list[op_policy.OperatorPolicy] = []
+    try:
+        authorities = op_standing.list_standing_authorities()
+    except Exception:
+        authorities = []
+    for authority in authorities:
+        authority_id = str(getattr(authority, "authority_id", "") or "")
+        if not authority_id:
+            continue
+        try:
+            policy = op_policy.OperatorPolicy(
+                authority_preference="standing",
+                standing_authority_id=authority_id,
+            )
+            policy.require_enabled()
+            policy.require_level("workspace")
+            policy.require_read_path(BOARD_ROOT)
+        except Exception:
+            continue
+        candidates.append(policy)
+    if not candidates:
+        return None
+    return min(candidates, key=_board_policy_score)
+
+
+def _mission_control_key(logical_work_id: str) -> str:
+    return MISSION_CONTROL_KEY_PREFIX + logical_work_id
+
+
+def _board_status_to_mission_control(status: str | None) -> str | None:
+    return {
+        "running": "In Progress",
+        "review": "In Review",
+        "done": "Completed",
+        "blocked": "On Hold",
+    }.get(str(status or ""))
+
+
+def record_mission_control_task(task: dict[str, Any], *, event: str) -> bool:
+    """Upsert one delegated logical task into the existing governed board."""
+    policy = _select_board_policy()
+    if policy is None:
+        return False
+    try:
+        policy.require_write_path(BOARD_ROOT)
+        kb = _kb()
+        conn = kb.connect(board=BOARD_SLUG)
+    except Exception:
+        return False
+    try:
+        logical_work_id = str(task.get("logical_work_id") or task.get("task_id") or "").strip()
+        delegated_id = str(task.get("task_id") or "").strip()
+        if not logical_work_id or not delegated_id:
+            return False
+        card_id = kb.create_task(
+            conn,
+            title=f"Delegated Hermes task {logical_work_id}",
+            body="Mission Control delegated execution record. Prompt content is intentionally not stored.",
+            assignee=ASSIGNEE,
+            created_by=MISSION_CONTROL_CREATED_BY,
+            workspace_kind="dir",
+            workspace_path=str(task.get("workdir") or "") or None,
+            priority=0,
+            idempotency_key=_mission_control_key(logical_work_id),
+            initial_status="running",
+            board=BOARD_SLUG,
+        )
+        marker = DELEGATION_MARKER_PREFIX + delegated_id
+        comments = kb.list_comments(conn, card_id)
+        if not comments or str(getattr(comments[-1], "body", "") or "") != marker:
+            if not any(str(getattr(c, "body", "") or "") == marker for c in comments):
+                kb.add_comment(conn, card_id, MISSION_CONTROL_CREATED_BY, marker)
+
+        worker_status = str(task.get("status") or "")
+        review_status = str(task.get("review_status") or "")
+        if worker_status == "completed":
+            desired = "done" if review_status == "accepted" else "review"
+        elif worker_status in op_delegation.TERMINAL_STATES:
+            desired = "blocked"
+        else:
+            desired = "running"
+
+        if desired == "blocked":
+            reason = str(
+                task.get("outcome_reason")
+                or task.get("failure_category")
+                or f"Delegated task ended in {worker_status or 'terminal'} state"
+            )[:2000]
+            current = kb.get_task(conn, card_id) if hasattr(kb, "get_task") else getattr(conn, "kb", None).tasks.get(card_id)
+            if getattr(current, "status", None) != "blocked":
+                kb.block_task(conn, card_id, reason=reason, kind="capability" if task.get("failure_category") == "permission" else "transient")
+        elif hasattr(conn, "kb") and hasattr(conn.kb, "tasks"):
+            card = conn.kb.tasks[card_id]
+            if card.status != "done" or desired == "done":
+                card.status = desired
+                if desired == "done":
+                    card.result = str(task.get("review_summary") or task.get("outcome_reason") or "Mission Control review accepted")
+        else:
+            now = int(time.time())
+            with kb.write_txn(conn):
+                if desired == "done":
+                    conn.execute(
+                        "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
+                        (now, str(task.get("review_summary") or task.get("outcome_reason") or "Mission Control review accepted")[:8000], card_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status=?, completed_at=NULL WHERE id=? AND status!='done'",
+                        (desired, card_id),
+                    )
+        lifecycle = f"mission-control-event={event};worker-status={worker_status};review-status={review_status or 'pending'}"
+        comments = kb.list_comments(conn, card_id)
+        if not comments or str(getattr(comments[-1], "body", "") or "") != lifecycle:
+            kb.add_comment(conn, card_id, MISSION_CONTROL_CREATED_BY, lifecycle)
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _mission_control_rows_read_only() -> tuple[list[dict[str, Any]], dict[str, int]]:
+    if _KANBAN_MODULE_OVERRIDE is not None:
+        kb = _KANBAN_MODULE_OVERRIDE
+        conn = kb.connect(board=BOARD_SLUG)
+        try:
+            tasks = [t for t in kb.list_tasks(conn, assignee=ASSIGNEE) if str(getattr(t, "idempotency_key", "") or "").startswith(MISSION_CONTROL_KEY_PREFIX)]
+            rows = []
+            counts: dict[str, int] = {}
+            for task in tasks:
+                status = str(task.status)
+                counts[status] = counts.get(status, 0) + 1
+                comments = kb.list_comments(conn, task.id)
+                delegated_id = _delegation_marker(comments)
+                rows.append({"board_task_id": task.id, "title": task.title, "status": status, "delegated_task_id": delegated_id, "logical_work_id": str(task.idempotency_key)[len(MISSION_CONTROL_KEY_PREFIX):]})
+            return rows, counts
+        finally:
+            conn.close()
+
+    policy = _select_board_read_policy()
+    db_path = BOARD_ROOT / "kanban.db"
+    if policy is None or not db_path.is_file():
+        return [], {}
+    policy.require_read_path(db_path)
+    uri = f"file:{db_path}?mode=ro"
+    with sqlite3.connect(uri, uri=True, timeout=10) as conn:
+        conn.row_factory = sqlite3.Row
+        task_rows = conn.execute(
+            "SELECT id,title,status,idempotency_key FROM tasks WHERE assignee=? AND idempotency_key LIKE ?",
+            (ASSIGNEE, MISSION_CONTROL_KEY_PREFIX + "%"),
+        ).fetchall()
+        rows: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        for row in task_rows:
+            status = str(row["status"])
+            counts[status] = counts.get(status, 0) + 1
+            marker = conn.execute(
+                "SELECT body FROM task_comments WHERE task_id=? AND body LIKE ? ORDER BY id DESC LIMIT 1",
+                (row["id"], DELEGATION_MARKER_PREFIX + "%"),
+            ).fetchone()
+            delegated_id = None
+            if marker:
+                delegated_id = str(marker[0])[len(DELEGATION_MARKER_PREFIX):].strip() or None
+            if delegated_id and delegated_id.startswith("dt_"):
+                try:
+                    if not op_delegation._task_path(delegated_id).is_file():
+                        delegated_id = None
+                except Exception:
+                    delegated_id = None
+            key = str(row["idempotency_key"] or "")
+            rows.append({"board_task_id": row["id"], "title": row["title"], "status": status, "delegated_task_id": delegated_id, "logical_work_id": key[len(MISSION_CONTROL_KEY_PREFIX):]})
+    return rows, counts
+
+
+def mission_control_task_status(logical_work_id: str) -> str | None:
+    rows, _ = _mission_control_rows_read_only()
+    for row in rows:
+        if row.get("logical_work_id") == logical_work_id:
+            return _board_status_to_mission_control(str(row.get("status") or ""))
+    return None
+
+
+def mission_control_snapshot() -> dict[str, Any]:
+    try:
+        rows, counts = _mission_control_rows_read_only()
+        active = [row for row in rows if row.get("status") in {"running", "review"} and row.get("delegated_task_id")]
+        return {
+            "success": True,
+            "board": BOARD_SLUG,
+            "counts": counts,
+            "active_delegations": active,
+            "active_count": len(active),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "board": BOARD_SLUG,
+            "counts": {},
+            "active_delegations": [],
+            "active_count": 0,
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
 
 
 def _encode_packet(packet: dict[str, Any]) -> str:
@@ -588,24 +799,38 @@ def _reconcile_running_task(kb: Any, conn: Any, task: Any) -> None:
                 kind="transient",
             )
         return
+    status = json.loads(op_delegation.hermes_delegated_task_status(delegated_id))
+    if not status.get("success"):
+        return
+    latest_status = str(status.get("latest_status") or status.get("status") or "")
+    if latest_status not in op_delegation.TERMINAL_STATES:
+        return
     result = json.loads(op_delegation.hermes_delegated_task_result(delegated_id))
     if not result.get("ready"):
         return
     if result.get("success"):
-        final_answer = str(result.get("final_answer") or result.get("stdout") or "").strip()
-        metadata = {
-            "delegated_task_id": delegated_id,
-            "authority_id": (result.get("authority") or {}).get("session_id"),
-            "changed_files": result.get("changed_files") or [],
-            "returncode": result.get("returncode"),
-        }
-        kb.complete_task(
-            conn,
-            task.id,
-            result=final_answer[:8000],
-            summary=(final_answer.splitlines()[0][:400] if final_answer else "Governed task completed"),
-            metadata=metadata,
-        )
+        final_answer = str(result.get("final_answer") or "").strip()
+        if result.get("review_status") == "accepted":
+            if hasattr(conn, "kb") and hasattr(conn.kb, "tasks"):
+                task.status = "done"
+                task.result = final_answer[:8000]
+            else:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
+                        (int(time.time()), final_answer[:8000], task.id),
+                    )
+        else:
+            if hasattr(conn, "kb") and hasattr(conn.kb, "tasks"):
+                task.status = "review"
+                task.result = final_answer[:8000]
+            else:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='review', completed_at=NULL, result=? WHERE id=?",
+                        (final_answer[:8000], task.id),
+                    )
+            kb.add_comment(conn, task.id, CREATED_BY, "mission-control-review-required=v1")
         return
     failure = str(result.get("failure_category") or "")
     kind = "capability" if failure in {"permission", "provider_configuration"} else "transient"
