@@ -1539,6 +1539,7 @@ def hermes_routing_release_v019(dry_run: bool = True) -> str:
 
 
 hermes_first_safe_model_prepare = op_first_safe.hermes_first_safe_model_prepare
+hermes_first_safe_model_execute = op_first_safe.hermes_first_safe_model_execute
 hermes_first_safe_model_verify = op_first_safe.hermes_first_safe_model_verify
 hermes_first_safe_provision_prepare = op_first_safe_provision.hermes_first_safe_provision_prepare
 hermes_first_safe_provision_execute = op_first_safe_provision.hermes_first_safe_provision_execute
@@ -2008,6 +2009,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_routing_release_v019,
         hermes_controller_publish,
         hermes_first_safe_model_prepare,
+        hermes_first_safe_model_execute,
         hermes_first_safe_model_verify,
         hermes_first_safe_provision_prepare,
         hermes_first_safe_provision_execute,
@@ -2101,6 +2103,17 @@ def register_tools(
             destructiveHint=False,
             idempotentHint=True,
             openWorldHint=False,
+        ),
+        # Execute consumes exactly one already-prepared immutable intent and
+        # invokes the fixed trusted worker. It is state-changing and reaches the
+        # fixed hermes-exec target, but exposes no arbitrary remote-operation
+        # inputs and is not idempotent because an intent may be claimed once.
+        "hermes_first_safe_model_execute": ToolAnnotations(
+            title="Execute one prepared FIRST_SAFE model acceptance intent via the fixed trusted worker",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
         ),
         # Verify only reads a local record.
         "hermes_first_safe_model_verify": ToolAnnotations(

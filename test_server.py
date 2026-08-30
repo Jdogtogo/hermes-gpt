@@ -351,6 +351,7 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_workspace_exec",
         "hermes_workspace_git_commit",
         "hermes_routing_release_v019",
+        "hermes_first_safe_model_execute",
         "hermes_first_safe_provision_prepare",
         "hermes_first_safe_provision_execute",
         "hermes_first_safe_provision_verify",
@@ -442,8 +443,8 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     public_manifest = status["public_manifest"]
     assert public_manifest["applicable"] is True
     assert public_manifest["manifest_version"] == server.op_manifest.MANIFEST_VERSION
-    # 51 as of manifest 1.7.0 (adds fixed-purpose Controller publication).
-    assert public_manifest["expected_tool_count"] == 51
+    # 52 as of manifest 1.8.0 (adds fixed FIRST_SAFE model execute bridge).
+    assert public_manifest["expected_tool_count"] == 52
     assert public_manifest["registered_tool_count"] == len(live_names)
     assert public_manifest["schema_fingerprint"] == server.op_manifest.EXPECTED_SCHEMA_FINGERPRINT
     assert public_manifest["missing_tools"] == []
@@ -462,6 +463,7 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
         "hermes_operator_service_restart",
         "hermes_approval_web_service_restart",
         "hermes_first_safe_model_prepare",
+        "hermes_first_safe_model_execute",
         "hermes_first_safe_model_verify",
         "hermes_first_safe_provision_prepare",
         "hermes_first_safe_provision_execute",

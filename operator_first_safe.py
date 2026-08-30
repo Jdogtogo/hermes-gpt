@@ -16,10 +16,13 @@ operation into three stages with a trust boundary in the middle:
    human-approved authority and the Mission Control lease, then records ONE
    bounded, immutable execution intent locally. It performs no ssh, no
    subprocess, no model call and no config mutation.
-2. ``first_safe_worker.py`` (trusted, host-side, NOT an MCP tool) -- the only
-   component that talks to hermes-exec. It is started locally by the operator,
-   re-derives every invariant from the immutable specification, and refuses any
-   intent whose recorded spec hash does not match.
+2. ``hermes_first_safe_model_execute`` (here, ChatGPT-facing) -- accepts only
+   the opaque id of an already-prepared intent and invokes ``first_safe_worker``
+   through a fixed in-process bridge. The worker remains the only component
+   that talks to hermes-exec, re-derives every invariant from the immutable
+   specification, and refuses any intent whose recorded spec hash does not
+   match. No host, user, path, command, script, model, credential or transport
+   parameter is exposed by the public execute tool.
 3. ``hermes_first_safe_model_verify`` (here, ChatGPT-facing) -- read-only.
    Returns allow-listed structured evidence and nothing else.
 
@@ -51,6 +54,7 @@ import operator_policy as op
 import operator_sessions as sessions
 
 PREPARE_TOOL_NAME = "hermes_first_safe_model_prepare"
+EXECUTE_TOOL_NAME = "hermes_first_safe_model_execute"
 VERIFY_TOOL_NAME = "hermes_first_safe_model_verify"
 
 POLICY_TEMPLATE = spec.POLICY_TEMPLATE
@@ -361,6 +365,77 @@ def hermes_first_safe_model_prepare() -> str:
                     "Obtain a fresh local human approval for hermes-exec-first-safe-model "
                     "and ensure Mission Control holds the coordination lease. Do not bypass "
                     "the governed FIRST_SAFE workflow."
+                ),
+            ),
+            indent=2,
+        )
+
+
+def hermes_first_safe_model_execute(intent_id: str) -> str:
+    """Execute exactly one prepared FIRST_SAFE model-acceptance intent.
+
+    This is a fixed governed bridge to ``first_safe_worker.claim_and_run``.
+    The only caller-supplied value is the opaque prepared intent id; host,
+    user, command, script, model, path, credential and transport details remain
+    fixed inside the trusted worker/specification. The live FIRST_SAFE authority
+    and Mission Control lease are re-validated immediately before execution.
+    """
+    try:
+        token = str(intent_id).strip()
+        if not _INTENT_ID_RE.fullmatch(token):
+            raise ValueError("intent_id is not a valid FIRST_SAFE intent identifier.")
+
+        policy = _require_first_safe_authority(for_mutation=True)
+        _require_mission_control_lease()
+
+        # Lazy import avoids a module cycle: the trusted worker imports this
+        # module for the canonical intent store/contract. It accepts no
+        # caller-controlled operational parameters beyond the opaque intent id.
+        import first_safe_worker as worker
+
+        worker_result = worker.claim_and_run(execute=True, intent_id=token)
+        if worker_result.get("success") is not True:
+            error = str(worker_result.get("error") or "FIRST_SAFE worker failed")
+            detail = str(worker_result.get("detail") or "").strip()
+            raise RuntimeError(f"{error}: {detail}" if detail else error)
+
+        evidence = dict(worker_result.get("evidence") or {})
+        result = {
+            "success": True,
+            "intent_id": token,
+            "state": STATE_COMPLETED,
+            "spec_hash": spec.spec_hash(),
+            "policy_template": POLICY_TEMPLATE,
+            "evidence": evidence,
+        }
+        op.audit_record(
+            tool=EXECUTE_TOOL_NAME,
+            level=policy.level,
+            apply_mode=policy.apply_mode,
+            dry_run=False,
+            success=True,
+            changed=bool(evidence.get("changed")),
+            summary="executed bounded FIRST_SAFE model acceptance via fixed trusted worker",
+            extra={
+                "intent_id": token,
+                "spec_hash": result["spec_hash"],
+                "policy_template": POLICY_TEMPLATE,
+                "host": spec.EGRESS_HOST,
+                "remote_execution_performed": True,
+                "acceptance_calls": 2,
+                "estimated_cost_usd": 0.0,
+            },
+        )
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            op.error_from_exception(
+                exc,
+                layer="first_safe",
+                code="FIRST_SAFE_EXECUTE_ERROR",
+                suggested_action=(
+                    "Use the exact prepared FIRST_SAFE intent under its bound approved "
+                    "hermes-exec-first-safe-model session and live Mission Control lease."
                 ),
             ),
             indent=2,

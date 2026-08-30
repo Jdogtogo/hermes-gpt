@@ -7,17 +7,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-# 1.3.0 -- FIRST_SAFE became a three-stage governed operation. The single
-# hermes_exec_first_safe_model tool launched ssh and piped a Python program to
-# hermes-exec from inside the connector call; regardless of its narrow
-# dry_run-only input surface it was semantically a remote-command-execution
-# mechanism. On the public surface it is replaced by
-# hermes_first_safe_model_prepare (records a bounded local intent) and
-# hermes_first_safe_model_verify (read-only evidence). Execution moved to
-# first_safe_worker.py, a trusted host-side worker deliberately NOT part of this
-# public surface. Net effect: 45 -> 46 tools, and no tool that reaches the VM.
-MANIFEST_VERSION = "1.7.0"
-EXPECTED_TOOL_COUNT = 51
+# 1.8.0 -- FIRST_SAFE model acceptance gains a fixed governed execute bridge.
+# The public surface is now prepare -> execute -> verify, matching provisioning.
+# Execute accepts only an opaque prepared intent id and lazily invokes the
+# existing trusted first_safe_worker; it exposes no host, user, path, command,
+# script, model, credential or transport parameters. 51 -> 52 tools.
+MANIFEST_VERSION = "1.8.0"
+EXPECTED_TOOL_COUNT = 52
 
 # Canonical public surface for the authenticated ChatGPT operator connector.
 # This is intentionally independent of registration order.
@@ -46,6 +42,7 @@ CANONICAL_TOOL_NAMES = tuple(
             "hermes_delegated_task_status",
             "hermes_env_status",
             "hermes_first_safe_model_prepare",
+            "hermes_first_safe_model_execute",
             "hermes_first_safe_model_verify",
             "hermes_first_safe_provision_prepare",
             "hermes_first_safe_provision_execute",
@@ -89,7 +86,7 @@ if len(CANONICAL_TOOL_NAMES) != EXPECTED_TOOL_COUNT:
 # 1.2.0 was c068da8c29c0be1fca941a4e2060f2bfff694266d9a23b5b70e08ec7abf3f99f
 # (45 tools, hermes_exec_first_safe_model present). Re-pinned for 1.3.0 after the
 # deliberate FIRST_SAFE prepare/verify split described above.
-EXPECTED_SCHEMA_FINGERPRINT = "b9dbf9f2381fe7417e9b9122c7c90938cc20ec231b9dd039d5877faa8f6a00d3"
+EXPECTED_SCHEMA_FINGERPRINT = "7df2f26e1285069da0b8e801074a28b1843e8477a0ff113ccb14446ff3a875df"
 
 
 def _canonicalize(value: Any) -> Any:
