@@ -1487,7 +1487,7 @@ def hermes_antigravity_smoke_test(dry_run: bool = True) -> str:
 
 
 def hermes_antigravity_dispatch(packet_path: str, dry_run: bool = True) -> str:
-    """Queue a governed read-only Antigravity analysis from a structured packet."""
+    """Queue a governed Antigravity analysis or apply task from a structured packet."""
     return op_antigravity_dispatch.hermes_antigravity_dispatch(
         packet_path=packet_path,
         dry_run=dry_run,

@@ -22,6 +22,8 @@ class _Policy:
     def __init__(self) -> None:
         self.read_paths: list[Path] = []
         self.write_paths: list[Path] = []
+        self.verbs: list[tuple[str, str]] = []
+        self.branches: list[str] = []
 
     @staticmethod
     def effective_dry_run(requested: bool) -> bool:
@@ -32,6 +34,12 @@ class _Policy:
 
     def require_write_path(self, path) -> None:
         self.write_paths.append(Path(path))
+
+    def require_verb(self, resource: str, action: str) -> None:
+        self.verbs.append((resource, action))
+
+    def require_branch(self, branch: str) -> None:
+        self.branches.append(branch)
 
 
 def _patch_roots(monkeypatch, tmp_path: Path) -> None:
@@ -73,8 +81,8 @@ def test_public_surface_has_no_prompt_command_model_or_environment_inputs() -> N
     assert ag.STATE_ROOT != ag.CANONICAL_WORKTREE
     assert ag.CANONICAL_WORKTREE not in ag.STATE_ROOT.parents
     assert ag.MODE == "plan"
-    assert ag.MODE in ag._agy_argv("fixed", timeout_value="60s")
-    assert ag.MODEL in ag._agy_argv("fixed", timeout_value="60s")
+    assert ag.MODE in ag._agy_argv("fixed", timeout_value="60s", mode=ag.MODE)
+    assert ag.MODEL in ag._agy_argv("fixed", timeout_value="60s", mode=ag.MODE)
 
 
 def test_packet_schema_rejects_arbitrary_prompt_and_command_fields(tmp_path: Path) -> None:
@@ -443,3 +451,547 @@ def test_dispatch_failure_redacts_sensitive_exception_text(monkeypatch) -> None:
 
     assert result["success"] is False
     assert "super-secret-value" not in result["error"]
+
+
+def test_apply_mode_requires_worktree_and_capabilities(tmp_path: Path) -> None:
+    """Apply mode must include worktree path and at least one capability."""
+    # Missing worktree
+    packet = _packet(
+        tmp_path / "apply_no_worktree.json",
+        mode="apply",
+        capabilities=["filesystem:edit"],
+    )
+    with pytest.raises(ValueError, match="Apply mode requires a worktree path"):
+        ag._load_packet(packet)
+
+    # Missing capabilities
+    packet = _packet(
+        tmp_path / "apply_no_caps.json",
+        mode="apply",
+        worktree="/some/path",
+    )
+    with pytest.raises(ValueError, match="Apply mode requires at least one capability"):
+        ag._load_packet(packet)
+
+    # Both present - should succeed
+    packet = _packet(
+        tmp_path / "apply_ok.json",
+        mode="apply",
+        worktree="/some/path",
+        capabilities=["filesystem:edit"],
+    )
+    loaded = ag._load_packet(packet)
+    assert loaded["mode"] == "apply"
+    assert loaded["worktree"] == "/some/path"
+    assert loaded["capabilities"] == ["filesystem:edit"]
+
+
+def test_apply_mode_rejects_unsupported_capabilities(tmp_path: Path) -> None:
+    """Apply mode must only use allowed capabilities."""
+    packet = _packet(
+        tmp_path / "apply_bad_cap.json",
+        mode="apply",
+        worktree="/some/path",
+        capabilities=["filesystem:edit", "unsupported:cap"],
+    )
+    with pytest.raises(ValueError, match="unsupported capabilities"):
+        ag._load_packet(packet)
+
+
+def test_plan_mode_does_not_require_worktree_or_capabilities(tmp_path: Path) -> None:
+    """Plan mode does not need worktree or capabilities."""
+    packet = _packet(
+        tmp_path / "plan.json",
+        mode="plan",
+    )
+    loaded = ag._load_packet(packet)
+    assert loaded["mode"] == "plan"
+    assert loaded["worktree"] is None
+    assert loaded["capabilities"] == []
+
+    # Plan mode can have capabilities but they're ignored for validation
+    packet = _packet(
+        tmp_path / "plan_with_caps.json",
+        mode="plan",
+        capabilities=["filesystem:edit"],
+    )
+    loaded = ag._load_packet(packet)
+    assert loaded["mode"] == "plan"
+    assert loaded["capabilities"] == ["filesystem:edit"]
+
+
+def test_agy_argv_apply_mode_includes_flags_and_worktree(monkeypatch, tmp_path: Path) -> None:
+    """Apply mode argv includes --mode accept-edits, --add-dir, and --sandbox."""
+    prompt = "test prompt"
+    argv = ag._agy_argv(
+        prompt,
+        timeout_value="120s",
+        mode="apply",
+        worktree="/worktree/path",
+        requested_model="custom-model",
+    )
+
+    assert "--mode" in argv
+    assert argv[argv.index("--mode") + 1] == ag.APPLY_MODE
+    assert "--add-dir" in argv
+    assert argv[argv.index("--add-dir") + 1] == "/worktree/path"
+    assert "--sandbox" in argv
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "custom-model"
+
+
+def test_agy_argv_plan_mode_excludes_apply_flags(monkeypatch) -> None:
+    """Plan mode argv does not include apply-specific flags."""
+    prompt = "test prompt"
+    argv = ag._agy_argv(
+        prompt,
+        timeout_value="120s",
+        mode="plan",
+        worktree="/worktree/path",
+        requested_model="custom-model",
+    )
+
+    assert "--mode" in argv
+    assert argv[argv.index("--mode") + 1] == ag.MODE
+    assert "--add-dir" not in argv
+    assert "--sandbox" not in argv
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "custom-model"
+
+
+def test_worker_acquires_and_releases_writer_lock_on_apply_completion(monkeypatch, tmp_path: Path) -> None:
+    """Worker claims writer lock for apply mode and releases on completion."""
+    _patch_roots(monkeypatch, tmp_path)
+    task_id = "agd_00000000000000a1"
+    job_dir = ag._job_dir(task_id)
+    job_dir.mkdir(parents=True)
+
+    packet = {
+        "schema_version": 1,
+        "objective": "Apply changes.",
+        "context": [],
+        "questions": ["What to do?"],
+        "constraints": [],
+        "expected_output": [],
+        "mode": "apply",
+        "capabilities": ["filesystem:edit"],
+        "worktree": "/worktree/path",
+        "branch": "test-branch",
+    }
+    (job_dir / "packet.normalized.json").write_text(json.dumps(packet), encoding="utf-8")
+    ag._write_state(
+        task_id,
+        task_id=task_id,
+        status="queued",
+        session_id="ops-test",
+        snapshot_hash="snapshot-test",
+        packet_sha256="abc123",
+        authority_id="auth-123",
+    )
+
+    locks_claimed = []
+    locks_released = []
+
+    class MockLock:
+        def __init__(self, worktree):
+            self.worktree = worktree
+
+    def mock_claim_writer_locks(authority_id, worktrees):
+        locks_claimed.append((authority_id, worktrees))
+        return [MockLock(w) for w in worktrees]
+
+    def mock_release_writer_locks(authority_id, worktrees):
+        locks_released.append((authority_id, worktrees))
+
+    monkeypatch.setattr(ag, "_assert_origin_authority", lambda _state: _Policy())
+    monkeypatch.setattr(
+        ag,
+        "_run_agy",
+        lambda *_args, **_kwargs: (
+            0,
+            json.dumps({"conversation_id": "conv-1", "response": "Done", "model": "test-model", "provider": "test-provider"}),
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        ag.op_worktree_lock if hasattr(ag, "op_worktree_lock") else __import__("operator_worktree_lock"),
+        "claim_writer_locks",
+        mock_claim_writer_locks,
+    )
+    monkeypatch.setattr(
+        ag.op_worktree_lock if hasattr(ag, "op_worktree_lock") else __import__("operator_worktree_lock"),
+        "release_writer_locks",
+        mock_release_writer_locks,
+    )
+
+    # Need to import operator_worktree_lock for the worker
+    import operator_worktree_lock as op_wlock
+    monkeypatch.setattr(op_wlock, "claim_writer_locks", mock_claim_writer_locks)
+    monkeypatch.setattr(op_wlock, "release_writer_locks", mock_release_writer_locks)
+
+    assert ag._worker(task_id) == 0
+
+    # Verify lock was claimed and released
+    assert len(locks_claimed) == 1
+    assert locks_claimed[0] == ("auth-123", ["/worktree/path"])
+    assert len(locks_released) == 1
+    assert locks_released[0] == ("auth-123", ["/worktree/path"])
+
+
+def test_worker_releases_writer_lock_on_cancellation(monkeypatch, tmp_path: Path) -> None:
+    """Worker releases writer lock when cancelled during apply."""
+    _patch_roots(monkeypatch, tmp_path)
+    task_id = "agd_00000000000000a2"
+    job_dir = ag._job_dir(task_id)
+    job_dir.mkdir(parents=True)
+
+    packet = {
+        "schema_version": 1,
+        "objective": "Apply changes.",
+        "context": [],
+        "questions": ["What to do?"],
+        "constraints": [],
+        "expected_output": [],
+        "mode": "apply",
+        "capabilities": ["filesystem:edit"],
+        "worktree": "/worktree/path",
+    }
+    (job_dir / "packet.normalized.json").write_text(json.dumps(packet), encoding="utf-8")
+    ag._write_state(
+        task_id,
+        task_id=task_id,
+        status="queued",
+        session_id="ops-test",
+        snapshot_hash="snapshot-test",
+        packet_sha256="abc123",
+        authority_id="auth-123",
+    )
+
+    locks_released = []
+
+    class MockLock:
+        def __init__(self, worktree):
+            self.worktree = worktree
+
+    def mock_claim_writer_locks(authority_id, worktrees):
+        return [MockLock(w) for w in worktrees]
+
+    def mock_release_writer_locks(authority_id, worktrees):
+        locks_released.append((authority_id, worktrees))
+
+    import operator_worktree_lock as op_wlock
+    monkeypatch.setattr(op_wlock, "claim_writer_locks", mock_claim_writer_locks)
+    monkeypatch.setattr(op_wlock, "release_writer_locks", mock_release_writer_locks)
+    monkeypatch.setattr(ag, "_assert_origin_authority", lambda _state: _Policy())
+    monkeypatch.setattr(
+        ag,
+        "_run_agy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ag._DispatchCancelled()),
+    )
+
+    returncode = ag._worker(task_id)
+
+    assert returncode == 128 + int(signal.SIGTERM)
+    assert len(locks_released) == 1
+    assert locks_released[0] == ("auth-123", ["/worktree/path"])
+
+
+def test_worker_releases_writer_lock_on_timeout(monkeypatch, tmp_path: Path) -> None:
+    """Worker releases writer lock when agy times out during apply."""
+    _patch_roots(monkeypatch, tmp_path)
+    task_id = "agd_00000000000000a3"
+    job_dir = ag._job_dir(task_id)
+    job_dir.mkdir(parents=True)
+
+    packet = {
+        "schema_version": 1,
+        "objective": "Apply changes.",
+        "context": [],
+        "questions": ["What to do?"],
+        "constraints": [],
+        "expected_output": [],
+        "mode": "apply",
+        "capabilities": ["filesystem:edit"],
+        "worktree": "/worktree/path",
+    }
+    (job_dir / "packet.normalized.json").write_text(json.dumps(packet), encoding="utf-8")
+    ag._write_state(
+        task_id,
+        task_id=task_id,
+        status="queued",
+        session_id="ops-test",
+        snapshot_hash="snapshot-test",
+        packet_sha256="abc123",
+        authority_id="auth-123",
+    )
+
+    locks_released = []
+
+    class MockLock:
+        def __init__(self, worktree):
+            self.worktree = worktree
+
+    def mock_claim_writer_locks(authority_id, worktrees):
+        return [MockLock(w) for w in worktrees]
+
+    def mock_release_writer_locks(authority_id, worktrees):
+        locks_released.append((authority_id, worktrees))
+
+    import operator_worktree_lock as op_wlock
+    monkeypatch.setattr(op_wlock, "claim_writer_locks", mock_claim_writer_locks)
+    monkeypatch.setattr(op_wlock, "release_writer_locks", mock_release_writer_locks)
+    monkeypatch.setattr(ag, "_assert_origin_authority", lambda _state: _Policy())
+    monkeypatch.setattr(
+        ag,
+        "_run_agy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ag.subprocess.TimeoutExpired("agy", 600)),
+    )
+
+    returncode = ag._worker(task_id)
+
+    assert returncode == 124
+    assert len(locks_released) == 1
+    assert locks_released[0] == ("auth-123", ["/worktree/path"])
+
+
+def test_worker_releases_writer_lock_on_exception(monkeypatch, tmp_path: Path) -> None:
+    """Worker releases writer lock when any exception occurs during apply."""
+    _patch_roots(monkeypatch, tmp_path)
+    task_id = "agd_00000000000000a4"
+    job_dir = ag._job_dir(task_id)
+    job_dir.mkdir(parents=True)
+
+    packet = {
+        "schema_version": 1,
+        "objective": "Apply changes.",
+        "context": [],
+        "questions": ["What to do?"],
+        "constraints": [],
+        "expected_output": [],
+        "mode": "apply",
+        "capabilities": ["filesystem:edit"],
+        "worktree": "/worktree/path",
+    }
+    (job_dir / "packet.normalized.json").write_text(json.dumps(packet), encoding="utf-8")
+    ag._write_state(
+        task_id,
+        task_id=task_id,
+        status="queued",
+        session_id="ops-test",
+        snapshot_hash="snapshot-test",
+        packet_sha256="abc123",
+        authority_id="auth-123",
+    )
+
+    locks_released = []
+
+    class MockLock:
+        def __init__(self, worktree):
+            self.worktree = worktree
+
+    def mock_claim_writer_locks(authority_id, worktrees):
+        return [MockLock(w) for w in worktrees]
+
+    def mock_release_writer_locks(authority_id, worktrees):
+        locks_released.append((authority_id, worktrees))
+
+    import operator_worktree_lock as op_wlock
+    monkeypatch.setattr(op_wlock, "claim_writer_locks", mock_claim_writer_locks)
+    monkeypatch.setattr(op_wlock, "release_writer_locks", mock_release_writer_locks)
+    monkeypatch.setattr(ag, "_assert_origin_authority", lambda _state: _Policy())
+    monkeypatch.setattr(
+        ag,
+        "_run_agy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("some error")),
+    )
+
+    returncode = ag._worker(task_id)
+
+    assert returncode == 1
+    assert len(locks_released) == 1
+    assert locks_released[0] == ("auth-123", ["/worktree/path"])
+
+
+def test_worker_extracts_model_and_provider_from_agy_output(monkeypatch, tmp_path: Path) -> None:
+    """Worker extracts actual_model and provider from agy JSON output."""
+    _patch_roots(monkeypatch, tmp_path)
+    task_id = "agd_00000000000000a5"
+    job_dir = ag._job_dir(task_id)
+    job_dir.mkdir(parents=True)
+
+    packet = {
+        "schema_version": 1,
+        "objective": "Review.",
+        "context": [],
+        "questions": ["What?"],
+        "constraints": [],
+        "expected_output": [],
+    }
+    (job_dir / "packet.normalized.json").write_text(json.dumps(packet), encoding="utf-8")
+    ag._write_state(
+        task_id,
+        task_id=task_id,
+        status="queued",
+        session_id="ops-test",
+        snapshot_hash="snapshot-test",
+        packet_sha256="abc123",
+    )
+
+    monkeypatch.setattr(ag, "_assert_origin_authority", lambda _state: _Policy())
+    # agy returns model and provider in output
+    monkeypatch.setattr(
+        ag,
+        "_run_agy",
+        lambda *_args, **_kwargs: (
+            0,
+            json.dumps({
+                "conversation_id": "conv-1",
+                "response": "Finding one",
+                "model": "gemini-3.6-flash-low-actual",
+                "provider": "google-vertex"
+            }),
+            "",
+        ),
+    )
+
+    assert ag._worker(task_id) == 0
+
+    result = json.loads((job_dir / "result.json").read_text())
+    assert result["actual_model"] == "gemini-3.6-flash-low-actual"
+    assert result["provider"] == "google-vertex"
+    assert result["model_verified_at"] is not None
+
+
+def test_worker_extracts_actual_model_from_agy_output(monkeypatch, tmp_path: Path) -> None:
+    """Worker extracts actual_model from agy JSON output using actual_model key."""
+    _patch_roots(monkeypatch, tmp_path)
+    task_id = "agd_00000000000000a6"
+    job_dir = ag._job_dir(task_id)
+    job_dir.mkdir(parents=True)
+
+    packet = {
+        "schema_version": 1,
+        "objective": "Review.",
+        "context": [],
+        "questions": ["What?"],
+        "constraints": [],
+        "expected_output": [],
+    }
+    (job_dir / "packet.normalized.json").write_text(json.dumps(packet), encoding="utf-8")
+    ag._write_state(
+        task_id,
+        task_id=task_id,
+        status="queued",
+        session_id="ops-test",
+        snapshot_hash="snapshot-test",
+        packet_sha256="abc123",
+    )
+
+    monkeypatch.setattr(ag, "_assert_origin_authority", lambda _state: _Policy())
+    # agy returns actual_model key
+    monkeypatch.setattr(
+        ag,
+        "_run_agy",
+        lambda *_args, **_kwargs: (
+            0,
+            json.dumps({
+                "conversation_id": "conv-2",
+                "response": "Finding two",
+                "actual_model": "gemini-3.6-flash-high",
+                "provider": "anthropic"
+            }),
+            "",
+        ),
+    )
+
+    assert ag._worker(task_id) == 0
+
+    result = json.loads((job_dir / "result.json").read_text())
+    assert result["actual_model"] == "gemini-3.6-flash-high"
+    assert result["provider"] == "anthropic"
+    assert result["model_verified_at"] is not None
+
+
+def test_dispatch_apply_mode_requires_filesystem_edit_verb(monkeypatch, tmp_path: Path) -> None:
+    """Dispatch in apply mode requires filesystem:edit verb."""
+    _patch_roots(monkeypatch, tmp_path)
+    packet = _packet(
+        tmp_path / "apply_packet.json",
+        mode="apply",
+        worktree="/worktree/path",
+        capabilities=["filesystem:edit"],
+    )
+
+    policy = _Policy()
+    monkeypatch.setattr(ag, "_require_authority", lambda **_kwargs: policy)
+    monkeypatch.setattr(
+        ag,
+        "_preflight",
+        lambda: {
+            "binary_exists": True,
+            "binary_executable": True,
+            "binary": str(ag.AGY_BINARY),
+            "model": ag.MODEL,
+            "mode": ag.MODE,
+        },
+    )
+    monkeypatch.setattr(ag.op, "audit_record", lambda **_kwargs: {})
+    monkeypatch.setattr(ag, "_active_task", lambda: None)
+    monkeypatch.setattr(ag, "_worker_env", lambda: {"HOME": "/home/jfroh"})
+    monkeypatch.setattr(
+        ag.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("process started")),
+    )
+
+    result = json.loads(ag.hermes_antigravity_dispatch(str(packet), dry_run=True))
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["mode"] == "apply"
+    # Verify filesystem:edit verb was required and the worktree write path enforced
+    assert ("filesystem", "edit") in policy.verbs
+    assert policy.write_paths == [Path("/worktree/path")]
+
+
+def test_dispatch_apply_mode_requires_tests_run_verb_when_capability_present(monkeypatch, tmp_path: Path) -> None:
+    """Dispatch in apply mode with tests:run capability requires tests:run verb."""
+    _patch_roots(monkeypatch, tmp_path)
+    packet = _packet(
+        tmp_path / "apply_tests.json",
+        mode="apply",
+        worktree="/worktree/path",
+        capabilities=["filesystem:edit", "tests:run"],
+    )
+
+    policy = _Policy()
+    monkeypatch.setattr(ag, "_require_authority", lambda **_kwargs: policy)
+    monkeypatch.setattr(
+        ag,
+        "_preflight",
+        lambda: {
+            "binary_exists": True,
+            "binary_executable": True,
+            "binary": str(ag.AGY_BINARY),
+            "model": ag.MODEL,
+            "mode": ag.MODE,
+        },
+    )
+    monkeypatch.setattr(ag.op, "audit_record", lambda **_kwargs: {})
+    monkeypatch.setattr(ag, "_active_task", lambda: None)
+    monkeypatch.setattr(ag, "_worker_env", lambda: {"HOME": "/home/jfroh"})
+    monkeypatch.setattr(
+        ag.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("process started")),
+    )
+
+    result = json.loads(ag.hermes_antigravity_dispatch(str(packet), dry_run=True))
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["mode"] == "apply"
+    # Verify filesystem:edit and tests:run verbs were both required
+    assert ("filesystem", "edit") in policy.verbs
+    assert ("tests", "run") in policy.verbs
+    assert policy.write_paths == [Path("/worktree/path")]
