@@ -57,6 +57,14 @@ except ModuleNotFoundError as exc:
     op_lease = None
     OPERATOR_LEASE_IMPORT_ERROR = str(exc)
 
+# Phase 3 R1 Pilot - feature-gated import
+try:
+    from tools.mission_control.shadow_resolver.pilot_mcp_tool import hermes_operator_phase3_r1_pilot_request
+    PILOT_MCP_TOOL_AVAILABLE = True
+except ModuleNotFoundError:
+    PILOT_MCP_TOOL_AVAILABLE = False
+    hermes_operator_phase3_r1_pilot_request = None
+
 
 LOCAL_DEV_PROFILE = "local-dev"
 REMOTE_PROFILE = "remote"
@@ -2034,6 +2042,10 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_mission_control_lease_release,
         hermes_mission_control_lease_status,
     ]
+    if PILOT_MCP_TOOL_AVAILABLE:
+        tool_list.append(hermes_operator_phase3_r1_pilot_request)
+
+    return tool_list
 
 
 def register_tools(

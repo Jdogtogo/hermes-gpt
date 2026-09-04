@@ -127,13 +127,14 @@ def test_validate_manifest_reports_schema_drift_when_names_match():
     assert result["issues"] == ["schema_drift"]
 
 
-def test_canonical_chatgpt_operator_name_manifest_is_52_tools():
-    # 52 as of manifest 1.8.0: adds the fixed FIRST_SAFE model execute bridge,
-    # accepting only an opaque prepared intent id and reusing the trusted worker.
-    assert manifest.MANIFEST_VERSION == "1.8.0"
-    assert manifest.EXPECTED_TOOL_COUNT == 52
-    assert len(manifest.CANONICAL_TOOL_NAMES) == 52
-    assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 52
+def test_canonical_chatgpt_operator_name_manifest_is_52_tools() -> None:
+    # 53 as of manifest 1.9.0: adds the Phase 3 R1 pilot capability-composed grant endpoint.
+    # The public surface gains hermes_operator_phase3_r1_pilot_request.
+    # 52 -> 53 tools.
+    assert manifest.MANIFEST_VERSION == "1.9.0"
+    assert manifest.EXPECTED_TOOL_COUNT == 53
+    assert len(manifest.CANONICAL_TOOL_NAMES) == 53
+    assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 53
     assert "hermes_controller_publish" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_routing_release_v019" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_first_safe_model_prepare" in manifest.CANONICAL_TOOL_NAMES
@@ -143,6 +144,7 @@ def test_canonical_chatgpt_operator_name_manifest_is_52_tools():
     assert "hermes_first_safe_provision_execute" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_first_safe_provision_verify" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_exec_first_safe_model" not in manifest.CANONICAL_TOOL_NAMES
+    assert "hermes_operator_phase3_r1_pilot_request" in manifest.CANONICAL_TOOL_NAMES
     for required in {
         "hermes_antigravity_dispatch",
         "hermes_antigravity_dispatch_cancel",

@@ -7,13 +7,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-# 1.8.0 -- FIRST_SAFE model acceptance gains a fixed governed execute bridge.
-# The public surface is now prepare -> execute -> verify, matching provisioning.
-# Execute accepts only an opaque prepared intent id and lazily invokes the
-# existing trusted first_safe_worker; it exposes no host, user, path, command,
-# script, model, credential or transport parameters. 51 -> 52 tools.
-MANIFEST_VERSION = "1.8.0"
-EXPECTED_TOOL_COUNT = 52
+# 1.9.0 -- Phase 3 R1 pilot capability-composed grant endpoint added.
+# The public surface gains hermes_operator_phase3_r1_pilot_request.
+# 52 -> 53 tools.
+MANIFEST_VERSION = "1.9.0"
+EXPECTED_TOOL_COUNT = 53
 
 # Canonical public surface for the authenticated ChatGPT operator connector.
 # This is intentionally independent of registration order.
@@ -61,6 +59,7 @@ CANONICAL_TOOL_NAMES = tuple(
             "hermes_operator_snapshot",
             "hermes_operator_status",
             "hermes_ops_brain_query",
+            "hermes_operator_phase3_r1_pilot_request",
             "hermes_search_files",
             "hermes_workspace_exec",
             "hermes_workspace_git_commit",
