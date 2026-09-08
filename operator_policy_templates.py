@@ -374,7 +374,7 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "apply_mode": "direct",
             "allowed_profiles": ["default"],
             "readable_roots": [
-                "/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt/.release-preservation",
+                "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration",
             ],
             "writable_roots": [],
             "egress_hosts": ["github.com"],
@@ -401,7 +401,7 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "has_deployment": True,
         },
         "max_duration_seconds": 60 * 60,
-        "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
+        "allowed_branches": ["mission-control/preservation-integration"],
         "baseline_required": True,
     },
     "hermes-opsbrain-release": {

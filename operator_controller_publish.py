@@ -15,8 +15,9 @@ from urllib.parse import urlparse
 
 import operator_policy as op
 
-WORKTREE = Path("/home/jfroh/.hermes/worktrees/hermes-gpt-operator-session-chatgpt/.release-preservation")
-BRANCH = "codex/operator-session-chatgpt-20260713"
+WORKTREE = Path("/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration")
+BRANCH = "mission-control/preservation-integration"
+REMOTE_BRANCH = "codex/operator-session-chatgpt-20260713"
 REMOTE = "origin"
 ALLOWED_REMOTE_HOSTS = frozenset({"github.com"})
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -109,7 +110,7 @@ def hermes_controller_publish(expected_commit: str, dry_run: bool = True, runner
         if host not in ALLOWED_REMOTE_HOSTS:
             raise PermissionError(f"Configured origin host {host!r} is not approved for Controller publication.")
 
-        refspec = f"HEAD:refs/heads/{BRANCH}"
+        refspec = f"HEAD:refs/heads/{REMOTE_BRANCH}"
         preflight = _must_git(
             ["push", "--dry-run", "--porcelain", REMOTE, refspec],
             label="remote fast-forward preflight",
@@ -119,6 +120,7 @@ def hermes_controller_publish(expected_commit: str, dry_run: bool = True, runner
         plan = {
             "worktree": str(WORKTREE),
             "branch": BRANCH,
+            "remote_branch": REMOTE_BRANCH,
             "commit": expected,
             "remote": REMOTE,
             "remote_host": host,
@@ -138,7 +140,7 @@ def hermes_controller_publish(expected_commit: str, dry_run: bool = True, runner
                 changed=False,
                 summary=f"validated Controller publication for {expected}",
                 path=str(WORKTREE),
-                extra={"branch": BRANCH, "commit": expected, "remote": REMOTE, "remote_host": host},
+                extra={"branch": BRANCH, "remote_branch": REMOTE_BRANCH, "commit": expected, "remote": REMOTE, "remote_host": host},
             )
             return json.dumps({"success": True, "dry_run": True, "plan": plan, "preflight": op.redact_output(preflight)}, indent=2)
 
@@ -151,13 +153,13 @@ def hermes_controller_publish(expected_commit: str, dry_run: bool = True, runner
         )
         changed = True
         remote_head_raw = _must_git(
-            ["ls-remote", "--heads", REMOTE, f"refs/heads/{BRANCH}"],
+            ["ls-remote", "--heads", REMOTE, f"refs/heads/{REMOTE_BRANCH}"],
             label="post-push remote verification",
             timeout=120,
             runner=runner,
         )
         fields = remote_head_raw.split()
-        if len(fields) != 2 or fields[0] != expected or fields[1] != f"refs/heads/{BRANCH}":
+        if len(fields) != 2 or fields[0] != expected or fields[1] != f"refs/heads/{REMOTE_BRANCH}":
             raise RuntimeError("Remote verification did not resolve the fixed branch to the expected commit.")
 
         result = {
@@ -165,6 +167,7 @@ def hermes_controller_publish(expected_commit: str, dry_run: bool = True, runner
             "dry_run": False,
             "changed": True,
             "branch": BRANCH,
+            "remote_branch": REMOTE_BRANCH,
             "commit": expected,
             "remote": REMOTE,
             "remote_host": host,
@@ -182,7 +185,7 @@ def hermes_controller_publish(expected_commit: str, dry_run: bool = True, runner
             changed=True,
             summary=f"published Controller commit {expected}",
             path=str(WORKTREE),
-            extra={"branch": BRANCH, "commit": expected, "remote": REMOTE, "remote_host": host, "force_push": False},
+            extra={"branch": BRANCH, "remote_branch": REMOTE_BRANCH, "commit": expected, "remote": REMOTE, "remote_host": host, "force_push": False},
         )
         return json.dumps(result, indent=2)
     except Exception as exc:
@@ -195,7 +198,7 @@ def hermes_controller_publish(expected_commit: str, dry_run: bool = True, runner
             changed=changed,
             error=str(exc),
             path=str(WORKTREE),
-            extra={"branch": BRANCH, "remote": REMOTE, "force_push": False},
+            extra={"branch": BRANCH, "remote_branch": REMOTE_BRANCH, "remote": REMOTE, "force_push": False},
         )
         return json.dumps(
             op.error_from_exception(

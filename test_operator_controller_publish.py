@@ -54,7 +54,7 @@ def _runner_factory(*, dirty: bool = False, host: str = "github.com", preflight_
         if args[:2] == ["push", "--porcelain"]:
             return 0, "To github.com:owner/repo.git\n \tHEAD:refs/heads/test\tdone\n", ""
         if args[:2] == ["ls-remote", "--heads"]:
-            return 0, f"{COMMIT}\trefs/heads/{publish.BRANCH}\n", ""
+            return 0, f"{COMMIT}\trefs/heads/{publish.REMOTE_BRANCH}\n", ""
         raise AssertionError(f"unexpected git call: {argv!r}")
 
     return runner, calls
@@ -84,6 +84,8 @@ def test_dry_run_performs_remote_non_force_preflight_only(monkeypatch):
     assert result["success"] is True
     assert result["dry_run"] is True
     assert result["plan"]["commit"] == COMMIT
+    assert result["plan"]["branch"] == publish.BRANCH
+    assert result["plan"]["remote_branch"] == publish.REMOTE_BRANCH
     assert result["plan"]["force_push"] is False
     assert any(call[1:4] == ["push", "--dry-run", "--porcelain"] for call in calls)
     assert not any(call[1:3] == ["push", "--porcelain"] for call in calls)
@@ -98,9 +100,11 @@ def test_apply_pushes_exact_head_and_verifies_remote(monkeypatch):
     assert result["success"] is True
     assert result["changed"] is True
     assert result["commit"] == COMMIT
+    assert result["branch"] == publish.BRANCH
+    assert result["remote_branch"] == publish.REMOTE_BRANCH
     assert result["remote_verified"] is True
     actual_pushes = [call for call in calls if call[1:3] == ["push", "--porcelain"]]
-    assert actual_pushes == [["git", "push", "--porcelain", "origin", f"HEAD:refs/heads/{publish.BRANCH}"]]
+    assert actual_pushes == [["git", "push", "--porcelain", "origin", f"HEAD:refs/heads/{publish.REMOTE_BRANCH}"]]
     assert all("--force" not in call and "-f" not in call for call in calls)
 
 
