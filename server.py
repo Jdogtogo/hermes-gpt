@@ -59,7 +59,7 @@ except ModuleNotFoundError as exc:
 
 # Phase 3 R1 Pilot - feature-gated import
 try:
-    from tools.mission_control.shadow_resolver.pilot_mcp_tool import hermes_operator_phase3_r1_pilot_request
+    from operator_shadow_resolver.pilot_mcp_tool import hermes_operator_phase3_r1_pilot_request
     PILOT_MCP_TOOL_AVAILABLE = True
 except ModuleNotFoundError:
     PILOT_MCP_TOOL_AVAILABLE = False
