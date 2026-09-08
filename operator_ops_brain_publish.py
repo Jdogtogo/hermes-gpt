@@ -192,6 +192,39 @@ def _safe_remove_run_root(run_root: Path | None) -> tuple[bool, str]:
         return False, op.redact_output(str(exc))
 
 
+def _safe_gate_path(scratch: Path, relative: Path) -> Path:
+    """Return one trusted gate path only when it cannot escape the scratch clone.
+
+    The target commit is already required to keep ``tools/`` and ``scripts/``
+    byte-identical to the published baseline. This additional path check closes
+    the residual case where that trusted baseline itself contains a symlink or
+    another path shape that would execute outside the isolated clone.
+    """
+    candidate = scratch / relative
+    if candidate.is_symlink():
+        raise PublishError(
+            f"Trusted publication gate {relative.as_posix()} is a symlink; refusing execution."
+        )
+    try:
+        scratch_root = scratch.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise PublishError(
+            f"Trusted publication gate {relative.as_posix()} is missing."
+        ) from exc
+    try:
+        resolved.relative_to(scratch_root)
+    except ValueError as exc:
+        raise PublishError(
+            f"Trusted publication gate {relative.as_posix()} escapes the scratch clone."
+        ) from exc
+    if not resolved.is_file():
+        raise PublishError(
+            f"Trusted publication gate {relative.as_posix()} is not a regular file."
+        )
+    return resolved
+
+
 def _git_read(args: list[str], *, label: str, runner: Runner | None = None, timeout: int = 120) -> str:
     return _must_run(
         ["git", "-C", str(CANONICAL_REPO), *args],
@@ -280,6 +313,7 @@ def hermes_ops_brain_publish(
     remote_host = ""
     target = ""
     remote_before = ""
+    ancestry_verified = False
     validation_passed = False
     guard_passed = False
     push_preflight_passed = False
@@ -294,13 +328,16 @@ def hermes_ops_brain_publish(
         policy.require_read_path(CANONICAL_REPO)
         policy.require_write_path(PUBLISH_ROOT)
         policy.require_egress_host(REMOTE_HOST)
-        policy.require_verb("opsbrain", "publish")
         policy.require_branch(BRANCH)
-        # Even remote dry-run creates and removes a bounded local scratch clone.
+
+        if type(dry_run) is not bool:
+            raise ValueError("dry_run must be a boolean.")
+        # Preflight and release are deliberately separate capabilities. Even a
+        # remote dry-run creates and removes a bounded local scratch clone, so
+        # both paths still require an approved direct-mutation session.
+        policy.require_verb("opsbrain", "preflight" if dry_run else "release")
         policy.require_mutation(False)
 
-        if not isinstance(dry_run, bool):
-            raise ValueError("dry_run must be a boolean.")
         target = _validate_sha(expected_commit, "expected_commit")
         remote_before = _validate_sha(expected_remote_sha, "expected_remote_sha")
         if not CANONICAL_REPO.is_dir():
@@ -329,6 +366,7 @@ def hermes_ops_brain_publish(
                 "Target commit is not a fast-forward descendant of the expected remote SHA"
                 + (f": {detail}" if detail else ".")
             )
+        ancestry_verified = True
 
         _require_trusted_gate_sources_unchanged(remote_before, target, runner=runner)
 
@@ -420,8 +458,9 @@ def hermes_ops_brain_publish(
         if scratch_status:
             raise PublishError("Scratch checkout is not clean before validation.")
 
+        validator_path = _safe_gate_path(scratch, VALIDATOR_REL)
         _must_run(
-            [sys.executable, str(VALIDATOR_REL)],
+            [sys.executable, str(validator_path)],
             label="OpsBrain validator",
             workdir=scratch,
             timeout=180,
@@ -429,9 +468,10 @@ def hermes_ops_brain_publish(
         )
         validation_passed = True
 
+        guard_path = _safe_gate_path(scratch, GUARD_REL)
         guard_input = f"refs/heads/{BRANCH} {target} {REMOTE_REF} {remote_before}\n"
         _must_run(
-            ["bash", str(GUARD_REL), REMOTE, remote_url],
+            ["bash", str(guard_path), REMOTE, remote_url],
             label="OpsBrain pre-push guard",
             workdir=scratch,
             timeout=180,
@@ -527,11 +567,17 @@ def hermes_ops_brain_publish(
                 "changed": changed,
                 "expected_commit": target or str(expected_commit or ""),
                 "expected_remote_sha": remote_before or str(expected_remote_sha or ""),
+                "history_monotonic_ancestor_verified": ancestry_verified,
                 "validation_passed": validation_passed,
                 "guard_passed": guard_passed,
                 "push_preflight_passed": push_preflight_passed,
                 "push_executed": push_executed,
                 "remote_verified": remote_verified,
+                "publish_strategy": "atomic_cas",
+                "force_with_lease": True,
+                "unconstrained_force_push": False,
+                "lease_target_ref": REMOTE_REF,
+                "lease_expected_sha": remote_before or str(expected_remote_sha or ""),
                 "cleanup_ok": cleanup_ok,
             }
         )
@@ -571,12 +617,17 @@ def hermes_ops_brain_publish(
         "remote_repository": REMOTE_REPOSITORY,
         "expected_commit": target,
         "expected_remote_sha": remote_before,
+        "history_monotonic_ancestor_verified": ancestry_verified,
         "validation_passed": validation_passed,
         "guard_passed": guard_passed,
         "push_preflight_passed": push_preflight_passed,
         "push_executed": push_executed,
         "remote_verified": remote_verified if not dry_run else False,
-        "force_push": False,
+        "publish_strategy": "atomic_cas",
+        "force_with_lease": True,
+        "unconstrained_force_push": False,
+        "lease_target_ref": REMOTE_REF,
+        "lease_expected_sha": remote_before,
         "canonical_checkout_mutated": False,
         "cleanup_ok": cleanup_ok,
     }
@@ -602,12 +653,17 @@ def hermes_ops_brain_publish(
             "remote_host": remote_host,
             "expected_commit": target,
             "expected_remote_sha": remote_before,
+            "history_monotonic_ancestor_verified": ancestry_verified,
             "validation_passed": validation_passed,
             "guard_passed": guard_passed,
             "push_executed": push_executed,
             "remote_verified": remote_verified,
             "cleanup_ok": cleanup_ok,
-            "force_push": False,
+            "publish_strategy": "atomic_cas",
+            "force_with_lease": True,
+            "unconstrained_force_push": False,
+            "lease_target_ref": REMOTE_REF,
+            "lease_expected_sha": remote_before,
         },
     )
     return json.dumps(result, indent=2)

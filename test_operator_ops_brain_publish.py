@@ -16,8 +16,10 @@ class FakePolicy:
     level = "workspace"
     apply_mode = "direct"
 
-    def __init__(self):
+    def __init__(self, *, allow_preflight: bool = True, allow_release: bool = True):
         self.required = []
+        self.allow_preflight = allow_preflight
+        self.allow_release = allow_release
 
     def require_level(self, level):
         assert level == "workspace"
@@ -36,7 +38,12 @@ class FakePolicy:
         self.required.append(("egress", host))
 
     def require_verb(self, group, verb):
-        assert (group, verb) == ("opsbrain", "publish")
+        assert group == "opsbrain"
+        assert verb in {"preflight", "release"}
+        if verb == "preflight" and not self.allow_preflight:
+            raise PermissionError("preflight not granted")
+        if verb == "release" and not self.allow_release:
+            raise PermissionError("release not granted")
         self.required.append((group, verb))
 
     def require_branch(self, branch):
@@ -48,14 +55,18 @@ class FakePolicy:
         self.required.append(("mutation", "direct"))
 
 
-def _install(monkeypatch, tmp_path):
+def _install(monkeypatch, tmp_path, *, policy=None):
     canonical = tmp_path / "ops-brain"
-    canonical.mkdir(exist_ok=True)
+    canonical.mkdir(parents=True, exist_ok=True)
     scratch_root = tmp_path / "publish-scratch"
+    selected_policy = policy or FakePolicy()
     monkeypatch.setattr(publish, "CANONICAL_REPO", canonical)
     monkeypatch.setattr(publish, "PUBLISH_ROOT", scratch_root)
-    monkeypatch.setattr(publish.op, "OperatorPolicy", FakePolicy)
+    monkeypatch.setattr(publish.op, "OperatorPolicy", lambda: selected_policy)
     monkeypatch.setattr(publish.op, "audit_record", lambda **kwargs: None)
+    # Existing fake-runner tests model Git/subprocess behaviour rather than a
+    # physical clone. Dedicated tests below exercise _safe_gate_path itself.
+    monkeypatch.setattr(publish, "_safe_gate_path", lambda scratch, relative: relative)
     return canonical, scratch_root
 
 
@@ -175,7 +186,12 @@ def test_dry_run_is_exact_non_force_and_preserves_canonical_checkout(monkeypatch
     assert result["push_preflight_passed"] is True
     assert result["push_executed"] is False
     assert result["canonical_checkout_mutated"] is False
-    assert result["force_push"] is False
+    assert result["publish_strategy"] == "atomic_cas"
+    assert result["force_with_lease"] is True
+    assert result["unconstrained_force_push"] is False
+    assert result["lease_target_ref"] == publish.REMOTE_REF
+    assert result["lease_expected_sha"] == REMOTE_BEFORE
+    assert result["history_monotonic_ancestor_verified"] is True
     assert result["cleanup_ok"] is True
     assert not scratch_root.exists() or list(scratch_root.iterdir()) == []
     assert _actual_push_calls(calls) == []
@@ -376,3 +392,128 @@ def test_cleanup_failure_is_visible_after_verified_push(monkeypatch, tmp_path):
     assert result["remote_verified"] is True
     assert result["cleanup_ok"] is False
     assert "warning" in result
+
+
+def test_dry_run_and_apply_use_separate_authority_verbs(monkeypatch, tmp_path):
+    preflight_policy = FakePolicy()
+    canonical, _ = _install(monkeypatch, tmp_path / "preflight", policy=preflight_policy)
+    runner, _calls = _runner_factory(canonical)
+    dry_result = json.loads(
+        publish.hermes_ops_brain_publish(TARGET, REMOTE_BEFORE, True, runner=runner)
+    )
+    assert dry_result["success"] is True
+    assert ("opsbrain", "preflight") in preflight_policy.required
+    assert ("opsbrain", "release") not in preflight_policy.required
+
+    monkeypatch.undo()
+    release_root = tmp_path / "release"
+    release_root.mkdir()
+    release_policy = FakePolicy()
+    canonical, _ = _install(monkeypatch, release_root, policy=release_policy)
+    runner, _calls = _runner_factory(canonical)
+    apply_result = json.loads(
+        publish.hermes_ops_brain_publish(TARGET, REMOTE_BEFORE, False, runner=runner)
+    )
+    assert apply_result["success"] is True
+    assert ("opsbrain", "release") in release_policy.required
+    assert ("opsbrain", "preflight") not in release_policy.required
+
+
+def test_missing_preflight_or_release_capability_blocks_before_commands(monkeypatch, tmp_path):
+    for index, (dry_run, policy) in enumerate(
+        (
+            (True, FakePolicy(allow_preflight=False)),
+            (False, FakePolicy(allow_release=False)),
+        )
+    ):
+        case = tmp_path / f"authority-{index}"
+        case.mkdir()
+        _canonical, _ = _install(monkeypatch, case, policy=policy)
+        calls = []
+
+        def runner(argv, *, timeout, workdir, input_text):
+            calls.append(argv)
+            raise AssertionError("runner must not be reached without authority")
+
+        result = json.loads(
+            publish.hermes_ops_brain_publish(
+                TARGET, REMOTE_BEFORE, dry_run, runner=runner
+            )
+        )
+        assert result["success"] is False
+        assert calls == []
+        monkeypatch.undo()
+
+
+def test_dry_run_requires_exact_boolean(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path)
+    calls = []
+
+    def runner(argv, *, timeout, workdir, input_text):
+        calls.append(argv)
+        raise AssertionError("runner must not be reached for invalid dry_run")
+
+    result = json.loads(
+        publish.hermes_ops_brain_publish(
+            TARGET, REMOTE_BEFORE, "true", runner=runner  # type: ignore[arg-type]
+        )
+    )
+    assert result["success"] is False
+    assert calls == []
+
+
+def test_safe_gate_path_accepts_regular_file_inside_scratch(tmp_path):
+    scratch = tmp_path / "scratch"
+    gate = scratch / "tools" / "validate_ops_brain.py"
+    gate.parent.mkdir(parents=True)
+    gate.write_text("print('ok')\n", encoding="utf-8")
+    assert publish._safe_gate_path(scratch, Path("tools/validate_ops_brain.py")) == gate.resolve()
+
+
+def test_safe_gate_path_rejects_file_and_parent_symlink_escapes(tmp_path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "gate.py"
+    outside_file.write_text("print('outside')\n", encoding="utf-8")
+
+    direct = scratch / "gate.py"
+    direct.symlink_to(outside_file)
+    try:
+        publish._safe_gate_path(scratch, Path("gate.py"))
+    except publish.PublishError:
+        pass
+    else:
+        raise AssertionError("direct symlink gate must fail closed")
+
+    parent_link = scratch / "tools"
+    parent_link.symlink_to(outside, target_is_directory=True)
+    try:
+        publish._safe_gate_path(scratch, Path("tools/gate.py"))
+    except publish.PublishError:
+        pass
+    else:
+        raise AssertionError("parent symlink escape must fail closed")
+
+
+def test_atomic_cas_never_uses_unconstrained_force_forms(monkeypatch, tmp_path):
+    canonical, _ = _install(monkeypatch, tmp_path)
+    runner, calls = _runner_factory(canonical)
+    result = json.loads(
+        publish.hermes_ops_brain_publish(TARGET, REMOTE_BEFORE, False, runner=runner)
+    )
+    assert result["success"] is True
+    assert result["publish_strategy"] == "atomic_cas"
+    assert result["force_with_lease"] is True
+    assert result["unconstrained_force_push"] is False
+    exact_lease = f"--force-with-lease={publish.REMOTE_REF}:{REMOTE_BEFORE}"
+    for call in calls:
+        argv = call["argv"]
+        if "push" not in argv:
+            continue
+        assert exact_lease in argv
+        assert "--force" not in argv
+        assert "-f" not in argv
+        assert "--force-with-lease" not in argv
+        assert not any(arg.startswith("+") for arg in argv)
