@@ -1988,7 +1988,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
     template and its immutable services:restart grant. See
     docs/hermes-operator-approval-system.md.
     """
-    return [
+    tool_list = [
         hermes_ops_brain_query,
         hermes_operator_policy,
         hermes_operator_status,

@@ -127,11 +127,9 @@ def test_validate_manifest_reports_schema_drift_when_names_match():
     assert result["issues"] == ["schema_drift"]
 
 
-def test_canonical_chatgpt_operator_name_manifest_is_52_tools() -> None:
-    # 53 as of manifest 1.9.0: adds the Phase 3 R1 pilot capability-composed grant endpoint.
-    # The public surface gains hermes_operator_phase3_r1_pilot_request.
-    # 52 -> 53 tools.
-    assert manifest.MANIFEST_VERSION == "1.9.0"
+def test_canonical_chatgpt_operator_name_manifest_is_53_tools() -> None:
+    # 53 as of manifest 1.9.1: Phase 3 R1 pilot composition and fingerprint are live.
+    assert manifest.MANIFEST_VERSION == "1.9.1"
     assert manifest.EXPECTED_TOOL_COUNT == 53
     assert len(manifest.CANONICAL_TOOL_NAMES) == 53
     assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 53
