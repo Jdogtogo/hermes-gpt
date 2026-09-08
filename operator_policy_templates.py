@@ -404,6 +404,67 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
         "baseline_required": True,
     },
+    "hermes-opsbrain-release": {
+        "active": True,
+        "description": (
+            "One-purpose authority for canonical OpsBrain publication. The canonical checkout is read-only; "
+            "all validation occurs in a bounded disposable scratch clone. The remote is fixed to github.com, "
+            "the repository and master branch are fixed in code, and publication requires exact local/remote "
+            "SHAs plus an atomic expected-SHA compare-and-swap. No general Git push, arbitrary repository, "
+            "arbitrary branch, service, credential, provider-routing, or unrelated filesystem authority is granted."
+        ),
+        "risk_tier": 3,
+        "standing_authority_eligible": False,
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/ops-brain",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/ops-brain-publish-scratch",
+            ],
+            "egress_hosts": ["github.com"],
+            "service_units": [],
+            "hard_denied_paths": [
+                "/home/jfroh/.hermes/ops-brain/.env",
+                "/home/jfroh/.hermes/ops-brain/.env.*",
+                "/home/jfroh/.hermes/ops-brain/**/credentials",
+                "/home/jfroh/.hermes/ops-brain/**/API keys",
+                "/home/jfroh/.hermes/ops-brain/**/OAuth tokens",
+                "/home/jfroh/.hermes/ops-brain/**/authentication databases",
+                "/home/jfroh/.hermes/ops-brain/**/secret stores",
+                "/home/jfroh/.hermes/ops-brain/**/private keys",
+                "/home/jfroh/.hermes/ops-brain/**/SSH material",
+            ],
+            "verbs": {
+                "opsbrain": ["preflight", "release"],
+            },
+            "containment_strength": "process",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "branch_guard_verified": True,
+            "baseline_guard_verified": True,
+            "single_writer_verified": True,
+            "untracked_delete_protected": True,
+            "version_controlled_rollback": True,
+            "deliverable_verification_required": True,
+            "deliverable_verification_verified": False,
+            "data_sensitivity": "internal",
+            "production_effect": "release",
+            "paid_route_change": "none",
+            "has_secret_access": False,
+            "has_credential_access": False,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": True,
+            "has_deployment": True,
+        },
+        "max_duration_seconds": 60 * 60,
+        "allowed_branches": ["master"],
+        "baseline_required": True,
+    },
     "hermes-exec-first-safe-model": {
         "active": True,
         "description": (

@@ -443,8 +443,8 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     public_manifest = status["public_manifest"]
     assert public_manifest["applicable"] is True
     assert public_manifest["manifest_version"] == server.op_manifest.MANIFEST_VERSION
-    # 53 as of manifest 1.9.1 (adds the Phase 3 R1 pilot and fixes tool-list composition).
-    assert public_manifest["expected_tool_count"] == 53
+    # 54 as of manifest 1.10.0 (adds the governed OpsBrain publisher).
+    assert public_manifest["expected_tool_count"] == 54
     assert public_manifest["registered_tool_count"] == len(live_names)
     assert public_manifest["schema_fingerprint"] == server.op_manifest.EXPECTED_SCHEMA_FINGERPRINT
     assert public_manifest["missing_tools"] == []
