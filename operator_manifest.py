@@ -7,11 +7,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-# 1.10.0 -- governed canonical OpsBrain publisher added to the public Controller surface.
-# The public surface gains hermes_ops_brain_publish while preserving the Phase 3 R1 pilot tool.
-# 54 tools.
-MANIFEST_VERSION = "1.10.0"
-EXPECTED_TOOL_COUNT = 54
+# 1.11.0 -- opaque GitHub release device authentication added to the public Controller surface.
+# The public surface gains hermes_github_release_auth while preserving the 1.10.0 Publisher surface.
+# 55 tools.
+MANIFEST_VERSION = "1.11.0"
+EXPECTED_TOOL_COUNT = 55
 
 # Canonical public surface for the authenticated ChatGPT operator connector.
 # This is intentionally independent of registration order.
@@ -23,6 +23,7 @@ CANONICAL_TOOL_NAMES = tuple(
             "hermes_computer_use_doctor",
             "hermes_claude_desktop_restart",
             "hermes_controller_publish",
+            "hermes_github_release_auth",
             "hermes_antigravity_dispatch",
             "hermes_antigravity_dispatch_cancel",
             "hermes_antigravity_dispatch_status",
@@ -87,7 +88,8 @@ if len(CANONICAL_TOOL_NAMES) != EXPECTED_TOOL_COUNT:
 # (45 tools, hermes_exec_first_safe_model present). Re-pinned for 1.3.0 after the
 # deliberate FIRST_SAFE prepare/verify split described above.
 # 1.10.0 re-pinned after adding the governed OpsBrain publisher (54 tools).
-EXPECTED_SCHEMA_FINGERPRINT = "39ba4bdb90d64159641ff67b2c1ba32f64162e3779d28f9f453f43c1dd14bbc2"
+# 1.11.0 re-pinned after adding the opaque GitHub release device-auth surface (55 tools).
+EXPECTED_SCHEMA_FINGERPRINT = "4df5469665836e129daf96d04d04a0ff2d2a0acc76eb6834c9f2d811a922ee5d"
 
 
 def _canonicalize(value: Any) -> Any:

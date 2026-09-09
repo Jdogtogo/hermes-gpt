@@ -127,13 +127,13 @@ def test_validate_manifest_reports_schema_drift_when_names_match():
     assert result["issues"] == ["schema_drift"]
 
 
-def test_canonical_chatgpt_operator_name_manifest_is_54_tools() -> None:
-    # 53 as of manifest 1.9.1: Phase 3 R1 pilot composition and fingerprint are live.
-    assert manifest.MANIFEST_VERSION == "1.10.0"
-    assert manifest.EXPECTED_TOOL_COUNT == 54
-    assert len(manifest.CANONICAL_TOOL_NAMES) == 54
-    assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 54
+def test_canonical_chatgpt_operator_name_manifest_is_55_tools() -> None:
+    assert manifest.MANIFEST_VERSION == "1.11.0"
+    assert manifest.EXPECTED_TOOL_COUNT == 55
+    assert len(manifest.CANONICAL_TOOL_NAMES) == 55
+    assert len(set(manifest.CANONICAL_TOOL_NAMES)) == 55
     assert "hermes_controller_publish" in manifest.CANONICAL_TOOL_NAMES
+    assert "hermes_github_release_auth" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_ops_brain_publish" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_routing_release_v019" in manifest.CANONICAL_TOOL_NAMES
     assert "hermes_first_safe_model_prepare" in manifest.CANONICAL_TOOL_NAMES

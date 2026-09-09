@@ -359,13 +359,12 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
         "baseline_required": False,
     },
-    "hermes-github-cli-bootstrap": {
+    "hermes-github-cli-install": {
         "active": True,
         "description": (
-            "One-purpose authority to install and authenticate a release-scoped GitHub CLI inside the "
-            "clean Controller integration worktree. Network access is limited to GitHub release/auth hosts; "
-            "credential material must remain inside the bounded worktree and is not exposed through tool output. "
-            "No service, routing, OpsBrain, arbitrary package-manager, or unrelated filesystem authority is granted."
+            "One-purpose authority to install a portable GitHub CLI only inside the clean Controller "
+            "integration worktree. GitHub release egress is fixed and no authentication, credential access, "
+            "system package manager, sudo, service, routing, OpsBrain, or unrelated filesystem authority is granted."
         ),
         "risk_tier": 3,
         "standing_authority_eligible": False,
@@ -379,15 +378,62 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "writable_roots": [
                 "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration",
             ],
-            "egress_hosts": [
-                "github.com",
-                "api.github.com",
-                "release-assets.githubusercontent.com",
-            ],
+            "egress_hosts": ["github.com", "release-assets.githubusercontent.com"],
             "service_units": [],
             "verbs": {
                 "filesystem": ["read", "edit"],
                 "tests": ["run"],
+            },
+            "containment_strength": "process",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "branch_guard_verified": True,
+            "baseline_guard_verified": True,
+            "single_writer_verified": True,
+            "untracked_delete_protected": True,
+            "version_controlled_rollback": True,
+            "deliverable_verification_required": True,
+            "deliverable_verification_verified": False,
+            "data_sensitivity": "internal",
+            "production_effect": "none",
+            "paid_route_change": "none",
+            "has_secret_access": False,
+            "has_credential_access": False,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": True,
+            "has_deployment": False,
+        },
+        "max_duration_seconds": 60 * 60,
+        "allowed_branches": ["mission-control/preservation-integration"],
+        "baseline_required": True,
+    },
+    "hermes-github-release-auth": {
+        "active": True,
+        "description": (
+            "One-purpose authority for the fixed GitHub release OAuth device broker. The caller may start, "
+            "complete, inspect status, or clear only the fixed release-auth state; bearer tokens and device_code "
+            "remain opaque and are never exposed through generic filesystem tools or tool output."
+        ),
+        "risk_tier": 3,
+        "standing_authority_eligible": False,
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration/logs/.release-tools/gh-auth",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration/logs/.release-tools/gh-auth",
+            ],
+            "egress_hosts": ["github.com", "api.github.com"],
+            "service_units": [],
+            "hard_denied_paths": [
+                "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration/logs/.release-tools/gh-auth",
+            ],
+            "verbs": {
+                "github_release_auth": ["start", "complete", "status", "clear"],
             },
             "containment_strength": "process",
             "containment_verified": True,
@@ -402,8 +448,8 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "data_sensitivity": "internal",
             "production_effect": "none",
             "paid_route_change": "none",
-            "has_secret_access": True,
-            "has_credential_access": True,
+            "has_secret_access": False,
+            "has_credential_access": False,
             "has_client_identifiable_data": False,
             "has_financial_data": False,
             "has_external_communication": True,
@@ -433,6 +479,9 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "writable_roots": [],
             "egress_hosts": ["github.com"],
             "service_units": [],
+            "hard_denied_paths": [
+                "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration/logs/.release-tools/gh-auth",
+            ],
             "verbs": {"git": ["push"]},
             "containment_strength": "process",
             "containment_verified": True,

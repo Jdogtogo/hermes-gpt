@@ -351,6 +351,9 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         "hermes_workspace_exec",
         "hermes_workspace_git_commit",
         "hermes_routing_release_v019",
+        "hermes_controller_publish",
+        "hermes_github_release_auth",
+        "hermes_ops_brain_publish",
         "hermes_first_safe_model_execute",
         "hermes_first_safe_provision_prepare",
         "hermes_first_safe_provision_execute",
@@ -414,6 +417,18 @@ def test_chatgpt_operator_tool_surface_is_authenticated_and_non_owner(monkeypatc
         annotations = registered[mutating_name].annotations
         assert annotations is None or annotations.readOnlyHint is not True
 
+    release_auth_tool = registered["hermes_github_release_auth"]
+    release_auth_annotations = release_auth_tool.annotations
+    assert release_auth_annotations is not None
+    assert release_auth_annotations.readOnlyHint is False
+    assert release_auth_annotations.destructiveHint is False
+    assert release_auth_annotations.idempotentHint is True
+    assert release_auth_annotations.openWorldHint is True
+    release_auth_schema = server.op_manifest.native_tool_record(release_auth_tool)["inputSchema"]
+    action_schema = release_auth_schema["properties"]["action"]
+    assert set(action_schema["enum"]) == {"start", "complete", "status", "clear"}
+    assert action_schema["default"] == "status"
+
 
 def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     """hermes_operator_status() must report exactly the live MCP tool surface.
@@ -443,8 +458,8 @@ def test_operator_status_reports_actual_registered_tools(monkeypatch, tmp_path):
     public_manifest = status["public_manifest"]
     assert public_manifest["applicable"] is True
     assert public_manifest["manifest_version"] == server.op_manifest.MANIFEST_VERSION
-    # 54 as of manifest 1.10.0 (adds the governed OpsBrain publisher).
-    assert public_manifest["expected_tool_count"] == 54
+    # 55 as of manifest 1.11.0 (adds opaque GitHub release device authentication).
+    assert public_manifest["expected_tool_count"] == 55
     assert public_manifest["registered_tool_count"] == len(live_names)
     assert public_manifest["schema_fingerprint"] == server.op_manifest.EXPECTED_SCHEMA_FINGERPRINT
     assert public_manifest["missing_tools"] == []

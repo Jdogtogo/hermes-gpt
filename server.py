@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -19,6 +19,7 @@ import operator_config as op_config
 import operator_workspace as op_workspace
 import operator_release as op_release
 import operator_controller_publish as op_controller_publish
+import operator_github_release_auth as op_github_release_auth
 import operator_ops_brain_publish as op_ops_brain_publish
 import operator_diagnostics as op_diagnostics
 import operator_computer_use_diagnostics as op_computer_use
@@ -1908,6 +1909,13 @@ def hermes_controller_publish(expected_commit: str, dry_run: bool = True) -> str
     return op_controller_publish.hermes_controller_publish(expected_commit, dry_run=dry_run)
 
 
+def hermes_github_release_auth(
+    action: Literal["start", "complete", "status", "clear"] = "status",
+) -> str:
+    """Drive one bounded step of the opaque GitHub release device-auth flow."""
+    return op_github_release_auth.hermes_github_release_auth(action)
+
+
 def hermes_ops_brain_publish(expected_commit: str, expected_remote_sha: str, dry_run: bool = True) -> str:
     """Publish one exact canonical OpsBrain commit through the fixed governed publisher."""
     return op_ops_brain_publish.hermes_ops_brain_publish(expected_commit, expected_remote_sha, dry_run=dry_run)
@@ -2022,6 +2030,7 @@ def chatgpt_operator_tool_list() -> list[Any]:
         hermes_workspace_git_commit,
         hermes_routing_release_v019,
         hermes_controller_publish,
+        hermes_github_release_auth,
         hermes_ops_brain_publish,
         hermes_first_safe_model_prepare,
         hermes_first_safe_model_execute,
@@ -2102,6 +2111,13 @@ def register_tools(
     explicit_tool_annotations = {
         "hermes_controller_publish": ToolAnnotations(
             title="Publish the exact clean Controller HEAD to its fixed origin branch",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        "hermes_github_release_auth": ToolAnnotations(
+            title="Manage opaque GitHub release device authentication",
             readOnlyHint=False,
             destructiveHint=False,
             idempotentHint=True,
