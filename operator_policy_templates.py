@@ -359,6 +359,60 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": ["codex/operator-session-chatgpt-20260713"],
         "baseline_required": False,
     },
+    "hermes-github-cli-bootstrap": {
+        "active": True,
+        "description": (
+            "One-purpose authority to install and authenticate a release-scoped GitHub CLI inside the "
+            "clean Controller integration worktree. Network access is limited to GitHub release/auth hosts; "
+            "credential material must remain inside the bounded worktree and is not exposed through tool output. "
+            "No service, routing, OpsBrain, arbitrary package-manager, or unrelated filesystem authority is granted."
+        ),
+        "risk_tier": 3,
+        "standing_authority_eligible": False,
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/worktrees/hermes-canonical-preservation-integration",
+            ],
+            "egress_hosts": [
+                "github.com",
+                "api.github.com",
+                "release-assets.githubusercontent.com",
+            ],
+            "service_units": [],
+            "verbs": {
+                "filesystem": ["read", "edit"],
+                "tests": ["run"],
+            },
+            "containment_strength": "process",
+            "containment_verified": True,
+            "bounded_roots_verified": True,
+            "branch_guard_verified": True,
+            "baseline_guard_verified": True,
+            "single_writer_verified": True,
+            "untracked_delete_protected": True,
+            "version_controlled_rollback": False,
+            "deliverable_verification_required": True,
+            "deliverable_verification_verified": False,
+            "data_sensitivity": "internal",
+            "production_effect": "none",
+            "paid_route_change": "none",
+            "has_secret_access": True,
+            "has_credential_access": True,
+            "has_client_identifiable_data": False,
+            "has_financial_data": False,
+            "has_external_communication": True,
+            "has_deployment": False,
+        },
+        "max_duration_seconds": 60 * 60,
+        "allowed_branches": ["mission-control/preservation-integration"],
+        "baseline_required": True,
+    },
     "hermes-controller-release": {
         "active": True,
         "description": (
