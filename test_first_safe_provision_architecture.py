@@ -340,8 +340,8 @@ def test_unexpected_sibling_profile_git_tampering_fails_provisioning_verificatio
     """Sibling-profile or Git drift must trip fail-closed worker checks."""
     src = worker.REMOTE_PROGRAM
 
-    sibling_before = 'siblings_before={name:digest_tree(ROOT/"profiles"/name) for name in SIBLINGS}'
-    sibling_after = 'siblings_after={name:digest_tree(ROOT/"profiles"/name) for name in SIBLINGS}'
+    sibling_before = 'siblings_before={name:sibling_static_snapshot(name) for name in SIBLINGS}'
+    sibling_after = 'siblings_after={name:sibling_static_snapshot(name) for name in SIBLINGS}'
     sibling_fail = 'if siblings_after!=siblings_before: fail("sibling profile changed during provisioning")'
     git_before = 'git_before=subprocess.run(["git","status","--porcelain=v1"]'
     git_after = 'git_after=subprocess.run(["git","status","--porcelain=v1"]'

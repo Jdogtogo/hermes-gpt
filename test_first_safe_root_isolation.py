@@ -62,6 +62,32 @@ def test_root_snapshot_detects_absence_and_rejects_symlinks(tmp_path, program):
     assert snapshot()[str(path)] is not None
 
 
+def test_provisioning_sibling_snapshot_checks_only_static_metadata(tmp_path, monkeypatch):
+    profile = tmp_path / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model: isolated", encoding="utf-8")
+    (profile / ".env").write_text("SECRET=never-read", encoding="utf-8")
+    (profile / "state.db").write_bytes(b"runtime")
+    tree = ast.parse(provision_worker.REMOTE_PROGRAM)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "sibling_static_snapshot")
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+
+    def reject(message, **_details):
+        raise ValueError(message)
+
+    scope = {"ROOT": tmp_path, "stat": stat, "fail": reject}
+    exec(compile(module, "<sibling-metadata-only>", "exec"), scope)
+    snapshot = scope["sibling_static_snapshot"]
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "read_bytes", lambda *_a, **_k: pytest.fail("sibling secret read"))
+        patcher.setattr(Path, "read_text", lambda *_a, **_k: pytest.fail("sibling secret read"))
+        initial = snapshot("coder")
+    (profile / "state.db").write_bytes(b"normal-runtime-churn")
+    assert snapshot("coder") == initial
+    (profile / ".env").write_text("SECRET=modified-secret", encoding="utf-8")
+    assert snapshot("coder") != initial
+
+
 def test_provisioning_guard_precedes_quarantine_and_checks_after_write():
     program = provision_worker.REMOTE_PROGRAM
     assert program.index("root_before=root_state_snapshot()") < program.index("os.rename(PROFILE_AUTH,destination)")
