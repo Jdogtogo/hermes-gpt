@@ -47,6 +47,7 @@ def fixed_plan() -> dict[str, Any]:
         "base_url": spec.OPENROUTER_BASE_URL,
         "approved_model": spec.APPROVED_MODEL,
         "credential_contract": "target profile-local .env must pre-exist privately with OPENROUTER_API_KEY; worker never reads or returns its value",
+        "auth_quarantine_collision_policy": "preserve existing fixed quarantine; move active profile auth to fixed .quarantine.2 only when vacant; fail closed if secondary exists",
         "live_model_calls": 0,
         "service_changes": False,
         "git_changes": False,

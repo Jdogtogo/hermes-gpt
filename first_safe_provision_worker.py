@@ -62,6 +62,7 @@ CONFIG=PROFILE/"config.yaml"
 PROFILE_ENV=PROFILE/".env"
 PROFILE_AUTH=PROFILE/"auth.json"
 PROFILE_AUTH_QUARANTINE=PROFILE/"auth.json.pre-first-safe.quarantine"
+PROFILE_AUTH_QUARANTINE_SECONDARY=PROFILE/"auth.json.pre-first-safe.quarantine.2"
 PROFILE_SHARED=PROFILE/"shared"
 PROFILE_NOUS=PROFILE_SHARED/"nous_auth.json"
 ROOT_CONFIG=ROOT/"config.yaml"
@@ -102,18 +103,10 @@ def env_has_key(path,key):
 
 who=pwd.getpwuid(os.geteuid())
 if who.pw_name!="jfroh" or who.pw_dir!="/home/jfroh": fail("wrong target runtime identity")
-profile_auth_quarantined=False
-if PROFILE_AUTH.exists():
-    if PROFILE_AUTH.is_symlink() or not PROFILE_AUTH.is_file(): fail("profile auth.json must be a regular file before quarantine",path=str(PROFILE_AUTH))
-    if PROFILE_AUTH_QUARANTINE.exists(): fail("profile auth quarantine already exists",path=str(PROFILE_AUTH_QUARANTINE))
-    try:
-        os.rename(PROFILE_AUTH,PROFILE_AUTH_QUARANTINE)
-        os.chmod(PROFILE_AUTH_QUARANTINE,0o600)
-    except OSError as exc:
-        fail("unable to quarantine profile auth.json",detail=type(exc).__name__)
-    profile_auth_quarantined=True
-for p,label in ((ROOT_CONFIG,"root config.yaml"),(ROOT_ENV,"root .env"),(ROOT_AUTH,"root auth.json"),(ROOT_NOUS,"root Nous auth"),(PROFILE_AUTH,"profile auth.json"),(PROFILE_NOUS,"profile Nous auth")):
-    if p.exists(): fail(label+" must be absent",path=str(p))
+# Validate unrelated state before any credential-file rename. A failed
+# preflight must not partially quarantine a profile.
+for p,label in ((ROOT_CONFIG,"root config.yaml"),(ROOT_ENV,"root .env"),(ROOT_AUTH,"root auth.json"),(ROOT_NOUS,"root Nous auth"),(PROFILE_NOUS,"profile Nous auth")):
+    if p.exists() or p.is_symlink(): fail(label+" must be absent",path=str(p))
 
 rc=subprocess.run(["git","rev-parse","HEAD"],cwd=str(REPO),capture_output=True,text=True,shell=False)
 if rc.returncode!=0 or rc.stdout.strip()!=EXPECTED_COMMIT: fail("target Hermes commit mismatch",observed=rc.stdout.strip()[:64])
@@ -129,9 +122,35 @@ mode=stat.S_IMODE(PROFILE_ENV.stat().st_mode)
 if mode & 0o077: fail("first-safe profile .env permissions too broad",mode=oct(mode))
 if not env_has_key(PROFILE_ENV,"OPENROUTER_API_KEY"): fail("first-safe profile .env lacks OPENROUTER_API_KEY")
 
+# Check the approved configuration before touching any auth file. Never
+# follow an unexpected config symlink or replace a non-regular file.
+if CONFIG.is_symlink() or (CONFIG.exists() and not CONFIG.is_file()): fail("first-safe config must be a regular file",path=str(CONFIG))
+if CONFIG.exists() and CONFIG.read_text(encoding="utf-8")!=CONFIG_TEXT: fail("existing first-safe config differs from approved sparse config")
+
+# Preserve both generations when an earlier quarantine already exists.
+# The secondary destination is fixed and is never reused or overwritten;
+# a third collision fails closed for explicit local reconciliation.
+profile_auth_quarantined=False
+profile_auth_quarantine_path=None
+if PROFILE_AUTH.exists() or PROFILE_AUTH.is_symlink():
+    if PROFILE_AUTH.is_symlink() or not PROFILE_AUTH.is_file(): fail("profile auth.json must be a regular file before quarantine",path=str(PROFILE_AUTH))
+    destination=PROFILE_AUTH_QUARANTINE
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_file(): fail("existing profile auth quarantine must be a regular file",path=str(destination))
+        if stat.S_IMODE(destination.stat().st_mode) & 0o077: fail("existing profile auth quarantine permissions too broad")
+        destination=PROFILE_AUTH_QUARANTINE_SECONDARY
+        if destination.exists() or destination.is_symlink(): fail("secondary profile auth quarantine already exists",path=str(destination))
+    try:
+        os.rename(PROFILE_AUTH,destination)
+        os.chmod(destination,0o600)
+    except OSError as exc:
+        fail("unable to quarantine profile auth.json",detail=type(exc).__name__)
+    profile_auth_quarantined=True
+    profile_auth_quarantine_path=str(destination)
+if PROFILE_AUTH.exists() or PROFILE_AUTH.is_symlink(): fail("profile auth.json must be absent after quarantine",path=str(PROFILE_AUTH))
+
 PROFILE.mkdir(mode=0o700,parents=True,exist_ok=True)
 PROFILE_SHARED.mkdir(mode=0o700,parents=True,exist_ok=True)
-if CONFIG.exists() and CONFIG.read_text(encoding="utf-8")!=CONFIG_TEXT: fail("existing first-safe config differs from approved sparse config")
 CONFIG.write_text(CONFIG_TEXT,encoding="utf-8")
 os.chmod(CONFIG,0o600)
 
@@ -145,7 +164,7 @@ print("HERMES_FIRST_SAFE_PROVISION_JSON="+json.dumps({
   "target_user":"jfroh","target_host":"hermes-exec","profile":"first-safe",
   "config_path":str(CONFIG),"config_mode":oct(stat.S_IMODE(CONFIG.stat().st_mode)),
   "credential_file_present":True,"credential_key_name_present":True,"credential_value_exposed":False,
-  "profile_auth_quarantined":profile_auth_quarantined,"profile_auth_quarantine_path":str(PROFILE_AUTH_QUARANTINE) if profile_auth_quarantined else None,
+  "profile_auth_quarantined":profile_auth_quarantined,"profile_auth_quarantine_path":profile_auth_quarantine_path,
   "root_provider_state_absent":True,"sibling_profiles_unchanged":True,"git_status_unchanged":True,
   "model_api_calls":0,"services_changed":False,"cloudflare_changed":False,"cron_changed":False,"cutover":False,
 },sort_keys=True))

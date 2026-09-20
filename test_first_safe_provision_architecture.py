@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
+import stat
+
+import pytest
 
 import operator_first_safe_provision as provision
 import first_safe_provision_worker as worker
@@ -15,6 +19,7 @@ def test_fixed_plan_is_single_target_and_non_live():
     assert plan["profile"] == "first-safe"
     assert plan["profile_home"] == "/home/jfroh/.hermes/profiles/first-safe"
     assert plan["live_model_calls"] == 0
+    assert "fixed .quarantine.2" in plan["auth_quarantine_collision_policy"]
     assert plan["service_changes"] is False
     assert plan["cloudflare_changes"] is False
     assert plan["cron_changes"] is False
@@ -134,27 +139,102 @@ def test_remote_program_requires_existing_private_profile_credential_and_never_r
     assert 'OPENROUTER_API_KEY=' not in src
 
 
-def test_remote_program_quarantines_only_profile_auth_without_reading_contents():
+def test_remote_program_preserves_both_auth_generations_on_quarantine_collision():
     src = worker.REMOTE_PROGRAM
     fixed_path = 'PROFILE_AUTH_QUARANTINE=PROFILE/"auth.json.pre-first-safe.quarantine"'
-    collision = 'if PROFILE_AUTH_QUARANTINE.exists(): fail("profile auth quarantine already exists"'
-    rename = 'os.rename(PROFILE_AUTH,PROFILE_AUTH_QUARANTINE)'
-    chmod = 'os.chmod(PROFILE_AUTH_QUARANTINE,0o600)'
+    secondary_path = 'PROFILE_AUTH_QUARANTINE_SECONDARY=PROFILE/"auth.json.pre-first-safe.quarantine.2"'
+    collision = 'if destination.exists() or destination.is_symlink(): fail("secondary profile auth quarantine already exists"'
+    rename = 'os.rename(PROFILE_AUTH,destination)'
+    chmod = 'os.chmod(destination,0o600)'
     config_write = 'CONFIG.write_text(CONFIG_TEXT,encoding="utf-8")'
-    assert fixed_path in src
-    assert 'if PROFILE_AUTH.exists():' in src
+    assert fixed_path in src and secondary_path in src
+    assert 'if PROFILE_AUTH.exists() or PROFILE_AUTH.is_symlink():' in src
     assert 'PROFILE_AUTH.is_symlink() or not PROFILE_AUTH.is_file()' in src
-    assert collision in src
-    assert rename in src
-    assert chmod in src
+    assert 'if destination.is_symlink() or not destination.is_file()' in src
+    assert 'destination=PROFILE_AUTH_QUARANTINE_SECONDARY' in src
+    assert collision in src and rename in src and chmod in src
+    assert src.index('if not PROFILE_ENV.is_file()') < src.index('if CONFIG.is_symlink()') < src.index(rename)
     assert src.index(collision) < src.index(rename) < src.index(chmod) < src.index(config_write)
     assert 'profile_auth_quarantined=False' in src
     assert 'profile_auth_quarantined=True' in src
     assert '"profile_auth_quarantined":profile_auth_quarantined' in src
-    assert '"profile_auth_quarantine_path":str(PROFILE_AUTH_QUARANTINE)' in src
+    assert '"profile_auth_quarantine_path":profile_auth_quarantine_path' in src
     assert 'PROFILE_AUTH.read_text' not in src
     assert 'PROFILE_AUTH.read_bytes' not in src
     assert 'PROFILE_AUTH.unlink' not in src
+    assert 'os.unlink(' not in src
+
+
+def _run_synthetic_quarantine(tmp_path):
+    """Exercise only the fixed rename block against disposable, non-secret files."""
+    src = worker.REMOTE_PROGRAM
+    start = src.index('profile_auth_quarantined=False\n')
+    end = src.index('\nPROFILE.mkdir(', start)
+    active = tmp_path / 'auth.json'
+    first = tmp_path / 'auth.json.pre-first-safe.quarantine'
+    second = tmp_path / 'auth.json.pre-first-safe.quarantine.2'
+
+    def fail(message, **_details):
+        raise RuntimeError(message)
+
+    namespace = {
+        'PROFILE_AUTH': active,
+        'PROFILE_AUTH_QUARANTINE': first,
+        'PROFILE_AUTH_QUARANTINE_SECONDARY': second,
+        'os': os,
+        'stat': stat,
+        'fail': fail,
+    }
+    return src[start:end], namespace, active, first, second
+
+
+def test_first_quarantine_path_is_used_when_vacant(tmp_path):
+    snippet, namespace, active, first, second = _run_synthetic_quarantine(tmp_path)
+    active.write_bytes(b'synthetic-current')
+    exec(snippet, namespace)
+    assert not active.exists()
+    assert first.read_bytes() == b'synthetic-current'
+    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+    assert not second.exists()
+    assert namespace['profile_auth_quarantine_path'] == str(first)
+
+
+def test_existing_quarantine_is_preserved_and_active_auth_moves_to_secondary(tmp_path):
+    snippet, namespace, active, first, second = _run_synthetic_quarantine(tmp_path)
+    active.write_bytes(b'synthetic-current')
+    first.write_bytes(b'synthetic-previous')
+    os.chmod(first, 0o600)
+    os.chmod(active, 0o640)
+    exec(snippet, namespace)
+    assert not active.exists()
+    assert first.read_bytes() == b'synthetic-previous'
+    assert second.read_bytes() == b'synthetic-current'
+    assert stat.S_IMODE(second.stat().st_mode) == 0o600
+    assert namespace['profile_auth_quarantined'] is True
+    assert namespace['profile_auth_quarantine_path'] == str(second)
+
+
+def test_second_quarantine_collision_fails_without_changing_either_backup(tmp_path):
+    snippet, namespace, active, first, second = _run_synthetic_quarantine(tmp_path)
+    active.write_bytes(b'synthetic-current')
+    first.write_bytes(b'synthetic-previous')
+    second.write_bytes(b'synthetic-older')
+    os.chmod(first, 0o600)
+    with pytest.raises(RuntimeError, match='secondary profile auth quarantine already exists'):
+        exec(snippet, namespace)
+    assert active.read_bytes() == b'synthetic-current'
+    assert first.read_bytes() == b'synthetic-previous'
+    assert second.read_bytes() == b'synthetic-older'
+
+
+def test_quarantine_symlink_fails_without_touching_active_auth(tmp_path):
+    snippet, namespace, active, first, second = _run_synthetic_quarantine(tmp_path)
+    active.write_bytes(b'synthetic-current')
+    first.symlink_to(tmp_path / 'nonexistent')
+    with pytest.raises(RuntimeError, match='regular file'):
+        exec(snippet, namespace)
+    assert active.read_bytes() == b'synthetic-current'
+    assert not second.exists()
 
 
 def test_remote_program_fails_closed_on_root_state_and_sibling_or_git_change():

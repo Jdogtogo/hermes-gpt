@@ -644,8 +644,10 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
             "One-purpose PRE-LIVE authority for fixed trusted provisioning of the dedicated "
             "first-safe profile on jfroh@hermes-exec. The connector only records/verifies a bounded "
             "intent; the trusted host worker may quarantine only the exact profile-local auth.json by "
-            "non-content rename, then create the approved sparse profile config after the target-local "
-            "private profile .env already exists with the expected key name. No secret value is read or "
+            "non-content rename to the fixed quarantine, or to the fixed .quarantine.2 when the first "
+            "backup already exists; neither backup may be overwritten. It creates the approved sparse "
+            "profile config only after the target-local private profile .env exists with the expected "
+            "key name. No secret value is read or "
             "returned, and no model/API call, arbitrary command, service, Git, OAuth, "
             "Cloudflare, cron, cutover or WSL-retirement capability is granted."
         ),
