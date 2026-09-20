@@ -78,17 +78,19 @@ def fail(msg, **extra):
     print("HERMES_FIRST_SAFE_PROVISION_JSON="+json.dumps({"success":False,"error":str(msg),**extra},sort_keys=True))
     raise SystemExit(2)
 
-def digest_tree(path):
-    p=Path(path)
-    if not p.exists(): return "ABSENT"
-    h=hashlib.sha256()
-    for item in sorted(p.rglob("*"), key=lambda x:str(x.relative_to(p))):
-        rel=str(item.relative_to(p)).encode(); h.update(rel+b"\0")
-        if item.is_file():
-            h.update(b"F"+oct(stat.S_IMODE(item.stat().st_mode)).encode()+b"\0"+item.read_bytes()+b"\0")
-        elif item.is_dir(): h.update(b"D"+oct(stat.S_IMODE(item.stat().st_mode)).encode()+b"\0")
-        elif item.is_symlink(): h.update(b"L"+os.readlink(item).encode()+b"\0")
-    return h.hexdigest()
+def sibling_static_snapshot(name):
+    # Only the two static routing files matter. Never read sibling .env or
+    # auth contents, and ignore normal session/log/cache churn.
+    result={}
+    for rel in ("config.yaml",".env"):
+        path=ROOT/"profiles"/name/rel
+        try: st=path.lstat()
+        except FileNotFoundError:
+            result[rel]=None
+            continue
+        if not stat.S_ISREG(st.st_mode): fail("sibling static profile path must be a regular file",path=str(path))
+        result[rel]=(st.st_dev,st.st_ino,st.st_mode,st.st_size,st.st_mtime_ns,st.st_ctime_ns)
+    return result
 
 def env_has_key(path,key):
     try:
@@ -103,15 +105,32 @@ def env_has_key(path,key):
 
 who=pwd.getpwuid(os.geteuid())
 if who.pw_name!="jfroh" or who.pw_dir!="/home/jfroh": fail("wrong target runtime identity")
-# Validate unrelated state before any credential-file rename. A failed
-# preflight must not partially quarantine a profile.
-for p,label in ((ROOT_CONFIG,"root config.yaml"),(ROOT_ENV,"root .env"),(ROOT_AUTH,"root auth.json"),(ROOT_NOUS,"root Nous auth"),(PROFILE_NOUS,"profile Nous auth")):
-    if p.exists() or p.is_symlink(): fail(label+" must be absent",path=str(p))
+# Root provider state belongs to the existing default Hermes profile. Never
+# read its contents, remove it, or require it to be absent. Compare only file
+# metadata before and after our profile-local operation, rejecting symlinks.
+ROOT_STATE_PATHS=(ROOT_CONFIG,ROOT_ENV,ROOT_AUTH,ROOT_NOUS)
+def root_state_snapshot():
+    result={}
+    for path in ROOT_STATE_PATHS:
+        try: st=path.lstat()
+        except FileNotFoundError:
+            result[str(path)]=None
+            continue
+        if not stat.S_ISREG(st.st_mode): fail("root provider state must be a regular file",path=str(path))
+        result[str(path)]=(st.st_dev,st.st_ino,st.st_mode,st.st_size,st.st_mtime_ns,st.st_ctime_ns)
+    return result
+
+root_before=root_state_snapshot()
+if PROFILE_NOUS.exists() or PROFILE_NOUS.is_symlink(): fail("profile Nous auth must be absent",path=str(PROFILE_NOUS))
 
 rc=subprocess.run(["git","rev-parse","HEAD"],cwd=str(REPO),capture_output=True,text=True,shell=False)
 if rc.returncode!=0 or rc.stdout.strip()!=EXPECTED_COMMIT: fail("target Hermes commit mismatch",observed=rc.stdout.strip()[:64])
+# Resolve the profile through the pinned Hermes runtime, not a replicated
+# path algorithm. This subprocess receives no inherited provider credentials.
+probe=subprocess.run([str(REPO/"venv"/"bin"/"python3"),"-c","from hermes_constants import get_hermes_home; print(get_hermes_home())"],cwd=str(REPO),env={"HOME":str(HOME),"HERMES_HOME":str(PROFILE),"PATH":"/usr/bin:/bin"},capture_output=True,text=True,timeout=10,shell=False)
+if probe.returncode!=0 or probe.stdout.strip()!=str(PROFILE): fail("pinned Hermes profile home binding unverified")
 git_before=subprocess.run(["git","status","--porcelain=v1"],cwd=str(REPO),capture_output=True,text=True,shell=False).stdout
-siblings_before={name:digest_tree(ROOT/"profiles"/name) for name in SIBLINGS}
+siblings_before={name:sibling_static_snapshot(name) for name in SIBLINGS}
 
 # Credential placement is intentionally NOT performed here. The target-local
 # profile .env must already exist under a separately governed secret-placement
@@ -154,8 +173,10 @@ PROFILE_SHARED.mkdir(mode=0o700,parents=True,exist_ok=True)
 CONFIG.write_text(CONFIG_TEXT,encoding="utf-8")
 os.chmod(CONFIG,0o600)
 
-siblings_after={name:digest_tree(ROOT/"profiles"/name) for name in SIBLINGS}
+siblings_after={name:sibling_static_snapshot(name) for name in SIBLINGS}
 if siblings_after!=siblings_before: fail("sibling profile changed during provisioning")
+if root_state_snapshot()!=root_before: fail("default-profile provider state changed during provisioning")
+if PROFILE_NOUS.exists() or PROFILE_NOUS.is_symlink(): fail("profile Nous auth created during provisioning")
 git_after=subprocess.run(["git","status","--porcelain=v1"],cwd=str(REPO),capture_output=True,text=True,shell=False).stdout
 if git_after!=git_before: fail("Hermes repository status changed during provisioning")
 
@@ -165,7 +186,7 @@ print("HERMES_FIRST_SAFE_PROVISION_JSON="+json.dumps({
   "config_path":str(CONFIG),"config_mode":oct(stat.S_IMODE(CONFIG.stat().st_mode)),
   "credential_file_present":True,"credential_key_name_present":True,"credential_value_exposed":False,
   "profile_auth_quarantined":profile_auth_quarantined,"profile_auth_quarantine_path":profile_auth_quarantine_path,
-  "root_provider_state_absent":True,"sibling_profiles_unchanged":True,"git_status_unchanged":True,
+  "root_provider_state_unchanged":True,"profile_home_binding_verified":True,"sibling_profiles_unchanged":True,"git_status_unchanged":True,
   "model_api_calls":0,"services_changed":False,"cloudflare_changed":False,"cron_changed":False,"cutover":False,
 },sort_keys=True))
 '''
@@ -238,10 +259,14 @@ def execute(intent_id: str) -> dict[str, Any]:
             "success","target_user","target_host","profile","config_path","config_mode",
             "credential_file_present","credential_key_name_present","credential_value_exposed",
             "profile_auth_quarantined","profile_auth_quarantine_path",
-            "root_provider_state_absent","sibling_profiles_unchanged","git_status_unchanged",
+            "root_provider_state_unchanged","profile_home_binding_verified","sibling_profiles_unchanged","git_status_unchanged",
             "model_api_calls","services_changed","cloudflare_changed","cron_changed","cutover"
         }
         if set(evidence) - allowed: raise RuntimeError("provisioning evidence contains non-allowlisted fields")
+        for flag in ("root_provider_state_unchanged","profile_home_binding_verified","sibling_profiles_unchanged","git_status_unchanged"):
+            if evidence.get(flag) is not True: raise RuntimeError("provisioning isolation evidence missing or failed")
+        if evidence.get("credential_value_exposed") is not False or evidence.get("model_api_calls") != 0:
+            raise RuntimeError("provisioning credential/API-call evidence invalid")
         with intents._connect() as c:
             c.execute("UPDATE provision_intents SET state=?, completed_at=?, evidence_json=? WHERE intent_id=?",
                       (intents.STATE_COMPLETED,int(time.time()),json.dumps(evidence,sort_keys=True),intent_id)); c.commit()

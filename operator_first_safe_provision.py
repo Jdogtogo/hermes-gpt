@@ -48,6 +48,8 @@ def fixed_plan() -> dict[str, Any]:
         "approved_model": spec.APPROVED_MODEL,
         "credential_contract": "target profile-local .env must pre-exist privately with OPENROUTER_API_KEY; worker never reads or returns its value",
         "auth_quarantine_collision_policy": "preserve existing fixed quarantine; move active profile auth to fixed .quarantine.2 only when vacant; fail closed if secondary exists",
+        "root_provider_state_policy": "allow existing default-profile files, verify non-content metadata unchanged, reject symlinks",
+        "profile_home_binding": "verify pinned Hermes get_hermes_home resolves only dedicated first-safe profile",
         "live_model_calls": 0,
         "service_changes": False,
         "git_changes": False,

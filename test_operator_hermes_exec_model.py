@@ -47,8 +47,9 @@ def _payload(model: str | None = None, reason: str = "single_model_catalog_zero_
         "broader_routing_changed": False,
         "git_status_unchanged": True,
         "sibling_profiles_unchanged": True,
-        "root_provider_state_absent_before_after": True,
-        "shared_nous_state_absent_before_after": True,
+        "root_provider_state_unchanged": True,
+        "profile_shared_nous_state_absent_before_after": True,
+        "profile_home_binding_verified": True,
         "api_key_auth_only": True,
         "oauth_used": False,
         "ambient_provider_env_inherited": False,
@@ -86,8 +87,9 @@ def test_fixed_plan_is_entirely_constant_and_fail_closed():
     assert first["base_url"] == "https://openrouter.ai/api/v1"
     assert first["api_key_auth_only"] is True
     assert first["oauth_allowed"] is False
-    assert first["root_provider_state_required_absent"] is True
-    assert first["shared_nous_state_required_absent"] is True
+    assert first["root_provider_state_unchanged_required"] is True
+    assert first["profile_shared_nous_state_required_absent"] is True
+    assert first["profile_home_binding_required"] is True
     assert first["ambient_provider_env_inherited"] is False
     assert first["acceptance_calls"] == 2
     assert first["guard_kind"] == spec.GUARD_KIND
@@ -314,8 +316,9 @@ def test_valid_payload_passes():
         ("broader_routing_changed", True),
         ("git_status_unchanged", False),
         ("sibling_profiles_unchanged", False),
-        ("root_provider_state_absent_before_after", False),
-        ("shared_nous_state_absent_before_after", False),
+        ("root_provider_state_unchanged", False),
+        ("profile_shared_nous_state_absent_before_after", False),
+        ("profile_home_binding_verified", False),
         ("api_key_auth_only", False),
         ("oauth_used", True),
         ("ambient_provider_env_inherited", True),
@@ -388,8 +391,9 @@ def test_bounded_evidence_drops_anything_not_allow_listed():
     assert evidence["broader_routing_changed"] is False
     assert evidence["git_status_unchanged"] is True
     assert evidence["sibling_profiles_unchanged"] is True
-    assert evidence["root_provider_state_absent_before_after"] is True
-    assert evidence["shared_nous_state_absent_before_after"] is True
+    assert evidence["root_provider_state_unchanged"] is True
+    assert evidence["profile_shared_nous_state_absent_before_after"] is True
+    assert evidence["profile_home_binding_verified"] is True
     assert evidence["api_key_auth_only"] is True
     assert evidence["oauth_used"] is False
     assert evidence["ambient_provider_env_inherited"] is False

@@ -117,8 +117,22 @@ def scalar(v):
     return v[1:-1] if len(v)>=2 and v[0]==v[-1] and v[0] in "\"'" else v
 
 
+# The default profile is an existing live installation. Do not inspect its
+# credential contents: only compare non-content metadata and reject symlinks.
+ROOT_STATE_PATHS=(ROOT_CONFIG,ROOT_ENV,ROOT_AUTH,ROOT_SHARED_NOUS)
+def root_state_snapshot():
+    result={}
+    for path in ROOT_STATE_PATHS:
+        try: st=path.lstat()
+        except FileNotFoundError:
+            result[str(path)]=None
+            continue
+        if not stat.S_ISREG(st.st_mode): fail("root provider state must be a regular file",path=str(path))
+        result[str(path)]=(st.st_dev,st.st_ino,st.st_mode,st.st_size,st.st_mtime_ns,st.st_ctime_ns)
+    return result
+
 def assert_absent(path,label):
-    if Path(path).exists(): fail(f"{label} must be absent for FIRST_SAFE",path=str(path))
+    if Path(path).exists() or Path(path).is_symlink(): fail(f"{label} must be absent for FIRST_SAFE",path=str(path))
 
 
 def env_has_key(path,key):
@@ -415,8 +429,11 @@ def main():
     if identity.pw_name!="jfroh" or Path(identity.pw_dir)!=LINUX_HOME: fail("effective Linux identity drift",observed_user=identity.pw_name,observed_home=identity.pw_dir)
     for required in (ROOT,PROFILE_HOME,REPO,CONFIG,PYTHON,HERMES):
         if not Path(required).exists(): fail("required Hermes runtime path missing",path=str(required))
-    for path,label in ((ROOT_CONFIG,"root config"),(ROOT_ENV,"root environment"),(ROOT_AUTH,"root auth"),(ROOT_SHARED_NOUS,"root Nous shared state")):
-        assert_absent(path,label)
+    root_before=root_state_snapshot()
+    # Check actual pinned runtime resolution without copying root config or
+    # inheriting an ambient provider credential into the probe.
+    rc,home_out,_=run([PYTHON,"-c","from hermes_constants import get_hermes_home; print(get_hermes_home())"],cwd=REPO,timeout=10,env=sanitized_env())
+    if rc!=0 or home_out.strip()!=str(PROFILE_HOME): fail("pinned Hermes profile home binding unverified")
     auth_before=validate_profile_auth_metadata(PROFILE_AUTH)
     require_private_file(PROFILE_ENV,"FIRST_SAFE profile environment")
     if not env_has_key(PROFILE_ENV,"OPENROUTER_API_KEY"):
@@ -454,8 +471,8 @@ def main():
         if after_git!=before_git: fail("Hermes Git worktree changed during acceptance",before=before_git,after=after_git)
         after_siblings=sibling_snapshot()
         if after_siblings!=before_siblings: fail("sibling profile changed during FIRST_SAFE acceptance")
-        for path,label in ((ROOT_CONFIG,"root config"),(ROOT_ENV,"root environment"),(ROOT_AUTH,"root auth"),(ROOT_SHARED_NOUS,"root Nous shared state"),(PROFILE_SHARED_NOUS,"FIRST_SAFE Nous shared state")):
-            assert_absent(path,label)
+        if root_state_snapshot()!=root_before: fail("default-profile provider state changed during FIRST_SAFE acceptance")
+        assert_absent(PROFILE_SHARED_NOUS,"FIRST_SAFE Nous shared state")
         auth_after=validate_profile_auth_metadata(PROFILE_AUTH)
     except BaseException:
         if changed:
@@ -473,8 +490,8 @@ def main():
         "guard":guard,"calls":calls,"total_acceptance_calls":2,"total_estimated_cost_usd":0.0,
         "total_actual_cost_usd":0.0,"cooldown_rotation_events":0,"config_sha256_before":before_sha,
         "config_sha256_after":sha(final_bytes),"git_status_unchanged":True,"broader_routing_changed":False,
-        "sibling_profiles_unchanged":True,"root_provider_state_absent_before_after":True,
-        "shared_nous_state_absent_before_after":True,"api_key_auth_only":True,"oauth_used":False,
+        "sibling_profiles_unchanged":True,"root_provider_state_unchanged":True,
+        "profile_shared_nous_state_absent_before_after":True,"profile_home_binding_verified":True,"api_key_auth_only":True,"oauth_used":False,
         "profile_auth_metadata_only":True,"profile_auth_source":"env:OPENROUTER_API_KEY",
         "profile_auth_secret_persisted":False,"profile_auth_oauth_present":False,
         "profile_auth_entry_count_before":auth_before["entry_count"],"profile_auth_entry_count_after":auth_after["entry_count"],
@@ -503,8 +520,9 @@ def fixed_plan() -> dict[str, Any]:
         "base_url": OPENROUTER_BASE_URL,
         "api_key_auth_only": True,
         "oauth_allowed": False,
-        "root_provider_state_required_absent": True,
-        "shared_nous_state_required_absent": True,
+        "root_provider_state_unchanged_required": True,
+        "profile_shared_nous_state_required_absent": True,
+        "profile_home_binding_required": True,
         "ambient_provider_env_inherited": False,
         "guard_kind": GUARD_KIND,
         "guard_required_checks": list(REQUIRED_GUARD_CHECKS),
@@ -572,10 +590,12 @@ def validate_acceptance_payload(payload: dict[str, Any]) -> None:
         raise RuntimeError("remote result did not prove bounded config scope")
     if payload.get("git_status_unchanged") is not True or payload.get("sibling_profiles_unchanged") is not True:
         raise RuntimeError("remote result did not prove repository/profile isolation")
-    if payload.get("root_provider_state_absent_before_after") is not True:
-        raise RuntimeError("remote result did not prove root provider-state absence")
-    if payload.get("shared_nous_state_absent_before_after") is not True:
-        raise RuntimeError("remote result did not prove shared Nous-state absence")
+    if payload.get("root_provider_state_unchanged") is not True:
+        raise RuntimeError("remote result did not prove default-profile provider state unchanged")
+    if payload.get("profile_shared_nous_state_absent_before_after") is not True:
+        raise RuntimeError("remote result did not prove FIRST_SAFE shared Nous-state absence")
+    if payload.get("profile_home_binding_verified") is not True:
+        raise RuntimeError("remote result did not prove pinned Hermes profile home binding")
     if payload.get("api_key_auth_only") is not True or payload.get("oauth_used") is not False:
         raise RuntimeError("remote result did not prove API-key-only authentication")
     if payload.get("ambient_provider_env_inherited") is not False:
@@ -596,7 +616,7 @@ EVIDENCE_KEYS = (
     "calls", "total_acceptance_calls", "total_estimated_cost_usd",
     "total_actual_cost_usd", "cooldown_rotation_events", "git_status_unchanged",
     "broader_routing_changed", "changed_key", "profile", "sibling_profiles_unchanged",
-    "root_provider_state_absent_before_after", "shared_nous_state_absent_before_after",
+    "root_provider_state_unchanged", "profile_shared_nous_state_absent_before_after", "profile_home_binding_verified",
     "api_key_auth_only", "oauth_used", "ambient_provider_env_inherited",
 )
 
@@ -615,8 +635,9 @@ def bounded_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     evidence["git_status_unchanged"] = True
     evidence["broader_routing_changed"] = False
     evidence["sibling_profiles_unchanged"] = True
-    evidence["root_provider_state_absent_before_after"] = True
-    evidence["shared_nous_state_absent_before_after"] = True
+    evidence["root_provider_state_unchanged"] = True
+    evidence["profile_shared_nous_state_absent_before_after"] = True
+    evidence["profile_home_binding_verified"] = True
     evidence["api_key_auth_only"] = True
     evidence["oauth_used"] = False
     evidence["ambient_provider_env_inherited"] = False
