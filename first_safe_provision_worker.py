@@ -26,7 +26,7 @@ VM_NAME = "hermes-exec"
 SSH_USER = "jfroh"
 SSH_PROGRAM = "/usr/bin/ssh"
 REMOTE_PYTHON = "/home/jfroh/.hermes/hermes-agent/venv/bin/python3"
-EXPECTED_AGENT_COMMIT = "f80f453ae0679347e38abc917c7f94f717bf96c5"
+EXPECTED_AGENT_COMMIT = "cdceca42e107f0e51ab9ff50e1cc881ad76b577e"
 
 
 def _resolve_target_ipv4() -> str:
@@ -70,7 +70,7 @@ ROOT_ENV=ROOT/".env"
 ROOT_AUTH=ROOT/"auth.json"
 ROOT_NOUS=ROOT/"shared"/"nous_auth.json"
 REPO=ROOT/"hermes-agent"
-EXPECTED_COMMIT="f80f453ae0679347e38abc917c7f94f717bf96c5"
+EXPECTED_COMMIT="cdceca42e107f0e51ab9ff50e1cc881ad76b577e"
 SIBLINGS=("backend-eng","coder","maintenance","ops","thinker")
 CONFIG_TEXT="""model:\n  provider: openrouter\n  default: \n  base_url: https://openrouter.ai/api/v1\nfallback_providers: []\nproviders: {}\ncredential_pool_strategies: {}\n"""
 

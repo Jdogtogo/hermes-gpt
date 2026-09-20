@@ -112,7 +112,7 @@ def test_worker_target_and_paths_are_fixed():
     resolver = inspect.getsource(worker._resolve_target_ipv4)
     assert "Get-VMNetworkAdapter" not in resolver
     assert worker.REMOTE_PYTHON == "/home/jfroh/.hermes/hermes-agent/venv/bin/python3"
-    assert worker.EXPECTED_AGENT_COMMIT == "f80f453ae0679347e38abc917c7f94f717bf96c5"
+    assert worker.EXPECTED_AGENT_COMMIT == "cdceca42e107f0e51ab9ff50e1cc881ad76b577e"
     src = worker.REMOTE_PROGRAM
     assert '/home/jfroh' in src
     assert 'profiles"/"first-safe' in src
@@ -352,4 +352,4 @@ def test_unexpected_sibling_profile_git_tampering_fails_provisioning_verificatio
     assert src.index(sibling_before) < src.index("CONFIG.write_text") < src.index(sibling_after) < src.index(sibling_fail)
     assert src.index(git_before) < src.index("CONFIG.write_text") < src.index(git_after) < src.index(git_fail)
     assert 'target Hermes commit mismatch' in src
-    assert 'f80f453ae0679347e38abc917c7f94f717bf96c5' in src
+    assert 'cdceca42e107f0e51ab9ff50e1cc881ad76b577e' in src
