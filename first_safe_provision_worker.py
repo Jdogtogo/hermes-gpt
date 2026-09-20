@@ -10,6 +10,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -23,14 +24,32 @@ import operator_sessions as sessions
 
 VM_NAME = "hermes-exec"
 SSH_USER = "jfroh"
-SSH_PROGRAM = "/mnt/c/Windows/System32/OpenSSH/ssh.exe"
+SSH_PROGRAM = "/usr/bin/ssh"
 REMOTE_PYTHON = "/home/jfroh/.hermes/hermes-agent/venv/bin/python3"
 EXPECTED_AGENT_COMMIT = "f80f453ae0679347e38abc917c7f94f717bf96c5"
 
 
 def _resolve_target_ipv4() -> str:
-    """Return the fixed private IPv4 verified reachable from the Windows host."""
+    """Return the fixed private IPv4 for the legacy remote transport."""
     return "172.29.176.132"
+
+
+def _transport_argv() -> list[str]:
+    """Use a local Python subprocess only when already on the approved VM.
+
+    The Controller now runs on hermes-exec; Windows OpenSSH under /mnt/c is
+    unavailable there. A distinct Linux host must still use bounded SSH to
+    the pinned target. The payload independently verifies its target identity.
+    """
+    if socket.gethostname().split(".", 1)[0] == VM_NAME:
+        return [sys.executable, "-"]
+    return [
+        SSH_PROGRAM, "-T",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ConnectionAttempts=1",
+        f"{SSH_USER}@{_resolve_target_ipv4()}", REMOTE_PYTHON, "-",
+    ]
 
 REMOTE_PROGRAM = r'''from __future__ import annotations
 import hashlib, json, os, pwd, stat, subprocess
@@ -172,15 +191,10 @@ def execute(intent_id: str) -> dict[str, Any]:
         c.execute("UPDATE provision_intents SET state=?, claimed_at=? WHERE intent_id=?", (intents.STATE_CLAIMED,int(time.time()),intent_id)); c.commit()
 
     try:
-        target_ipv4 = _resolve_target_ipv4()
-        ssh_target = f"{SSH_USER}@{target_ipv4}"
-        proc = subprocess.run([
-            SSH_PROGRAM, "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "ConnectionAttempts=1",
-            ssh_target, REMOTE_PYTHON, "-"
-        ], input=REMOTE_PROGRAM, capture_output=True, text=True, timeout=30, shell=False)
+        proc = subprocess.run(
+            _transport_argv(), input=REMOTE_PROGRAM,
+            capture_output=True, text=True, timeout=30, shell=False,
+        )
         if not any(line.startswith("HERMES_FIRST_SAFE_PROVISION_JSON=") for line in (proc.stdout or "").splitlines()):
             stderr_text = (proc.stderr or "").lower()
             if "no such file or directory" in stderr_text:

@@ -75,20 +75,34 @@ def test_worker_revalidates_full_prepared_binding_before_claim():
 
 def test_worker_uses_stdin_for_remote_python_transport():
     src = inspect.getsource(worker.execute)
-    assert '"BatchMode=yes"' in src
-    assert '"ConnectTimeout=10"' in src
-    assert '"ConnectionAttempts=1"' in src
-    assert "ssh_target, REMOTE_PYTHON, \"-\"" in src
+    transport = inspect.getsource(worker._transport_argv)
+    assert '"BatchMode=yes"' in transport
+    assert '"ConnectTimeout=10"' in transport
+    assert '"ConnectionAttempts=1"' in transport
+    assert 'REMOTE_PYTHON, "-"' in transport
+    assert "_transport_argv()" in src
     assert "input=REMOTE_PROGRAM" in src
     assert 'REMOTE_PYTHON, "-c", REMOTE_PROGRAM' not in src
     assert src.index("try:") < src.index("proc = subprocess.run")
     assert 'UPDATE provision_intents SET state=?, completed_at=?, failure_reason=?' in src
 
 
+def test_worker_local_transport_only_on_approved_host(monkeypatch):
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: "hermes-exec")
+    assert worker._transport_argv() == [worker.sys.executable, "-"]
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: "hermes-exec.example")
+    assert worker._transport_argv() == [worker.sys.executable, "-"]
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: "unrelated-host")
+    argv = worker._transport_argv()
+    assert argv[0] == worker.SSH_PROGRAM
+    assert argv[-3:] == ["jfroh@172.29.176.132", worker.REMOTE_PYTHON, "-"]
+    assert "BatchMode=yes" in argv
+
+
 def test_worker_target_and_paths_are_fixed():
     assert worker.VM_NAME == "hermes-exec"
     assert worker.SSH_USER == "jfroh"
-    assert worker.SSH_PROGRAM == "/mnt/c/Windows/System32/OpenSSH/ssh.exe"
+    assert worker.SSH_PROGRAM == "/usr/bin/ssh"
     assert worker._resolve_target_ipv4() == "172.29.176.132"
     resolver = inspect.getsource(worker._resolve_target_ipv4)
     assert "Get-VMNetworkAdapter" not in resolver
