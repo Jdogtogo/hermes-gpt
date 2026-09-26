@@ -1251,6 +1251,51 @@ POLICY_TEMPLATES: dict[str, dict[str, Any]] = {
         "allowed_branches": None,
         "baseline_required": False,
     },
+    "hermes-free-model-discovery-maintenance": {
+        "active": True,
+        "description": (
+            "Maintain the read-only free-model catalogue scanner and its non-secret "
+            "snapshot/state outputs. No credentials, routing, profiles, config, services, "
+            "or broader ~/.hermes mutation."
+        ),
+        "policy": {
+            "level": "workspace",
+            "apply_mode": "direct",
+            "allowed_profiles": ["default"],
+            "readable_roots": [
+                "/home/jfroh/.hermes/scripts/free_model_poller.py",
+                "/home/jfroh/.hermes/registry/free_models.json",
+                "/home/jfroh/.hermes/registry/free_models.json.prev",
+                "/home/jfroh/.hermes/registry/free_model_poller_state.json",
+                "/home/jfroh/.hermes/registry/free_model_poller.log",
+            ],
+            "writable_roots": [
+                "/home/jfroh/.hermes/scripts/free_model_poller.py",
+                "/home/jfroh/.hermes/registry/free_models.json",
+                "/home/jfroh/.hermes/registry/free_models.json.prev",
+                "/home/jfroh/.hermes/registry/free_model_poller_state.json",
+                "/home/jfroh/.hermes/registry/free_model_poller.log",
+            ],
+            "service_units": [],
+            "verbs": {
+                "filesystem": ["read", "edit"],
+                "tests": ["run"],
+            },
+            "hard_denied_paths": [
+                "/home/jfroh/.hermes/.env",
+                "/home/jfroh/.hermes/.env.*",
+                "/home/jfroh/.hermes/auth",
+                "/home/jfroh/.hermes/auth.json",
+                "/home/jfroh/.hermes/credentials",
+                "/home/jfroh/.hermes/config.yaml",
+                "/home/jfroh/.hermes/profiles",
+                "/home/jfroh/.hermes/routing_control.json",
+            ],
+        },
+        "max_duration_seconds": _FOUR_HOURS,
+        "allowed_branches": None,
+        "baseline_required": False,
+    },
 }
 
 

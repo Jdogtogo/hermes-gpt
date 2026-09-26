@@ -441,6 +441,36 @@ def test_hermes_context_maintenance_template_must_be_requested_by_exact_name():
             pass
 
 
+def test_free_model_discovery_maintenance_is_exact_and_narrow():
+    resolved = templates.resolve_template("hermes-free-model-discovery-maintenance")
+    policy = resolved["policy"]
+    expected = [
+        "/home/jfroh/.hermes/scripts/free_model_poller.py",
+        "/home/jfroh/.hermes/registry/free_models.json",
+        "/home/jfroh/.hermes/registry/free_models.json.prev",
+        "/home/jfroh/.hermes/registry/free_model_poller_state.json",
+        "/home/jfroh/.hermes/registry/free_model_poller.log",
+    ]
+    assert policy["readable_roots"] == expected
+    assert policy["writable_roots"] == expected
+    assert policy["allowed_profiles"] == ["default"]
+    assert policy["service_units"] == []
+    assert policy["verbs"] == {
+        "filesystem": ["read", "edit"],
+        "tests": ["run"],
+    }
+    assert "/home/jfroh/.hermes/.env" in policy["hard_denied_paths"]
+    assert "/home/jfroh/.hermes/config.yaml" in policy["hard_denied_paths"]
+    assert "/home/jfroh/.hermes/routing_control.json" in policy["hard_denied_paths"]
+    assert resolved["allowed_branches"] is None
+    assert resolved["baseline_required"] is False
+    assert "git" not in policy["verbs"]
+
+
+def test_free_model_discovery_maintenance_template_is_active():
+    assert "hermes-free-model-discovery-maintenance" in templates.active_template_names()
+
+
 def test_governance_inventory_includes_opsbrain_and_remains_strictly_read_only():
     resolved = templates.resolve_template("hermes-governance-inventory")
     policy = resolved["policy"]
